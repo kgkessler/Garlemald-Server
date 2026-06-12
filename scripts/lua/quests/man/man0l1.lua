@@ -115,17 +115,20 @@ function onStart(player, quest)
 	
 	-- Immediately move to the Adventurer's Guild private area
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent010");
+	-- Close the Hob talk event BEFORE the warp. Upstream pmeteor's
+	-- closer lives in hob.lua (a PrivateArea populace script garlemald's
+	-- talk dispatch never reaches — man0l0's HOB arm early-returns at
+	-- ReplaceQuest), and pmeteor could afford to close AFTER its warp
+	-- call. garlemald's DoZoneChange ships the full zone-in replay
+	-- inline — including the delete for Hob, this event's owner — so an
+	-- open event here dereferences a deleted actor client-side and
+	-- crashes (two 2026-06-12 live runs: EndEvent absent, then EndEvent
+	-- trailing the bundle — both fatal). EndEvent-then-warp is the
+	-- live-proven ordering from the SEQ_005 director tails.
+	player:EndEvent();
 	GetWorldManager():DoZoneChange(player, 133, "PrivateAreaMasterPast", 2, 15, -459.619873, 40.0005722, 196.370377, 2.010813);
 	player:SendGameMessage(quest, 320, 0x20);
 	player:SendGameMessage(quest, 321, 0x20);
-	-- Close the Hob talk event before the client settles into the inn.
-	-- Upstream pmeteor's closer lives in hob.lua (the PrivateArea
-	-- populace script), which garlemald's talk dispatch never reaches —
-	-- man0l0's HOB arm early-returns at ReplaceQuest — so without this
-	-- the talkDefault event stays open across the DoZoneChange and the
-	-- 1.x client crashes at the zone-133 zone-in (2026-06-12 live run).
-	-- Mirrors man0g1.onStart's existing closer.
-	player:EndEvent();
 end
 
 function onFinish(player, quest)

@@ -3454,29 +3454,37 @@ mod tests {
         assert!(r3.error.is_none(), "onStart errored: {:?}", r3.error);
         assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
 
-        // Slice 4: the inn warp — and the load-bearing EndEvent closer.
+        // Slice 4: the inn warp — and the load-bearing EndEvent closer,
+        // which must come BEFORE the warp: garlemald's DoZoneChange
+        // ships the full zone-in replay inline (deleting Hob, the
+        // event's owner), and both an absent AND a trailing EndEvent
+        // crashed the live client (2026-06-12, two runs).
         let s4 = engine
             .fire_player_event_and_drain(1, &[])
             .expect("onStart parked on processEvent010");
+        let end_pos = s4
+            .iter()
+            .position(|c| matches!(c, LuaCommand::EndEvent { .. }));
+        let warp_pos = s4
+            .iter()
+            .position(|c| matches!(c, LuaCommand::DoZoneChange { zone_id: 133, .. }));
         assert!(
-            s4.iter()
-                .any(|c| matches!(c, LuaCommand::DoZoneChange { zone_id: 133, .. })),
-            "final slice must warp to the inn; got {s4:?}",
+            warp_pos.is_some(),
+            "final slice must warp to the inn; got {s4:?}"
         );
         assert!(
-            matches!(s4.last(), Some(LuaCommand::EndEvent { .. })),
-            "final slice must CLOSE the talk event after the warp — an \
-             open event across a zone change crashes the 1.x client \
-             (2026-06-12 live run); got {s4:?}",
+            end_pos.is_some() && end_pos < warp_pos,
+            "final slice must CLOSE the talk event BEFORE the warp; got {s4:?}",
         );
         assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 0);
     }
 
     /// All three follow-up quests' `onStart` (the opener → MSQ-2
     /// handoffs) warp the player to the adventurers' guild from inside
-    /// the still-open handoff talk event — each final slice must end
-    /// with the EndEvent closer (man0g1 always had it; man0l1/man0u1
-    /// gained it after the 2026-06-12 Limsa crash).
+    /// the still-open handoff talk event — each final slice must close
+    /// the event BEFORE the DoZoneChange (the warp's inline zone-in
+    /// replay deletes the event-owner NPC; a trailing EndEvent arrives
+    /// after the client has already crashed — 2026-06-12 live runs).
     #[test]
     fn real_follow_up_quest_onstart_final_slice_ends_event() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
@@ -3523,15 +3531,19 @@ mod tests {
             let last = engine
                 .fire_player_event_and_drain(1, &[])
                 .expect("onStart parked");
+            let end_pos = last
+                .iter()
+                .position(|c| matches!(c, LuaCommand::EndEvent { .. }));
+            let warp_pos = last.iter().position(
+                |c| matches!(c, LuaCommand::DoZoneChange { zone_id, .. } if *zone_id == dest_zone),
+            );
             assert!(
-                last.iter().any(
-                    |c| matches!(c, LuaCommand::DoZoneChange { zone_id, .. } if *zone_id == dest_zone)
-                ),
+                warp_pos.is_some(),
                 "{script}: final slice must warp to zone {dest_zone}; got {last:?}",
             );
             assert!(
-                matches!(last.last(), Some(LuaCommand::EndEvent { .. })),
-                "{script}: final slice must end with the EndEvent closer; got {last:?}",
+                end_pos.is_some() && end_pos < warp_pos,
+                "{script}: final slice must close the event BEFORE the warp; got {last:?}",
             );
         }
     }

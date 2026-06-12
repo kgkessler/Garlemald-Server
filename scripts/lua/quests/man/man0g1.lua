@@ -124,10 +124,15 @@ MRKR_MIOUNNE	= 11000601;
 function onStart(player, quest) 
     quest:StartSequence(SEQ_000);
     
-    -- Immediately move to the Adventurer's Guild private area
+    -- Immediately move to the Adventurer's Guild private area.
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent100");
-	GetWorldManager():DoZoneChange(player, 155, "PrivateAreaMasterPast", 2, 15, 67.034, 4, -1205.6497, -1.074);	
+	-- Close the handoff talk event BEFORE the warp — garlemald's
+	-- DoZoneChange ships the zone-in replay inline, deleting this
+	-- event's owner NPC while the client still holds the event open;
+	-- a trailing EndEvent arrives too late (the Limsa Hob handoff
+	-- crashed live on exactly this ordering, 2026-06-12 — see man0l1).
 	player:EndEvent();
+	GetWorldManager():DoZoneChange(player, 155, "PrivateAreaMasterPast", 2, 15, 67.034, 4, -1205.6497, -1.074);
 end
 
 function onFinish(player, quest)
