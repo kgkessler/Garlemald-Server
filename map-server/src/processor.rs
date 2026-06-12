@@ -470,7 +470,7 @@ impl PacketProcessor {
                     .send_zone_in_bundle(
                         &self.registry,
                         &self.db,
-                        self.lua.as_ref().map(|l| l.catalogs()),
+                        self.lua.as_ref(),
                         session_id,
                         0x1,
                         // Fresh-connection arrival — like login, retail
@@ -645,7 +645,7 @@ impl PacketProcessor {
                 .send_zone_in_bundle(
                     &self.registry,
                     &self.db,
-                    self.lua.as_ref().map(|l| l.catalogs()),
+                    self.lua.as_ref(),
                     session_id,
                     0x1,
                     // Login — retail's login.pcapng carries no
@@ -3214,7 +3214,7 @@ impl PacketProcessor {
             .send_zone_in_bundle(
                 &self.registry,
                 &self.db,
-                self.lua.as_ref().map(|l| l.catalogs()),
+                self.lua.as_ref(),
                 session_id,
                 spawn_type as u16,
                 // Content warps keep their pmeteor-verified shape: the

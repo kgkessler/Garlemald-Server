@@ -1853,7 +1853,7 @@ pub(crate) async fn apply_do_zone_change(
             .send_zone_in_bundle(
                 registry,
                 db,
-                lua.map(|l| l.catalogs()),
+                lua,
                 session_id,
                 spawn_type as u16,
                 /* commit_keep_list */ true,

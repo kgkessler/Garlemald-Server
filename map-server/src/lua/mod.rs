@@ -953,6 +953,47 @@ impl LuaEngine {
         PartialLuaCallResult { commands, error }
     }
 
+    /// pmeteor `Npc.CreateScriptBindPacket` parity: call the NPC base
+    /// class's `init(npc)` and return its results as wire LuaParams —
+    /// they become the ActorInstantiate params after the standard
+    /// 7-param prefix `[classPath, false×5, actorClassId]`. Per-class
+    /// shapes matter: `DoorStandard.init` returns `(false, false, 0,
+    /// 0, 0, 0)` — the trailing four ints feed the client's
+    /// `_setReactionTriggerBox_cpp` — while `PopulaceStandard.init`
+    /// returns `(false, false, 0, 0)`. The previous universal
+    /// populace-shaped tail crashed the client's `DoorStandard:
+    /// initForEvent` ("invalid argument: 2, integer" → error 40000 →
+    /// kicked to login) whenever a door's event condition was enabled.
+    /// `None` when the script / `init` is missing or errors — callers
+    /// fall back to the populace-shaped tail.
+    pub fn call_npc_init(&self, class_path_lower: &str) -> Option<Vec<common::luaparam::LuaParam>> {
+        use common::luaparam::LuaParam;
+        let path = self.resolver().base_class(class_path_lower);
+        if !path.exists() {
+            return None;
+        }
+        let (lua, _queue) = self.load_script(&path).ok()?;
+        let init: mlua::Function = lua.globals().get("init").ok()?;
+        // Base-class `init` implementations ignore the npc argument
+        // (they return constants); pass Nil rather than building a
+        // throwaway userdata. A script that does dereference it errors
+        // here and falls back to the default tail.
+        let ret: MultiValue = init.call(mlua::Value::Nil).ok()?;
+        let mut out = Vec::with_capacity(ret.len());
+        for v in ret.iter() {
+            out.push(match v {
+                mlua::Value::Nil => LuaParam::Nil,
+                mlua::Value::Boolean(true) => LuaParam::True,
+                mlua::Value::Boolean(false) => LuaParam::False,
+                mlua::Value::Integer(i) => LuaParam::Int32(*i as i32),
+                mlua::Value::Number(n) => LuaParam::Int32(*n as i32),
+                mlua::Value::String(s) => LuaParam::String(s.to_str().ok()?.to_string()),
+                _ => LuaParam::Nil,
+            });
+        }
+        Some(out)
+    }
+
     /// B6 of the SEQ_005 unblock plan — fire a content script's
     /// `onUpdate(tick, area)` hook. Sibling to
     /// [`call_content_hook`] that takes the simpler 2-arg shape

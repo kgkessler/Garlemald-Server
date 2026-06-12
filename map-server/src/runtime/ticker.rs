@@ -333,7 +333,7 @@ impl GameTicker {
                     .send_zone_in_bundle(
                         &self.registry,
                         &self.db,
-                        self.lua.as_ref().map(|l| l.catalogs()),
+                        self.lua.as_ref(),
                         session.id,
                         pending.spawn_type,
                         pending.commit_keep_list,

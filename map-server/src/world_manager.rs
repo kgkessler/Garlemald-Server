@@ -395,16 +395,21 @@ pub fn build_retainer_spawn_bundle(
     zone_name: &str,
 ) -> Vec<common::subpacket::SubPacket> {
     let mut out = Vec::new();
-    push_npc_spawn(&mut out, character, zone_name, 0, false, None);
+    push_npc_spawn(&mut out, character, zone_name, 0, false, None, None);
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_npc_spawn(
     subpackets: &mut Vec<common::subpacket::SubPacket>,
     character: &crate::actor::Character,
     zone_name: &str,
     priv_level: u32,
     in_private_area: bool,
+    // Lua engine for the per-class `init()` bind tail (pmeteor
+    // `Npc.CreateScriptBindPacket` parity); `None` falls back to the
+    // populace-shaped default.
+    lua: Option<&std::sync::Arc<crate::lua::LuaEngine>>,
     // Registry kind of the actor, when known. `Some(BattleNpc)` /
     // `Some(Ally)` means the actor went through the REAL BattleNpc
     // pipeline (stats, state_mainSkill, battleSave populated) and may
@@ -467,19 +472,34 @@ fn push_npc_spawn(
         in_private_area,
     );
 
-    let script_bind_params = vec![
-        common::luaparam::LuaParam::String(class_path_lower.clone()),
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::Int32(actor_class_id as i32),
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::False,
-        common::luaparam::LuaParam::Int32(0),
-        common::luaparam::LuaParam::Int32(0),
-    ];
+    // pmeteor `Npc.CreateScriptBindPacket`: a fixed 7-param prefix
+    // followed by the class's own `init()` returns — DoorStandard needs
+    // `(false, false, 0, 0, 0, 0)` (the trailing ints feed the client's
+    // push-trigger-box init), PopulaceStandard `(false, false, 0, 0)`.
+    // The old universal populace-shaped tail made every door's
+    // `initForEvent` error client-side (40000 dialog → kicked to login)
+    // the moment a quest enabled its event condition.
+    let script_bind_params = {
+        let mut p = vec![
+            common::luaparam::LuaParam::String(class_path_lower.clone()),
+            common::luaparam::LuaParam::False,
+            common::luaparam::LuaParam::False,
+            common::luaparam::LuaParam::False,
+            common::luaparam::LuaParam::False,
+            common::luaparam::LuaParam::False,
+            common::luaparam::LuaParam::Int32(actor_class_id as i32),
+        ];
+        match lua.and_then(|l| l.call_npc_init(&class_path_lower)) {
+            Some(tail) if !tail.is_empty() => p.extend(tail),
+            _ => p.extend([
+                common::luaparam::LuaParam::False,
+                common::luaparam::LuaParam::False,
+                common::luaparam::LuaParam::Int32(0),
+                common::luaparam::LuaParam::Int32(0),
+            ]),
+        }
+        p
+    };
 
     let is_monster = class_path_lower.contains("/monster/");
 
@@ -1249,14 +1269,18 @@ impl WorldManager {
         &self,
         registry: &ActorRegistry,
         db: &crate::database::Database,
-        // Battle-command catalog for hotbar `maxCommandRecastTime`
-        // resolution (#28 S3.1). `None` (Lua-less test harnesses) emits
-        // the hotbar with 0-second recast caps — slots still render.
-        catalogs: Option<&Arc<crate::lua::Catalogs>>,
+        // Lua engine for (a) the battle-command catalog (hotbar
+        // `maxCommandRecastTime` resolution, #28 S3.1) and (b) the
+        // per-class NPC `init()` returns that shape each NPC's
+        // ActorInstantiate params (pmeteor `Npc.CreateScriptBindPacket`
+        // parity). `None` (Lua-less test harnesses) emits 0-second
+        // recast caps and the populace-shaped default bind tail.
+        lua: Option<&Arc<crate::lua::LuaEngine>>,
         session_id: u32,
         spawn_type: u16,
         commit_keep_list: bool,
     ) {
+        let catalogs: Option<&Arc<crate::lua::Catalogs>> = lua.map(|l| l.catalogs());
         let Some(session) = self.session(session_id).await else {
             tracing::warn!(session = session_id, "send_zone_in_bundle: no session");
             return;
@@ -2139,6 +2163,7 @@ impl WorldManager {
                     .map(|b| b.area_level)
                     .unwrap_or(0),
                 private_area_bind.is_some(),
+                lua,
                 Some(handle.kind),
             );
             for mut sub in npc_bundle {
