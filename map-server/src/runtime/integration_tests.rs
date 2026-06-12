@@ -5354,27 +5354,26 @@ async fn level_up_fires_attain_level_and_learn_command_messages() {
     )
     .await;
 
-    // Drain the client channel and look for the two game-message
-    // subpackets (OP_GAME_MESSAGE = 0x01FD) carrying the expected
-    // text ids. Wire layout of each frame:
-    //   0x00-0x0F  BasePacket header
-    //   0x10-0x1F  SubPacket header
-    //   0x20-0x2F  GameMessage header (only on game-message subs)
-    //   0x30+      body — u32 receiver, u32 sender, u16 text_id, ...
-    // text_id therefore sits at frame offset 0x38.
+    // Drain the client channel and look for the worldMasterTextIds in
+    // the 0x0139-family CommandResult frames (pmeteor renders
+    // 33909/33926 exclusively on the battle-log channel — see
+    // emit_exp_property_updates). Frames on the channel are RAW
+    // subpacket bytes (the connection write task adds the BasePacket
+    // frame), and the rows land in an X01 or X10 container depending
+    // on how many text lines the grant produced (here: the class-4
+    // exp line + 33909 + 33926 = one X10), so scan each frame for the
+    // LE text-id markers rather than hardcoding a column offset.
     let mut saw_attain = false;
     let mut saw_learn = false;
     let attain_marker = 33909u16.to_le_bytes();
     let learn_marker = 33926u16.to_le_bytes();
     while let Ok(frame) = rx.try_recv() {
-        if frame.len() < 0x3a {
-            continue;
-        }
-        let text_bytes = &frame[0x38..0x3a];
-        if text_bytes == attain_marker {
-            saw_attain = true;
-        } else if text_bytes == learn_marker {
-            saw_learn = true;
+        for window in frame.windows(2) {
+            if window == attain_marker {
+                saw_attain = true;
+            } else if window == learn_marker {
+                saw_learn = true;
+            }
         }
     }
     assert!(

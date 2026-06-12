@@ -2583,20 +2583,34 @@ fn class_experience_text_id(class_id: u8) -> Option<u16> {
     })
 }
 
-/// Emit the `SetActorProperty` packets Meteor's `AddExp` sends after
-/// a successful gain. Target strings mirror Meteor's
-/// `ActorPropertyPacketUtil` usage:
+/// Emit the wire updates Meteor's `AddExp` sends after a successful
+/// gain, in pmeteor's order (`Player.cs:2932-2976` + the caller's
+/// `DoBattleAction(0, 0, actionList)`):
 ///
-///   - `charaWork/battleStateForSelf` → `skillPoint[class-1]`,
-///     `playerWork.restBonusExpRate` (self-only).
-///   - `charaWork/stateForAll` → `skillLevel[class-1]`,
-///     `state_mainSkillLevel` (self + broadcast on level-up).
+///   1. `charaWork/stateForAll` → `skillLevel[class-1]`,
+///      `state_mainSkillLevel` (self + nearby broadcast, level-up only),
+///   2. `charaWork/battleStateForSelf` → `skillPoint[class-1]`,
+///      `playerWork.restBonusExpRate` (self-only),
+///   3. one 0x0139-family CommandResult batch carrying the text rows
+///      ("You earn …" / "You attain level …" / "You learn …").
 ///
-/// The level-up packets now fan to nearby Players via the shared
-/// `broadcast_around_actor` helper — the `/stateForAll` target name
-/// is retail's convention for "everyone who can see this actor
-/// needs this value", and matches how Meteor's `QueuePackets` fans
-/// `ActorPropertyPacketUtil` output after a level up.
+/// Wire rules (the reason this path's first live run showed nothing
+/// client-side):
+///   - Ship RAW subpacket bytes — the connection write task wraps each
+///     mpsc frame in a BasePacket itself
+///     (`server.rs`/`wrap_subpackets_in_basepacket`); pre-wrapping with
+///     `BasePacket::create_from_subpacket` double-framed every packet
+///     and the world-server proxy read the inner BasePacket header as
+///     a garbage subpacket.
+///   - Stamp the owner's session into self-bound subpackets — the
+///     proxy fan-out drops `target_id == 0` frames (the rule
+///     `send_to_self_if_player` / `apply_send_game_message` already
+///     follow). Broadcast legs stay 0 for per-recipient stamping
+///     inside `broadcast_around_actor`.
+///   - Text ids 33909/33926/the 33934-family render ONLY as
+///     CommandResult rows on the battle-log channel; the previous
+///     `build_game_message` emission used opcode 0x01FD, which exists
+///     in neither pmeteor's packet family nor the 1.x opcode table.
 #[allow(clippy::too_many_arguments)]
 async fn emit_exp_property_updates(
     actor_id: u32,
@@ -2621,77 +2635,15 @@ async fn emit_exp_property_updates(
         return;
     };
     let class_slot = class_id.saturating_sub(1);
+    // Silent None when the zone isn't live (pure DB-only tests) — the
+    // broadcast legs just skip.
+    let zone = world.zone(handle.zone_id).await;
 
-    // Self-only: skillPoint + restBonusExpRate — owner sees their
-    // own XP bar and rested-exp UI widget, nobody else needs to.
-    let mut self_only_packets = Vec::new();
-    {
-        let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
-            actor_id,
-            "charaWork/battleStateForSelf",
-        );
-        b.add_int(
-            &format!("charaWork.battleSave.skillPoint[{}]", class_slot),
-            new_exp as u32,
-        );
-        if rested_before != rested_after {
-            b.add_int("playerWork.restBonusExpRate", rested_after as u32);
-        }
-        self_only_packets.extend(b.done());
-    }
-    for sub in &self_only_packets {
-        if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
-            client.send_bytes(base.to_bytes()).await;
-        }
-    }
-
-    // "You earn [exp] experience points." — pmeteor announces every
-    // gain through `BattleUtils.ClassExperienceTextIds[classId]`
-    // (Player.cs:2939) so the chat log shows the number the XP bar
-    // just absorbed. Param shape mirrors the C# CommandResult tail
-    // `((ushort)exp, bonusPercent)`: the displayed gain includes the
-    // bonus, and the percentage renders the "(+N%)" suffix — here the
-    // bonus is garlemald's rested-XP cut. Delivered through the same
-    // game-message path as the 33909 level-up line below (pmeteor ships
-    // both ids through one CommandResult batch, and 33909 already
-    // renders correctly via this path live).
-    if effective_gain > 0
-        && let Some(text_id) = class_experience_text_id(class_id)
-    {
-        use common::luaparam::LuaParam;
-        let bonus_pct = if base_exp > 0 && effective_gain > base_exp {
-            (((effective_gain - base_exp) as i64 * 100) / base_exp as i64) as u32
-        } else {
-            0
-        };
-        let msg = crate::packets::send::misc::build_game_message(
-            actor_id,
-            crate::packets::send::misc::GameMessageOptions {
-                sender_actor_id: 0,
-                receiver_actor_id: actor_id,
-                text_id,
-                log: 0x20,
-                display_id: None,
-                custom_sender: None,
-                lua_params: vec![
-                    LuaParam::UInt32(effective_gain as u32),
-                    LuaParam::UInt32(bonus_pct),
-                ],
-            },
-        );
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&msg, true, false) {
-            client.send_bytes(base.to_bytes()).await;
-        }
-    }
-
-    // Level-up: skillLevel + state_mainSkillLevel. Fan to nearby
-    // players AND self — the owner's client also reads the stateForAll
-    // row, so it needs the same bytes. Source is excluded by
-    // `actors_around` inside the broadcast helper, but we still
-    // send to the owning client directly so the packet isn't
-    // dropped if the broadcast grid happens not to include them
-    // (e.g. first frame after a zone-change before the grid
-    // re-registers the player).
+    // 1. Level-up: skillLevel + state_mainSkillLevel, self + nearby —
+    // `/stateForAll` is retail's "everyone who can see this actor"
+    // convention. The source is excluded by `actors_around`, so the
+    // direct self leg is required (same pair the live combat log's
+    // `broadcast_results` uses).
     if levels_gained > 0 {
         let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
             actor_id,
@@ -2705,127 +2657,153 @@ async fn emit_exp_property_updates(
             "charaWork.parameterSave.state_mainSkillLevel",
             new_level as u16,
         );
-        let level_packets = b.done();
-        for sub in &level_packets {
-            if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
-                client.send_bytes(base.to_bytes()).await;
+        for sub in b.done() {
+            let bytes = sub.to_bytes();
+            crate::runtime::dispatcher::send_to_self_if_player(
+                registry,
+                world,
+                actor_id,
+                bytes.clone(),
+            )
+            .await;
+            if let Some(zone) = &zone {
+                let _ = crate::runtime::broadcast::broadcast_around_actor(
+                    world,
+                    registry,
+                    zone,
+                    handle.actor_id,
+                    bytes,
+                )
+                .await;
             }
         }
-        // Nearby broadcast — look up the zone by the player's
-        // current zone id, fan each subpacket bytes to every
-        // nearby Player. Silent no-op if the zone isn't live (e.g.
-        // in a pure DB-only integration test).
-        if let Some(zone) = world.zone(handle.zone_id).await {
-            for sub in &level_packets {
-                if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
-                    let _ = crate::runtime::broadcast::broadcast_around_actor(
-                        world,
-                        registry,
-                        &zone,
-                        handle.actor_id,
-                        base.to_bytes(),
-                    )
-                    .await;
-                }
-            }
-        }
-
-        // "You attain level [level]." (textId 33909) + the
-        // ability-unlock chain Meteor runs in
-        // `Player.EquipAbilitiesAtLevel`. One game-message per
-        // crossed level so a multi-level rollover reports each
-        // threshold distinctly — matches retail's per-level
-        // feedback cadence. For each newly-reached level we look up
-        // the class's battle-command ids at that level via
-        // `Catalogs::commands_unlocked_at` and fire one 33926
-        // ("You learn X") per unlock, with the command id as the
-        // LuaParam.
-        emit_level_up_game_messages(
-            actor_id,
-            class_id,
-            new_level,
-            levels_gained,
-            client.clone(),
-            lua,
-        )
-        .await;
     }
-}
 
-/// Emit the per-level "You attain level N" + "You learn X" game
-/// messages a level-up rollover should produce. Iterates over the
-/// `levels_gained` most-recent level thresholds so a rollover that
-/// crossed 2 levels in one call (rare but possible with large
-/// `AddExp` grants) reports both. Silent no-op if `lua` is `None`
-/// (test harness) or the catalog is empty.
-async fn emit_level_up_game_messages(
-    actor_id: u32,
-    class_id: u8,
-    new_level: i16,
-    levels_gained: i16,
-    client: crate::data::ClientHandle,
-    lua: Option<&Arc<LuaEngine>>,
-) {
-    use common::luaparam::LuaParam;
+    // 2. Self-only: skillPoint + restBonusExpRate — owner sees their
+    // own XP bar and rested-exp UI widget, nobody else needs to.
+    {
+        let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
+            actor_id,
+            "charaWork/battleStateForSelf",
+        );
+        b.add_int(
+            &format!("charaWork.battleSave.skillPoint[{}]", class_slot),
+            new_exp as u32,
+        );
+        if rested_before != rested_after {
+            b.add_int("playerWork.restBonusExpRate", rested_after as u32);
+        }
+        for mut sub in b.done() {
+            sub.set_target_id(session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
+    }
 
-    // Retail text ids — see `Player.EquipAbilitiesAtLevel` at
-    // `origin/develop:Map Server/Actors/Chara/Player/Player.cs:2618`
-    // (`33926: You learn [command]`) and `LevelUp`
-    // (`33909: You attain level [level]`).
-    const TEXT_LEVEL_ATTAINED: u16 = 33909;
-    const TEXT_LEARN_COMMAND: u16 = 33926;
-
+    // 3. The text batch — pmeteor's actionList rows verbatim
+    // (`CommandResult(targetId, worldMasterTextId, effectId, amount,
+    // param, hitNum = 1)`):
+    //   exp:   (Id, ClassExperienceTextIds[class], 0, exp, bonus%) —
+    //          "You earn [exp](+[bonus]%) experience points."
+    //          (Player.cs:2939; amount caps at u16 — "the exp graphic
+    //          overflows after ~65k", Player.cs:2931). The bonus here
+    //          is garlemald's rested-XP cut.
+    //   level: (Id, 33909, 0, level) — "You attain level [level]."
+    //          one per crossed level, oldest first (Player.cs:3011).
+    //   learn: (Id, 33926, 0, commandId) — "You learn [command]." per
+    //          `Catalogs::commands_unlocked_at` (Player.cs:2995,
+    //          `EquipAbilitiesAtLevel`).
+    let mut rows: Vec<crate::packets::send::actor_battle::CommandResult> = Vec::new();
+    if effective_gain > 0
+        && let Some(text_id) = class_experience_text_id(class_id)
+    {
+        let bonus_pct = if base_exp > 0 && effective_gain > base_exp {
+            (((effective_gain - base_exp) as i64 * 100) / base_exp as i64) as u32
+        } else {
+            0
+        };
+        rows.push(crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            worldmaster_text_id: text_id,
+            amount: effective_gain.min(u16::MAX as i32) as u32,
+            param: bonus_pct.min(u8::MAX as u32),
+            hit_num: 1,
+            ..Default::default()
+        });
+    }
     for gained_idx in (0..levels_gained).rev() {
         // `new_level` is the *final* post-rollover level; the
         // intermediate levels we passed through are at
         // `new_level - gained_idx`.
         let at_level = new_level - gained_idx;
-
-        // "You attain level N."
-        let level_msg = crate::packets::send::misc::build_game_message(
-            actor_id,
-            crate::packets::send::misc::GameMessageOptions {
-                sender_actor_id: 0,
-                receiver_actor_id: actor_id,
-                text_id: TEXT_LEVEL_ATTAINED,
-                log: 0x20,
-                display_id: None,
-                custom_sender: None,
-                lua_params: vec![LuaParam::UInt32(at_level as u32)],
-            },
-        );
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&level_msg, true, false) {
-            client.send_bytes(base.to_bytes()).await;
-        }
-
-        // Ability unlocks at this level — one message per command.
-        let Some(lua) = lua else {
-            continue;
-        };
-        let commands = lua.catalogs().commands_unlocked_at(class_id, at_level);
-        for command_id in commands {
-            tracing::info!(
-                actor = actor_id,
-                class = class_id,
-                level = at_level,
-                command_id,
-                "ability unlock: You learn <command>",
-            );
-            let learn_msg = crate::packets::send::misc::build_game_message(
-                actor_id,
-                crate::packets::send::misc::GameMessageOptions {
-                    sender_actor_id: 0,
-                    receiver_actor_id: actor_id,
-                    text_id: TEXT_LEARN_COMMAND,
-                    log: 0x20,
-                    display_id: None,
-                    custom_sender: None,
-                    lua_params: vec![LuaParam::UInt32(command_id as u32)],
-                },
-            );
-            if let Ok(base) = common::BasePacket::create_from_subpacket(&learn_msg, true, false) {
-                client.send_bytes(base.to_bytes()).await;
+        rows.push(crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            worldmaster_text_id: 33909,
+            amount: at_level.max(0) as u32,
+            hit_num: 1,
+            ..Default::default()
+        });
+        if let Some(lua) = lua {
+            for command_id in lua.catalogs().commands_unlocked_at(class_id, at_level) {
+                tracing::info!(
+                    actor = actor_id,
+                    class = class_id,
+                    level = at_level,
+                    command_id,
+                    "ability unlock: You learn <command>",
+                );
+                rows.push(crate::packets::send::actor_battle::CommandResult {
+                    target_id: actor_id,
+                    worldmaster_text_id: 33926,
+                    amount: command_id as u32,
+                    hit_num: 1,
+                    ..Default::default()
+                });
             }
+        }
+    }
+    let mut offset = 0usize;
+    while offset < rows.len() {
+        // pmeteor container choice (matches `broadcast_results`): X01
+        // for a single row, X10 up to 10, X18 beyond.
+        let remaining = rows.len() - offset;
+        let sub = if remaining == 1 {
+            let row = &rows[offset];
+            offset += 1;
+            crate::packets::send::actor_battle::build_command_result_x01(actor_id, 0, 0, row)
+        } else if remaining <= 10 {
+            crate::packets::send::actor_battle::build_command_result_x10(
+                actor_id,
+                0,
+                0,
+                &rows,
+                &mut offset,
+            )
+        } else {
+            crate::packets::send::actor_battle::build_command_result_x18(
+                actor_id,
+                0,
+                0,
+                &rows,
+                &mut offset,
+            )
+        };
+        let bytes = sub.to_bytes();
+        crate::runtime::dispatcher::send_to_self_if_player(
+            registry,
+            world,
+            actor_id,
+            bytes.clone(),
+        )
+        .await;
+        if let Some(zone) = &zone {
+            let _ = crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                zone,
+                handle.actor_id,
+                bytes,
+            )
+            .await;
         }
     }
 }

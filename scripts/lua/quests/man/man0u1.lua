@@ -115,9 +115,14 @@ function onStart(player, quest)
     
     -- Immediately move to the Adventurer's Guild private area
 	callClientFunction(player, "delegateEvent", player, quest, "processEventMomodiStart");
-    GetWorldManager():DoZoneChange(player, 175, "PrivateAreaMasterPast", 4, 15, -75.242, 195.009, 74.572, -0.046);	
+    GetWorldManager():DoZoneChange(player, 175, "PrivateAreaMasterPast", 4, 15, -75.242, 195.009, 74.572, -0.046);
     player:SendGameMessage(quest, 329, 0x20);
 	player:SendGameMessage(quest, 330, 0x20);
+	-- Close the talk event before the client settles into the guild —
+	-- same open-event-across-warp crash class as man0l1's Hob handoff
+	-- (the upstream closer lives in an unreachable PrivateArea populace
+	-- script). Mirrors man0g1.onStart's existing closer.
+	player:EndEvent();
 end
 
 function onFinish(player, quest)

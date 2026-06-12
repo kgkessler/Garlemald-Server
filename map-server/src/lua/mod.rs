@@ -3336,6 +3336,206 @@ mod tests {
         }
     }
 
+    /// The Limsa Hob handoff (man0l0 SEQ_010 → Man0l1), slice by slice
+    /// against the REAL scripts — the 2026-06-12 live run crashed the
+    /// client here because the final slice warped to the inn with the
+    /// talkDefault event still open: pmeteor's closer lives in hob.lua
+    /// (a PrivateArea populace script garlemald's talk dispatch never
+    /// reaches), man0l0's HOB arm early-returns at ReplaceQuest, and
+    /// man0l1.onStart carried no closer. The fix mirrors man0g1: the
+    /// onStart final slice must end with EndEvent.
+    #[test]
+    fn real_limsa_hob_handoff_final_slice_closes_event() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let engine = LuaEngine::new(root);
+
+        let mut snapshot = sample_snapshot();
+        snapshot.actor_id = 1;
+        snapshot.current_class = 3;
+        snapshot.active_quests = vec![110_001];
+        snapshot.active_quest_states = vec![userdata::QuestStateSnapshot {
+            quest_id: 110_001,
+            sequence: 10, // SEQ_010 — Limsa port, talking to Hob
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }];
+
+        // Slice 1: the talk → man0l0.onTalk parks on the choice RPC.
+        let hob = LuaNpcSpec {
+            actor_id: 0x4730_00DC, // live Hob actor id (log 06:13:57)
+            name: "hob".into(),
+            class_name: "PopulaceStandard".into(),
+            class_path: "/Chara/Npc/Populace/PopulaceStandard".into(),
+            unique_id: "hob".into(),
+            zone_id: 230,
+            zone_name: "sea0Town01a".into(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            actor_class_id: 1_000_151, // HOB in man0l0.lua
+            quest_graphic: 0,
+        };
+        let r1 = engine.call_quest_hook(
+            &root.join("quests/man/man0l0.lua"),
+            "onTalk",
+            snapshot.clone(),
+            userdata::LuaQuestHandle {
+                player_id: 1,
+                quest_id: 110_001,
+                has_quest: true,
+                sequence: 10,
+                flags: 0,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+                queue: CommandQueue::new(),
+            },
+            vec![QuestHookArg::Npc(hob)],
+        );
+        assert!(r1.error.is_none(), "onTalk errored: {:?}", r1.error);
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Slice 2: EventUpdate carries choice=1 → ReplaceQuest hands off
+        // to Man0l1 (CompleteQuest + AddQuest) and the onTalk coroutine
+        // finishes (its EndEvent is intentionally skipped — the closer
+        // belongs to man0l1.onStart, after processEvent010).
+        let s2 = engine
+            .fire_player_event_and_drain(1, &[common::luaparam::LuaParam::Int32(1)])
+            .expect("onTalk parked on the choice RPC");
+        assert!(
+            s2.iter().any(|c| matches!(
+                c,
+                LuaCommand::CompleteQuest {
+                    quest_id: 110_001,
+                    ..
+                }
+            )) && s2.iter().any(|c| matches!(
+                c,
+                LuaCommand::AddQuest {
+                    quest_id: 110_002,
+                    ..
+                }
+            )),
+            "ReplaceQuest must push CompleteQuest(110001)+AddQuest(110002); got {s2:?}",
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 0);
+
+        // Slice 3: apply_add_quest fires man0l1.onStart → parks on the
+        // processEvent010 RPC.
+        let mut snapshot2 = snapshot.clone();
+        snapshot2.active_quests = vec![110_002];
+        snapshot2.active_quest_states = vec![userdata::QuestStateSnapshot {
+            quest_id: 110_002,
+            sequence: 0,
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }];
+        let r3 = engine.call_quest_hook(
+            &root.join("quests/man/man0l1.lua"),
+            "onStart",
+            snapshot2,
+            userdata::LuaQuestHandle {
+                player_id: 1,
+                quest_id: 110_002,
+                has_quest: true,
+                sequence: 0,
+                flags: 0,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+                queue: CommandQueue::new(),
+            },
+            vec![],
+        );
+        assert!(r3.error.is_none(), "onStart errored: {:?}", r3.error);
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Slice 4: the inn warp — and the load-bearing EndEvent closer.
+        let s4 = engine
+            .fire_player_event_and_drain(1, &[])
+            .expect("onStart parked on processEvent010");
+        assert!(
+            s4.iter()
+                .any(|c| matches!(c, LuaCommand::DoZoneChange { zone_id: 133, .. })),
+            "final slice must warp to the inn; got {s4:?}",
+        );
+        assert!(
+            matches!(s4.last(), Some(LuaCommand::EndEvent { .. })),
+            "final slice must CLOSE the talk event after the warp — an \
+             open event across a zone change crashes the 1.x client \
+             (2026-06-12 live run); got {s4:?}",
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 0);
+    }
+
+    /// All three follow-up quests' `onStart` (the opener → MSQ-2
+    /// handoffs) warp the player to the adventurers' guild from inside
+    /// the still-open handoff talk event — each final slice must end
+    /// with the EndEvent closer (man0g1 always had it; man0l1/man0u1
+    /// gained it after the 2026-06-12 Limsa crash).
+    #[test]
+    fn real_follow_up_quest_onstart_final_slice_ends_event() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        for (script, quest_id, dest_zone) in [
+            ("quests/man/man0l1.lua", 110_002u32, 133u32), // Limsa → the inn
+            ("quests/man/man0g1.lua", 110_006, 155),       // Gridania → Carline Canopy
+            ("quests/man/man0u1.lua", 110_010, 175),       // Ul'dah → the Quicksand
+        ] {
+            let engine = LuaEngine::new(root);
+            let mut snapshot = sample_snapshot();
+            snapshot.actor_id = 1;
+            snapshot.active_quests = vec![quest_id];
+            snapshot.active_quest_states = vec![userdata::QuestStateSnapshot {
+                quest_id,
+                sequence: 0,
+                flags: 0,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+            }];
+            let r = engine.call_quest_hook(
+                &root.join(script),
+                "onStart",
+                snapshot,
+                userdata::LuaQuestHandle {
+                    player_id: 1,
+                    quest_id,
+                    has_quest: true,
+                    sequence: 0,
+                    flags: 0,
+                    counters: [0; 3],
+                    npc_ls_from: 0,
+                    npc_ls_msg_step: 0,
+                    queue: CommandQueue::new(),
+                },
+                vec![],
+            );
+            assert!(r.error.is_none(), "{script} onStart errored: {:?}", r.error);
+            assert_eq!(
+                engine.scheduler().lock().unwrap().pending_event_count(),
+                1,
+                "{script}: onStart must park on its intro RPC",
+            );
+            let last = engine
+                .fire_player_event_and_drain(1, &[])
+                .expect("onStart parked");
+            assert!(
+                last.iter().any(
+                    |c| matches!(c, LuaCommand::DoZoneChange { zone_id, .. } if *zone_id == dest_zone)
+                ),
+                "{script}: final slice must warp to zone {dest_zone}; got {last:?}",
+            );
+            assert!(
+                matches!(last.last(), Some(LuaCommand::EndEvent { .. })),
+                "{script}: final slice must end with the EndEvent closer; got {last:?}",
+            );
+        }
+    }
+
     /// Cross-thread repro of the LIVE ticker topology: the signal resume
     /// (and its `wait()` re-park) happens on one thread while a ticker
     /// thread hammers `engine.tick()` concurrently — mirroring the
