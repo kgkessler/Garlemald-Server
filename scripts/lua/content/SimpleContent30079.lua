@@ -21,6 +21,11 @@ function onCreate(starterPlayer, contentArea, director)
 	-- would otherwise inherit battleStarted=true and let the allies
 	-- attack before the targeting tutorial returns.
 	battleStarted = false;
+	-- Clear this player's kill-EXP counter entry (see onUpdate) — a
+	-- stale entry from an aborted previous run would mis-pay the grant.
+	-- Other players' in-flight entries are left alone.
+	tutorialLiveHostiles = tutorialLiveHostiles or {};
+	tutorialLiveHostiles[starterPlayer.actorId] = nil;
 	thancred = GetWorldManager().SpawnBattleNpcById(14, contentArea);
 	niellefresne = GetWorldManager().SpawnBattleNpcById(15, contentArea);
 	mob1 = GetWorldManager().SpawnBattleNpcById(13, contentArea);
@@ -61,6 +66,12 @@ end
 -- per script path (NOT per content area), so onCreate re-arms it for
 -- each fresh run.
 battleStarted = false;
+-- Per-PLAYER live-hostile counts from the previous tick — drives the
+-- kill-EXP grant below. Keyed by player actor id because this VM (and
+-- so this table) is shared by EVERY session ticking this script; a
+-- plain scalar would interleave concurrent same-city runs and mint
+-- phantom EXP. onCreate clears the starting player's entry.
+tutorialLiveHostiles = {};
 
 function onUpdate(tick, area)
 	if not area then return end
@@ -68,13 +79,43 @@ function onUpdate(tick, area)
 	local mobs    = area:GetMonsters()   -- live-only (dead filtered by S0.5)
 	local allies  = area:GetAllies()
 
-	local engagedPlayer = nil
+	local engagedPlayer, firstPlayer = nil, nil
 	for player in players do
-		if player and player:IsEngaged() and player.target then
-			engagedPlayer = player
-			break
+		if player then
+			if not firstPlayer then firstPlayer = player end
+			if player:IsEngaged() and player.target then
+				engagedPlayer = player
+				break
+			end
 		end
 	end
+
+	-- Tutorial kill EXP: retail granted 3000 EXP for downing the goobbue
+	-- (single hostile, vs Limsa/Gridania's 1000-per-mob trio) — enough to
+	-- clear level 2 (570 SP) in one grant. (FFXIVenturer "Flowers for
+	-- All" guide: "You will receive 3000 EXP and a Velodyna Cosmos
+	-- (quest item) for completing the sequence".) `mobs` is live-only, so
+	-- a drop in the count since the last tick = the kill. Granted to the
+	-- player regardless of who landed the blow — retail pays the full
+	-- amount on ally killing blows too, which the onKillBNpc quest hook's
+	-- player-only attacker gate would miss. The `#allies > 0` gate is
+	-- the "fight is set up" signal: pre-onCreate ticks (no roster yet)
+	-- never touch the counter, so a stale count can't pay out against
+	-- an unspawned fight — and the allies are MinimumHpLock-floored, so
+	-- the roster stays populated through the kill's grant.
+	if #allies > 0 then
+		local owner = engagedPlayer or firstPlayer
+		if owner then
+			local prev = tutorialLiveHostiles[owner.actorId]
+			if prev ~= nil and #mobs < prev then
+				for _ = 1, prev - #mobs do
+					owner:AddExp(3000, owner.charaWork.parameterSave.state_mainSkill[0], 0)
+				end
+			end
+			tutorialLiveHostiles[owner.actorId] = #mobs
+		end
+	end
+
 	if not battleStarted then
 		-- Nothing moves until the player attacks. Latching on the
 		-- player's engagement keeps the goobbue alive and targetable

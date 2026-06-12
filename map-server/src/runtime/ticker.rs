@@ -309,6 +309,55 @@ impl GameTicker {
                 false
             }
         };
+        // Deferred zone-in bundles (retail same-region pacing — see
+        // `apply_do_zone_change`). Fire once due; while parked, the
+        // position handler holds stale client coordinate reports off
+        // the warp destination.
+        {
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            for session in self.world.all_sessions().await {
+                let Some(pending) = session.pending_zone_in.clone() else {
+                    continue;
+                };
+                if now_unix_ms < pending.fire_at_unix_ms {
+                    continue;
+                }
+                if let Some(mut snap) = self.world.session(session.id).await {
+                    snap.pending_zone_in = None;
+                    self.world.upsert_session(snap).await;
+                }
+                self.world
+                    .send_zone_in_bundle(
+                        &self.registry,
+                        &self.db,
+                        self.lua.as_ref(),
+                        session.id,
+                        pending.spawn_type,
+                        pending.commit_keep_list,
+                    )
+                    .await;
+                if pending.notify_private_area
+                    && let Some(client) = self.world.client(session.id).await
+                {
+                    let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                        crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                        crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                        34108,
+                        0x20,
+                    );
+                    msg.set_target_id(session.id);
+                    client.send_bytes(msg.to_bytes()).await;
+                }
+                tracing::info!(
+                    session = session.id,
+                    "deferred zone-in bundle dispatched (retail same-region pacing)",
+                );
+            }
+        }
+
         if content_due && let Some(lua) = self.lua.as_ref() {
             let sessions = self.world.all_sessions().await;
             for session in sessions {

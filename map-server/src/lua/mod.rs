@@ -953,6 +953,47 @@ impl LuaEngine {
         PartialLuaCallResult { commands, error }
     }
 
+    /// pmeteor `Npc.CreateScriptBindPacket` parity: call the NPC base
+    /// class's `init(npc)` and return its results as wire LuaParams —
+    /// they become the ActorInstantiate params after the standard
+    /// 7-param prefix `[classPath, false×5, actorClassId]`. Per-class
+    /// shapes matter: `DoorStandard.init` returns `(false, false, 0,
+    /// 0, 0, 0)` — the trailing four ints feed the client's
+    /// `_setReactionTriggerBox_cpp` — while `PopulaceStandard.init`
+    /// returns `(false, false, 0, 0)`. The previous universal
+    /// populace-shaped tail crashed the client's `DoorStandard:
+    /// initForEvent` ("invalid argument: 2, integer" → error 40000 →
+    /// kicked to login) whenever a door's event condition was enabled.
+    /// `None` when the script / `init` is missing or errors — callers
+    /// fall back to the populace-shaped tail.
+    pub fn call_npc_init(&self, class_path_lower: &str) -> Option<Vec<common::luaparam::LuaParam>> {
+        use common::luaparam::LuaParam;
+        let path = self.resolver().base_class(class_path_lower);
+        if !path.exists() {
+            return None;
+        }
+        let (lua, _queue) = self.load_script(&path).ok()?;
+        let init: mlua::Function = lua.globals().get("init").ok()?;
+        // Base-class `init` implementations ignore the npc argument
+        // (they return constants); pass Nil rather than building a
+        // throwaway userdata. A script that does dereference it errors
+        // here and falls back to the default tail.
+        let ret: MultiValue = init.call(mlua::Value::Nil).ok()?;
+        let mut out = Vec::with_capacity(ret.len());
+        for v in ret.iter() {
+            out.push(match v {
+                mlua::Value::Nil => LuaParam::Nil,
+                mlua::Value::Boolean(true) => LuaParam::True,
+                mlua::Value::Boolean(false) => LuaParam::False,
+                mlua::Value::Integer(i) => LuaParam::Int32(*i as i32),
+                mlua::Value::Number(n) => LuaParam::Int32(*n as i32),
+                mlua::Value::String(s) => LuaParam::String(s.to_str().ok()?.to_string()),
+                _ => LuaParam::Nil,
+            });
+        }
+        Some(out)
+    }
+
     /// B6 of the SEQ_005 unblock plan — fire a content script's
     /// `onUpdate(tick, area)` hook. Sibling to
     /// [`call_content_hook`] that takes the simpler 2-arg shape
@@ -3203,6 +3244,347 @@ mod tests {
                 sched.pending_signal_count(),
                 1,
                 "director must be parked on battleComplete during the fight",
+            );
+        }
+    }
+
+    /// Tutorial kill EXP (opening quests): the three REAL SEQ_005
+    /// content scripts award retail's per-kill EXP from `onUpdate` by
+    /// watching the live-hostile count — 1000/kill for the Gridania
+    /// wolves and Limsa aurelias, 3000 for the Ul'dah goobbue
+    /// (FFXIVenturer era guides + open-beta footage OCR; 3000 total per
+    /// city). Per script: arming ticks never grant; a hostile dropping
+    /// off the live roster lands exactly one `AddExp(per_kill, current
+    /// class)` per kill; an empty-ally roster (pre-onCreate window)
+    /// never touches the counter; and a SECOND session interleaved on
+    /// the same cached VM with a different live count neither mints
+    /// phantom EXP nor disturbs the first session's counter.
+    #[test]
+    fn real_seq005_content_scripts_grant_tutorial_kill_exp() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let actor = |id: u32, name: &str| userdata::LuaActor {
+            actor_id: id,
+            name: name.to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 2,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: CommandQueue::new(),
+            is_engaged: false,
+            speed: 0.0,
+            target_actor_id: 0,
+        };
+        let grants_in = |cmds: &[LuaCommand]| {
+            cmds.iter()
+                .filter_map(|c| match c {
+                    LuaCommand::AddExp {
+                        actor_id,
+                        class_id,
+                        exp,
+                    } => Some((*actor_id, *class_id, *exp)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (script, hostiles, per_kill) in [
+            ("content/SimpleContent30010.lua", 3u32, 1000i32), // Gridania wolves
+            ("content/SimpleContent30002.lua", 3, 1000),       // Limsa aurelias
+            ("content/SimpleContent30079.lua", 1, 3000),       // Ul'dah goobbue
+        ] {
+            let script_path = root.join(script);
+            assert!(script_path.exists(), "{script} missing");
+            // Fresh engine per script = fresh VM, like a server boot;
+            // every tick below shares it, like the live ticker.
+            let engine = LuaEngine::new(root);
+            // Session A (actor 42) and session B (actor 77) — each tick
+            // carries its own per-session roster, mirroring
+            // build_content_rosters.
+            let area_for = |player_id: u32, live: u32, with_ally: bool| {
+                let mut snap = sample_snapshot();
+                snap.actor_id = player_id;
+                snap.current_class = 2; // state_mainSkill[0] → AddExp target
+                let mut area = sample_content_area(CommandQueue::new());
+                area.players = vec![snap];
+                if with_ally {
+                    area.allies = vec![actor(0x4500_0000 + player_id, "ally")];
+                }
+                area.monsters = (0..live)
+                    .map(|i| actor(0x4600_0000 + player_id * 16 + i, "mob"))
+                    .collect();
+                area
+            };
+
+            // Pre-onCreate window: no roster at all (no allies) — the
+            // counter must not arm, or a stale value could later pay out
+            // against an unspawned fight.
+            let r0 = engine.call_content_on_update(&script_path, 1, area_for(42, 0, false));
+            assert!(r0.error.is_none(), "{script} tick0 errored: {:?}", r0.error);
+
+            // Session A arms: every hostile live — no grant.
+            let r1 = engine.call_content_on_update(&script_path, 2, area_for(42, hostiles, true));
+            assert!(r1.error.is_none(), "{script} tick1 errored: {:?}", r1.error);
+            assert_eq!(
+                grants_in(&r1.commands),
+                vec![],
+                "{script}: no grant while everything is alive",
+            );
+
+            // Session B arms on the SAME cached VM with its own roster.
+            let r2 = engine.call_content_on_update(&script_path, 3, area_for(77, hostiles, true));
+            assert!(r2.error.is_none(), "{script} tick2 errored: {:?}", r2.error);
+            assert_eq!(
+                grants_in(&r2.commands),
+                vec![],
+                "{script}: session B arming must not read session A's count",
+            );
+
+            // Session A: one hostile gone from the live-only roster
+            // (killed — S0.5 filters dead members out before the script
+            // runs) → exactly one per-kill grant to A.
+            let r3 =
+                engine.call_content_on_update(&script_path, 4, area_for(42, hostiles - 1, true));
+            assert!(r3.error.is_none(), "{script} tick3 errored: {:?}", r3.error);
+            assert_eq!(
+                grants_in(&r3.commands),
+                vec![(42, 2, per_kill)],
+                "{script}: exactly one per-kill grant to the player's class",
+            );
+
+            // Session B still at full strength on the next interleaved
+            // tick: the scalar-global bug would see B's count (3) vs A's
+            // stored 2 and mint phantom EXP here.
+            let r4 = engine.call_content_on_update(&script_path, 5, area_for(77, hostiles, true));
+            assert!(r4.error.is_none(), "{script} tick4 errored: {:?}", r4.error);
+            assert_eq!(
+                grants_in(&r4.commands),
+                vec![],
+                "{script}: session B at full strength must not be paid for A's kill",
+            );
+
+            // Session A again, unchanged count — no repeat grant.
+            let r5 =
+                engine.call_content_on_update(&script_path, 6, area_for(42, hostiles - 1, true));
+            assert!(r5.error.is_none(), "{script} tick5 errored: {:?}", r5.error);
+            assert_eq!(
+                grants_in(&r5.commands),
+                vec![],
+                "{script}: unchanged count must not re-grant",
+            );
+        }
+    }
+
+    /// The Limsa Hob handoff (man0l0 SEQ_010 → Man0l1), slice by slice
+    /// against the REAL scripts — the 2026-06-12 live run crashed the
+    /// client here because the final slice warped to the inn with the
+    /// talkDefault event still open: pmeteor's closer lives in hob.lua
+    /// (a PrivateArea populace script garlemald's talk dispatch never
+    /// reaches), man0l0's HOB arm early-returns at ReplaceQuest, and
+    /// man0l1.onStart carried no closer. The fix mirrors man0g1: the
+    /// onStart final slice must end with EndEvent.
+    #[test]
+    fn real_limsa_hob_handoff_final_slice_closes_event() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let engine = LuaEngine::new(root);
+
+        let mut snapshot = sample_snapshot();
+        snapshot.actor_id = 1;
+        snapshot.current_class = 3;
+        snapshot.active_quests = vec![110_001];
+        snapshot.active_quest_states = vec![userdata::QuestStateSnapshot {
+            quest_id: 110_001,
+            sequence: 10, // SEQ_010 — Limsa port, talking to Hob
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }];
+
+        // Slice 1: the talk → man0l0.onTalk parks on the choice RPC.
+        let hob = LuaNpcSpec {
+            actor_id: 0x4730_00DC, // live Hob actor id (log 06:13:57)
+            name: "hob".into(),
+            class_name: "PopulaceStandard".into(),
+            class_path: "/Chara/Npc/Populace/PopulaceStandard".into(),
+            unique_id: "hob".into(),
+            zone_id: 230,
+            zone_name: "sea0Town01a".into(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            actor_class_id: 1_000_151, // HOB in man0l0.lua
+            quest_graphic: 0,
+        };
+        let r1 = engine.call_quest_hook(
+            &root.join("quests/man/man0l0.lua"),
+            "onTalk",
+            snapshot.clone(),
+            userdata::LuaQuestHandle {
+                player_id: 1,
+                quest_id: 110_001,
+                has_quest: true,
+                sequence: 10,
+                flags: 0,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+                queue: CommandQueue::new(),
+            },
+            vec![QuestHookArg::Npc(hob)],
+        );
+        assert!(r1.error.is_none(), "onTalk errored: {:?}", r1.error);
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Slice 2: EventUpdate carries choice=1 → ReplaceQuest hands off
+        // to Man0l1 (CompleteQuest + AddQuest) and the onTalk coroutine
+        // finishes (its EndEvent is intentionally skipped — the closer
+        // belongs to man0l1.onStart, after processEvent010).
+        let s2 = engine
+            .fire_player_event_and_drain(1, &[common::luaparam::LuaParam::Int32(1)])
+            .expect("onTalk parked on the choice RPC");
+        assert!(
+            s2.iter().any(|c| matches!(
+                c,
+                LuaCommand::CompleteQuest {
+                    quest_id: 110_001,
+                    ..
+                }
+            )) && s2.iter().any(|c| matches!(
+                c,
+                LuaCommand::AddQuest {
+                    quest_id: 110_002,
+                    ..
+                }
+            )),
+            "ReplaceQuest must push CompleteQuest(110001)+AddQuest(110002); got {s2:?}",
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 0);
+
+        // Slice 3: apply_add_quest fires man0l1.onStart → parks on the
+        // processEvent010 RPC.
+        let mut snapshot2 = snapshot.clone();
+        snapshot2.active_quests = vec![110_002];
+        snapshot2.active_quest_states = vec![userdata::QuestStateSnapshot {
+            quest_id: 110_002,
+            sequence: 0,
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }];
+        let r3 = engine.call_quest_hook(
+            &root.join("quests/man/man0l1.lua"),
+            "onStart",
+            snapshot2,
+            userdata::LuaQuestHandle {
+                player_id: 1,
+                quest_id: 110_002,
+                has_quest: true,
+                sequence: 0,
+                flags: 0,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+                queue: CommandQueue::new(),
+            },
+            vec![],
+        );
+        assert!(r3.error.is_none(), "onStart errored: {:?}", r3.error);
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Slice 4: the inn warp — and the load-bearing EndEvent closer,
+        // which must come BEFORE the warp: garlemald's DoZoneChange
+        // ships the full zone-in replay inline (deleting Hob, the
+        // event's owner), and both an absent AND a trailing EndEvent
+        // crashed the live client (2026-06-12, two runs).
+        let s4 = engine
+            .fire_player_event_and_drain(1, &[])
+            .expect("onStart parked on processEvent010");
+        let end_pos = s4
+            .iter()
+            .position(|c| matches!(c, LuaCommand::EndEvent { .. }));
+        let warp_pos = s4
+            .iter()
+            .position(|c| matches!(c, LuaCommand::DoZoneChange { zone_id: 133, .. }));
+        assert!(
+            warp_pos.is_some(),
+            "final slice must warp to the inn; got {s4:?}"
+        );
+        assert!(
+            end_pos.is_some() && end_pos < warp_pos,
+            "final slice must CLOSE the talk event BEFORE the warp; got {s4:?}",
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 0);
+    }
+
+    /// All three follow-up quests' `onStart` (the opener → MSQ-2
+    /// handoffs) warp the player to the adventurers' guild from inside
+    /// the still-open handoff talk event — each final slice must close
+    /// the event BEFORE the DoZoneChange (the warp's inline zone-in
+    /// replay deletes the event-owner NPC; a trailing EndEvent arrives
+    /// after the client has already crashed — 2026-06-12 live runs).
+    #[test]
+    fn real_follow_up_quest_onstart_final_slice_ends_event() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        for (script, quest_id, dest_zone) in [
+            ("quests/man/man0l1.lua", 110_002u32, 133u32), // Limsa → the inn
+            ("quests/man/man0g1.lua", 110_006, 155),       // Gridania → Carline Canopy
+            ("quests/man/man0u1.lua", 110_010, 175),       // Ul'dah → the Quicksand
+        ] {
+            let engine = LuaEngine::new(root);
+            let mut snapshot = sample_snapshot();
+            snapshot.actor_id = 1;
+            snapshot.active_quests = vec![quest_id];
+            snapshot.active_quest_states = vec![userdata::QuestStateSnapshot {
+                quest_id,
+                sequence: 0,
+                flags: 0,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+            }];
+            let r = engine.call_quest_hook(
+                &root.join(script),
+                "onStart",
+                snapshot,
+                userdata::LuaQuestHandle {
+                    player_id: 1,
+                    quest_id,
+                    has_quest: true,
+                    sequence: 0,
+                    flags: 0,
+                    counters: [0; 3],
+                    npc_ls_from: 0,
+                    npc_ls_msg_step: 0,
+                    queue: CommandQueue::new(),
+                },
+                vec![],
+            );
+            assert!(r.error.is_none(), "{script} onStart errored: {:?}", r.error);
+            assert_eq!(
+                engine.scheduler().lock().unwrap().pending_event_count(),
+                1,
+                "{script}: onStart must park on its intro RPC",
+            );
+            let last = engine
+                .fire_player_event_and_drain(1, &[])
+                .expect("onStart parked");
+            let end_pos = last
+                .iter()
+                .position(|c| matches!(c, LuaCommand::EndEvent { .. }));
+            let warp_pos = last.iter().position(
+                |c| matches!(c, LuaCommand::DoZoneChange { zone_id, .. } if *zone_id == dest_zone),
+            );
+            assert!(
+                warp_pos.is_some(),
+                "{script}: final slice must warp to zone {dest_zone}; got {last:?}",
+            );
+            assert!(
+                end_pos.is_some() && end_pos < warp_pos,
+                "{script}: final slice must close the event BEFORE the warp; got {last:?}",
             );
         }
     }

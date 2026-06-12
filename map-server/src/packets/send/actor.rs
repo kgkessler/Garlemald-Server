@@ -664,6 +664,11 @@ pub fn build_player_property_init(
     tp: u16,
     main_skill: u8,
     main_skill_level: u8,
+    // Current skill points of the active class — feeds the XP bar at
+    // zone-in. Previously hardcoded 0 on the wire, which rendered any
+    // pre-warp EXP as a reset to 0 (the level companion was hardcoded
+    // 1 at the call site).
+    skill_point: i32,
     command_border: u8,
     tribe: u8,
     guardian: u8,
@@ -732,11 +737,11 @@ pub fn build_player_property_init(
     // Cast gauge defaults are floats (C# `float[] castGauge_speed = { 1.0f, 0.25f }`).
     b.add_float("charaWork.battleTemp.castGauge_speed[0]", 1.0);
     b.add_float("charaWork.battleTemp.castGauge_speed[1]", 0.25);
-    // `skillPoint` is int[] per C# BattleSave.
+    // `skillPoint` is int[] per C# BattleSave; wire slot is class-1.
     let skill_slot = main_skill.saturating_sub(1);
     b.add_int(
         &format!("charaWork.battleSave.skillPoint[{}]", skill_slot),
-        0,
+        skill_point.max(0) as u32,
     );
 
     b.add_byte("charaWork.commandBorder", command_border);
@@ -1197,6 +1202,7 @@ mod player_property_init_tests {
             0,
             2,
             1,
+            0,
             32,
             0,
             0,
@@ -1247,6 +1253,7 @@ mod player_property_init_tests {
             0,
             3,
             1,
+            0,
             32,
             0,
             0,

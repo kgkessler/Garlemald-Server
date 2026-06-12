@@ -772,6 +772,9 @@ impl UserData for LuaPlayer {
     // here. New scripts should prefer the method form when adding a
     // binding.
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        // Same dot-syntax id LuaActor exposes — the SEQ_005 content
+        // scripts key their per-player kill-EXP counters by it.
+        fields.add_field_method_get("actorId", |_, this| Ok(this.snapshot.actor_id));
         fields.add_field_method_get("hasChocobo", |_, this| Ok(this.snapshot.has_chocobo));
         fields.add_field_method_get("mountState", |_, this| Ok(this.snapshot.mount_state));
         fields.add_field_method_get("chocoboAppearance", |_, this| {
@@ -2089,17 +2092,38 @@ impl UserData for LuaPlayer {
         );
 
         // --- Economy / progression ------------------------------------------
-        methods.add_method("AddExp", |_, this, (class_id, exp): (u8, i32)| {
-            push(
-                &this.queue,
-                LuaCommand::AddExp {
-                    actor_id: this.snapshot.actor_id,
-                    class_id,
-                    exp,
-                },
-            );
-            Ok(())
-        });
+        // `player:AddExp(exp, classId, bonusPercent)` — pmeteor's
+        // `Player.AddExp(int exp, byte classId, byte bonusPercent = 0)`
+        // argument order (Player.cs:2932), which is what the ported
+        // scripts use (`gm/giveexp.lua`, the SEQ_005 tutorial kill
+        // grants). The previous garlemald-only `(classId, exp)` order
+        // silently mis-bound giveexp's qty as the class id. The bonus
+        // is folded into the queued gain the same way upstream does
+        // (`exp += ceil(exp * bonusPercent / 100)`) before the rollover
+        // math in `apply_add_exp` runs.
+        methods.add_method(
+            "AddExp",
+            |_, this, (exp, class_id, bonus_percent): (i32, u8, Option<i32>)| {
+                let bonus = bonus_percent.unwrap_or(0).max(0);
+                let exp = if exp > 0 && bonus > 0 {
+                    // i64 intermediate: `exp * bonus` at the i32 extremes
+                    // would overflow before the /100 brings it back down.
+                    let bonused = exp as i64 + (exp as i64 * bonus as i64 + 99) / 100;
+                    bonused.min(i32::MAX as i64) as i32
+                } else {
+                    exp
+                };
+                push(
+                    &this.queue,
+                    LuaCommand::AddExp {
+                        actor_id: this.snapshot.actor_id,
+                        class_id,
+                        exp,
+                    },
+                );
+                Ok(())
+            },
+        );
 
         // Convenience over Meteor's
         // `player:GetItemPackage(INVENTORY_CURRENCY):AddItem(1000001, qty, 1)`.
@@ -2165,25 +2189,71 @@ impl UserData for LuaPlayer {
             //   (sourceActor, textIdOwner, textId, log, …) — 4+ args
             //     (the OpeningStoper* "caution" handlers pass the
             //      player first)
-            // The previous binding hard-typed the 3-arg shape, so a
-            // 4-arg call failed the u32 conversion and the whole hook
-            // died before its EndEvent — the Ul'dah stopper's caution
-            // line never reached the client (issue #26 retest). Sniff
-            // the first integer arg as textId, the next as logType,
-            // and skip the leading actor userdata args.
-            let mut ints = args.iter().filter_map(|v| match v {
-                Value::Integer(i) => Some(*i),
-                Value::Number(n) => Some(*n as i64),
-                _ => None,
-            });
-            let Some(text_id) = ints.next() else {
+            // The TEXT OWNER is the actor whose text sheet hosts the
+            // id — the client resolves `textId` against the owner's
+            // sheet, and a wrong owner is FATAL client-side: man0l1's
+            // 320/321 (quest-sheet ids on the Man0l1 static actor
+            // 0xA0F1ADB2) shipped with the old hardcoded WorldMaster
+            // owner crashed the client on every Hob → inn handoff.
+            // The owner arrives as: a LuaQuestHandle (`quest` → static
+            // actor 0xA0F00000 | quest_id), an actor userdata, a large
+            // integer (GetStaticActor returns raw ids), or nothing /
+            // GetWorldMaster()'s Nil (→ WorldMaster). The LAST owner-
+            // shaped arg before the textId wins, so the 4-arg
+            // (sourceActor, textIdOwner, …) shape resolves to the
+            // textIdOwner. Integers ≤ 0xFFFF are textId then logType.
+            let mut text_owner: u32 = crate::packets::send::WORLD_MASTER_ACTOR_ID;
+            let mut text_id: Option<i64> = None;
+            let mut log_type: Option<i64> = None;
+            for v in args.iter() {
+                match v {
+                    Value::UserData(ud) if text_id.is_none() => {
+                        if let Ok(id) = ud.borrow_scoped::<LuaQuestHandle, _>(|q| {
+                            0xA0F0_0000u32 | (q.quest_id & 0x000F_FFFF)
+                        }) {
+                            text_owner = id;
+                        } else if let Ok(id) =
+                            ud.borrow_scoped::<LuaPlayer, _>(|p| p.snapshot.actor_id)
+                        {
+                            text_owner = id;
+                        } else if let Ok(id) = ud.borrow_scoped::<LuaActor, _>(|a| a.actor_id) {
+                            text_owner = id;
+                        } else if let Ok(id) = ud.borrow_scoped::<LuaNpc, _>(|n| n.base.actor_id) {
+                            text_owner = id;
+                        }
+                    }
+                    Value::Integer(i) => {
+                        let i = *i;
+                        if text_id.is_none() && i > 0xFFFF {
+                            text_owner = i as u32;
+                        } else if text_id.is_none() {
+                            text_id = Some(i);
+                        } else if log_type.is_none() {
+                            log_type = Some(i);
+                        }
+                    }
+                    Value::Number(n) => {
+                        let i = *n as i64;
+                        if text_id.is_none() && i > 0xFFFF {
+                            text_owner = i as u32;
+                        } else if text_id.is_none() {
+                            text_id = Some(i);
+                        } else if log_type.is_none() {
+                            log_type = Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(text_id) = text_id else {
                 return Ok(());
             };
-            let log_type = ints.next().map(|v| v.clamp(0, 255) as u8).unwrap_or(0x20);
+            let log_type = log_type.map(|v| v.clamp(0, 255) as u8).unwrap_or(0x20);
             push(
                 &this.queue,
                 LuaCommand::SendGameMessage {
                     actor_id: this.snapshot.actor_id,
+                    text_owner_id: text_owner,
                     text_id: text_id.max(0) as u32,
                     log_type,
                 },

@@ -569,22 +569,64 @@ impl CommandProcessor {
     /// warp without the director piggyback (quest scripts can still
     /// create the director separately).
     async fn handle_warp(&self, args: &Args<'_>) -> String {
-        const USAGE: &str = "usage: warp <x> <y> <z> [name] | warp <zone> <x> <y> <z> [name]";
+        const USAGE: &str = "usage: warp <x> <y> <z> [name] | warp <zone> <x> <y> <z> [name] | \
+                             warp <zone> <privateAreaName> <paLevel> <x> <y> <z> [name]";
         // Meteor's `warp.lua` dispatches on argc: exactly three numeric
         // args means "move within the current zone" (the
         // `DoPlayerMoveInZone` branch); four or more is the cross-zone
-        // `DoZoneChange` form.
+        // `DoZoneChange` form. The private-area form (arg 1 non-numeric)
+        // routes the player into the named PrivateArea instance — the
+        // test harness for quest destinations like
+        // `warp 133 PrivateAreaMasterPast 2 -459.62 40 196.37 <name>`.
         let same_zone_form = args.len() == 3
             && args.parse_f32(0).is_ok()
             && args.parse_f32(1).is_ok()
             && args.parse_f32(2).is_ok();
-        let (explicit_zone, x, y, z, name) = if same_zone_form {
+        let private_area_form =
+            args.len() >= 6 && args.parse_u32(0).is_ok() && args.parse_f32(1).is_err();
+        let (explicit_zone, private_area, private_area_type, x, y, z, name) = if same_zone_form {
             (
                 None,
+                None,
+                0u32,
                 args.parse_f32(0).unwrap(),
                 args.parse_f32(1).unwrap(),
                 args.parse_f32(2).unwrap(),
                 args.rest_joined(3),
+            )
+        } else if private_area_form {
+            let zone_id = match args.parse_u32(0) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let pa_name = match args.rest().get(1) {
+                Some(s) => s.to_string(),
+                None => return USAGE.into(),
+            };
+            let pa_level = match args.parse_u32(2) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let x = match args.parse_f32(3) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let y = match args.parse_f32(4) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let z = match args.parse_f32(5) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            (
+                Some(zone_id),
+                Some(pa_name),
+                pa_level,
+                x,
+                y,
+                z,
+                args.rest_joined(6),
             )
         } else {
             let zone_id = match args.parse_u32(0) {
@@ -603,7 +645,7 @@ impl CommandProcessor {
                 Ok(v) => v,
                 Err(e) => return format!("{USAGE} — {e}"),
             };
-            (Some(zone_id), x, y, z, args.rest_joined(4))
+            (Some(zone_id), None, 0u32, x, y, z, args.rest_joined(4))
         };
         let Some(name) = name else {
             return USAGE.into();
@@ -644,25 +686,46 @@ impl CommandProcessor {
         // which is SetActorPosition with the embedded actor id set to
         // 0xFFFFFFFF ("self") — NOT the player's id; the client ignores
         // the move otherwise. `warp.lua` passes spawn type 0x00
-        // (SPAWNTYPE_FADEIN) on this path. Cross-zone warp needs a full
-        // DoZoneChange flow the caller can drive by logging out +
-        // logging back in (left as a follow-up).
-        if current_zone_id == zone_id
-            && let Some(client) = self.world.client(session_id).await
-        {
-            // The world-server relay drops subpackets whose target_id
-            // is 0 (`world-server/src/server.rs`, zone-reply fan-out),
-            // so stamp the destination session on both — verified via
-            // packet logs: un-stamped 0xE2/0xCE reached the world and
-            // were never forwarded to the client.
-            let mut e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
-            e2.set_target_id(session_id);
-            client.send_bytes(e2.to_bytes()).await;
-            let mut pkt = crate::packets::send::build_set_actor_position(
-                actor_id, -1, x, y, z, rotation, 0, false,
-            );
-            pkt.set_target_id(session_id);
-            client.send_bytes(pkt.to_bytes()).await;
+        // (SPAWNTYPE_FADEIN) on this path.
+        if current_zone_id == zone_id {
+            if let Some(client) = self.world.client(session_id).await {
+                // The world-server relay drops subpackets whose target_id
+                // is 0 (`world-server/src/server.rs`, zone-reply fan-out),
+                // so stamp the destination session on both — verified via
+                // packet logs: un-stamped 0xE2/0xCE reached the world and
+                // were never forwarded to the client.
+                let mut e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
+                e2.set_target_id(session_id);
+                client.send_bytes(e2.to_bytes()).await;
+                let mut pkt = crate::packets::send::build_set_actor_position(
+                    actor_id, -1, x, y, z, rotation, 0, false,
+                );
+                pkt.set_target_id(session_id);
+                client.send_bytes(pkt.to_bytes()).await;
+            }
+        } else {
+            // Cross-zone warp — the full `DoZoneChange` flow: actor
+            // migration, 0x00E2 latch, and the zone-in bundle with the
+            // retail keep-list cleanup. Same-region destinations get the
+            // retail ~6 s deferred bundle (see `apply_do_zone_change`),
+            // which also makes this command the repeatable harness for
+            // exercising that path without replaying a quest flow.
+            crate::runtime::quest_apply::apply_do_zone_change(
+                actor_id,
+                zone_id,
+                private_area.clone(),
+                private_area_type,
+                2, // retail "warp by gm" spawn code
+                x,
+                y,
+                z,
+                rotation,
+                &self.registry,
+                &self.db,
+                &self.world,
+                Some(&self.lua),
+            )
+            .await;
         }
         format!("warped {name} to zone {zone_id} at ({x:.2}, {y:.2}, {z:.2})")
     }

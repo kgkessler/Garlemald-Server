@@ -136,12 +136,16 @@ pub fn build_mass_delete_actor_start(actor_id: u32) -> SubPacket {
 }
 
 /// OP_MASS_DELETE_ACTOR_X11 (0x0008, game-message opcode) — Mass
-/// Delete Actor Body (variable-count). Capacity 11 actors per
-/// packet.
+/// Delete Actor Body (variable-count). Capacity **8** actors per
+/// packet: the 1.23b client's receiver (`FUN_004dc690` case 8, decomp
+/// 2026-06-12) reads the count at body+0, the id array at body+4, and
+/// a parallel FLAGS array at body+0x24 — ids 9+ would overlap the
+/// flags region. Retail never ships more than 8 per packet (every
+/// capture chunked 8/2, 8/5).
 ///
 /// Wire format decoded from `ffxiv_traces/from_gridania_to_blackshroud.pcapng`
 /// 0x0008 OUT record #1: 48-byte body =
-/// `u32 count + u32[count] actor_ids + zero pad`.
+/// `u32 count + u32[8] actor_ids + u32[8] flags (zeroed)`.
 ///
 /// **Different layer from `OP_PONG`** despite same numeric value:
 /// this builder emits a game-message subpacket (type 3) with
@@ -150,7 +154,7 @@ pub fn build_mass_delete_actor_start(actor_id: u32) -> SubPacket {
 /// game-message header). See the doc on `OP_MASS_DELETE_ACTOR_X11`
 /// for the full disambiguation.
 pub fn build_mass_delete_actor_x11(actor_id: u32, exempt_actors: &[u32]) -> SubPacket {
-    const CAPACITY: usize = 11;
+    const CAPACITY: usize = 8;
     let mut data = body(0x50);
     let n = exempt_actors.len().min(CAPACITY);
     data[0..4].copy_from_slice(&(n as u32).to_le_bytes());
@@ -337,19 +341,23 @@ mod mass_delete_actor_tests {
         assert_eq!(pkt.data, expected);
     }
 
-    /// Truncates above the 11-actor capacity.
+    /// Truncates above the 8-actor capacity — the client's receiver
+    /// reads a parallel flags array at body+0x24 (= after 8 ids), so
+    /// ids past slot 7 would overwrite it (decomp `FUN_004dc690`
+    /// case 8, 2026-06-12).
     #[test]
     fn mass_delete_actor_x11_truncates_overflow() {
         let actors: Vec<u32> = (0..16).map(|i| 0x4670_0000 | i).collect();
         let pkt = build_mass_delete_actor_x11(1, &actors);
         let count = u32::from_le_bytes(pkt.data[0..4].try_into().unwrap());
-        assert_eq!(count, 11);
-        // Slot 11 is at offset 4 + 11*4 = 48; that's beyond the body
-        // so the 12th actor was dropped.
+        assert_eq!(count, 8);
+        // Slot 7 (the last) holds the 8th actor; the flags region from
+        // body+0x24 to the end of the 48-byte body stays zeroed.
         assert_eq!(
-            u32::from_le_bytes(pkt.data[4 + 10 * 4..4 + 10 * 4 + 4].try_into().unwrap()),
-            0x4670_000A,
+            u32::from_le_bytes(pkt.data[4 + 7 * 4..4 + 7 * 4 + 4].try_into().unwrap()),
+            0x4670_0007,
         );
+        assert!(pkt.data[0x24..].iter().all(|b| *b == 0));
     }
 
     #[test]

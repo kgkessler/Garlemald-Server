@@ -229,10 +229,12 @@ pub async fn apply_runtime_lua_command(
         // opening stoppers' "caution" circle (text 34109 "off limits").
         LC::SendGameMessage {
             actor_id,
+            text_owner_id,
             text_id,
             log_type,
         } => {
-            apply_send_game_message(actor_id, text_id, log_type, registry, world).await;
+            apply_send_game_message(actor_id, text_owner_id, text_id, log_type, registry, world)
+                .await;
             true
         }
         LC::AddExp {
@@ -1472,18 +1474,39 @@ pub(crate) async fn apply_content_finished(
         apply_despawn_actor(parent_zone_id, actor_id, registry, world).await;
     }
 
-    // 3 + 4. Roster + content-script clears.
+    // 3 + 4. Roster + content-script clears. The content director was
+    //    also installed as the session's LOGIN director by the opener
+    //    flows (`doContentArea` → `player:SetLoginDirector(director)`)
+    //    — clear that too, or every later zone-in bundle RESURRECTS the
+    //    despawned director: spawn packets for a dead actor with a
+    //    stale zone-suffixed name, plus the player's "Is Init Director"
+    //    script bind referencing it. That corpse rode every crashing
+    //    Hob → inn bundle and none of the working loads (cold logins /
+    //    GM warps carry no login director). pmeteor never resurrects it
+    //    either — `RemoveDirector` drops it from `ownedDirectors`
+    //    before any `SendZoneInPackets` runs.
     snap.transient_director_members.remove(&director_id);
     snap.transient_party_members.clear();
     snap.active_content_script = None;
+    if snap
+        .login_director
+        .as_ref()
+        .is_some_and(|spec| spec.actor_id == director_id)
+    {
+        snap.login_director = None;
+    }
     world.upsert_session(snap).await;
 
-    // 5. Player teardown — MinimumHpLock off.
+    // 5. Player teardown — MinimumHpLock off + the chara-side login-
+    //    director reference (the bundle's player-bind branch reads it).
     let player_id = match registry.by_session(session_id).await {
         Some(player) => {
             {
                 let mut c = player.character.write().await;
                 c.chara.mods.set(crate::actor::Modifier::MinimumHpLock, 0.0);
+                if c.chara.login_director_actor_id == director_id {
+                    c.chara.login_director_actor_id = 0;
+                }
             }
             player.actor_id
         }
@@ -1692,6 +1715,13 @@ pub(crate) async fn apply_do_zone_change(
         return;
     }
 
+    // Pre-move zone — feeds the same-region detection in step 5.
+    let old_zone_id = world
+        .session(session_id)
+        .await
+        .map(|s| s.current_zone_id)
+        .unwrap_or(0);
+
     // 1. Migrate the actor between zones (no-op if zone_id is the
     //    same as the current zone). `do_zone_change_with_private_area`
     //    also updates the session's destination + zone +
@@ -1743,6 +1773,33 @@ pub(crate) async fn apply_do_zone_change(
             &mut status_outbox,
         );
     }
+    // Persist the new zone + private area + coords to the characters
+    // row IMMEDIATELY (pmeteor `Player.CleanupAndSave` semantics). The
+    // DB writer existed but had zero callers, so currentZoneId only
+    // ever held the lobby-creation value — any crash/force-quit after a
+    // warp made the next login cold-load the STALE zone (the recurring
+    // "softlocked on Now Loading showing the ship" relogs).
+    if let Err(e) = db
+        .save_player_position(
+            player_id,
+            zone_id,
+            private_area.as_deref().unwrap_or(""),
+            private_area_type,
+            zone_id,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+        )
+        .await
+    {
+        tracing::warn!(
+            player = player_id,
+            err = %e,
+            "DoZoneChange: position persist failed",
+        );
+    }
     // Same drain shape as the processor's `drain_status_outbox` —
     // without the Lua engine the wire/save/recalc fan-out is dropped
     // but the in-memory purge above has already landed.
@@ -1772,52 +1829,102 @@ pub(crate) async fn apply_do_zone_change(
         tracing::warn!(player = player_id, "DoZoneChange: no client");
         return;
     };
-    // Tagged with the session id — untargeted subpackets are dropped by
-    // the world-server proxy fan-out, so this pair never reached the
-    // client before (see the matching block + decomp notes in
-    // `apply_do_zone_change_content`). Cross-zone warps still completed
-    // because a real region change takes the SetMap handler's
-    // region-mismatch arm; delivering the wipe + 0x00E2 restores pmeteor
-    // parity (`DoZoneChange`, WorldManager.cs:877-879). Subcode 0x02 is
-    // what pmeteor sends for full zone changes (0x10 is the in-place /
-    // content-instance variant) — both set the client's force-reload
-    // latch, so the distinction is parity-only. (Garlemald-Server #28.)
+    // Force-reload latch only. Retail warps NEVER wipe the old zone's
+    // actors up front (`return_to_inn` / `teleport_to_gridania` /
+    // `move_out_of_room` pcaps): the old-actor cleanup is the Mass
+    // Delete KEEP-LIST commit at the END of the zone-in bundle
+    // (`send_zone_in_bundle(.., commit_keep_list = true)` below), whose
+    // exempt lists name every just-spawned actor — the player included.
+    // The prior shape here — a bare 0x0007 wipe-all ahead of the bundle
+    // — deleted the player's own actor mid-scene: tolerated on
+    // cross-region warps (the region mismatch forces a clean scene
+    // rebuild) but FATAL on a same-region map change (the 230 → 133
+    // Drowning Wench warp crashed four live runs while a cold login
+    // into the identical destination bundle works). Subcode 0x02 is the
+    // full-zone-change latch value retail/pmeteor use (0x10 is the
+    // in-place / content-instance variant). Tagged with the session id
+    // — untargeted subpackets are dropped by the world-server proxy
+    // fan-out. (Garlemald-Server #28.)
     {
-        let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
-        wipe.set_target_id(session_id);
-        client.send_bytes(wipe.to_bytes()).await;
         let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
         e2.set_target_id(session_id);
         client.send_bytes(e2.to_bytes()).await;
     }
 
-    // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
-    //    from the session + character we just updated, so the
-    //    bundle spawns the player at the new coords.
-    world
-        .send_zone_in_bundle(
-            registry,
-            db,
-            lua.map(|l| l.catalogs()),
-            session_id,
-            spawn_type as u16,
-        )
-        .await;
-
-    // 6. pmeteor sends the 34108 "instance" message AFTER the bundle
-    //    when the destination is a PrivateArea (`if (newArea is
-    //    PrivateArea)`, WorldManager.cs:887-888) — the SEQ_005 return
-    //    warp into zone 155's PrivateAreaMasterPast takes this branch
-    //    in the reference capture. (Garlemald-Server #28.)
-    if private_area.is_some() {
-        let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
-            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-            34108,
-            0x20,
+    // 5. Dispatch the zone-in bundle — retail-paced. SAME-REGION map
+    //    changes get the bundle DEFERRED ~6 s behind the 0x00E2 latch
+    //    (parked on the session; the game ticker fires it), matching
+    //    retail's bundle pacing (return_to_inn / move_out_of_room /
+    //    teleport_to_gridania pcaps, uniformly ~5.8-6.0 s of
+    //    bundle-silence — though never SESSION-silence: pongs keep
+    //    flowing). Decomp note (FUN_0059ced0/FUN_0059e3c0, 2026-06-12):
+    //    the client's scene teardown is asynchronous and driven by the
+    //    0x00CE order machine, NOT by this gap — the deferral is
+    //    retail parity, not a proven client requirement, and could
+    //    likely be shortened. It shipped as part of the fix stack that
+    //    stopped the 230 → 133 Drowning Wench warp crash (with the
+    //    keep-list cleanup and the per-class NPC init binds — the
+    //    latter being the proven in-bundle crash: door NPCs with the
+    //    populace-shaped bind tail die in initForEvent mid-load).
+    //    Cross-region warps keep the live-proven immediate flush. The
+    //    34108 PrivateArea notice travels with whichever path
+    //    dispatches the bundle (pmeteor: after it, WorldManager.cs:
+    //    887-888).
+    let same_region = {
+        let old_region = match world.zone(old_zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => 0,
+        };
+        let new_region = match world.zone(zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => u16::MAX,
+        };
+        old_region == new_region
+    };
+    if same_region {
+        const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
+        let fire_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            + RETAIL_ZONE_CHANGE_GAP_MS;
+        if let Some(mut snap) = world.session(session_id).await {
+            snap.pending_zone_in = Some(crate::data::PendingZoneIn {
+                fire_at_unix_ms,
+                spawn_type: spawn_type as u16,
+                commit_keep_list: true,
+                notify_private_area: private_area.is_some(),
+            });
+            world.upsert_session(snap).await;
+        }
+        tracing::info!(
+            player = player_id,
+            zone = zone_id,
+            old_zone = old_zone_id,
+            "zone-in bundle deferred (retail same-region pacing)",
         );
-        msg.set_target_id(session_id);
-        client.send_bytes(msg.to_bytes()).await;
+    } else {
+        world
+            .send_zone_in_bundle(
+                registry,
+                db,
+                lua,
+                session_id,
+                spawn_type as u16,
+                /* commit_keep_list */ true,
+            )
+            .await;
+
+        if private_area.is_some() {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
     }
 
     tracing::info!(
@@ -2500,6 +2607,8 @@ pub async fn apply_add_exp(
         emit_exp_property_updates(
             actor_id,
             class_id,
+            exp,
+            effective_gain,
             new_exp,
             new_level,
             levels_gained,
@@ -2550,24 +2659,71 @@ pub fn consume_rested_xp(exp: i32, rested: i32) -> (i32, i32) {
     (total, new_rested)
 }
 
-/// Emit the `SetActorProperty` packets Meteor's `AddExp` sends after
-/// a successful gain. Target strings mirror Meteor's
-/// `ActorPropertyPacketUtil` usage:
+/// Per-class "You earn [exp] experience points." text ids — pmeteor's
+/// `BattleUtils.ClassExperienceTextIds` (`Map Server/Actors/Chara/Ai/
+/// Utils/BattleUtils.cs:102-123`). One id per class because non-English
+/// locales inflect the class name into the line. Returns `None` for
+/// ids outside the table (e.g. jobs, retired classes): the gain still
+/// applies, the chat line is just skipped.
+fn class_experience_text_id(class_id: u8) -> Option<u16> {
+    Some(match class_id {
+        2 => 33934,  // Pugilist
+        3 => 33935,  // Gladiator
+        4 => 33936,  // Marauder
+        7 => 33937,  // Archer
+        8 => 33938,  // Lancer
+        10 => 33939, // Sentinel (retired class; the text id survives in the client files)
+        22 => 33940, // Thaumaturge
+        23 => 33941, // Conjurer
+        29 => 33945, // Carpenter
+        30 => 33946, // Blacksmith
+        31 => 33947, // Armorer
+        32 => 33948, // Goldsmith
+        33 => 33949, // Leatherworker
+        34 => 33950, // Weaver
+        35 => 33951, // Alchemist
+        36 => 33952, // Culinarian
+        39 => 33953, // Miner
+        40 => 33954, // Botanist
+        41 => 33955, // Fisher
+        _ => return None,
+    })
+}
+
+/// Emit the wire updates Meteor's `AddExp` sends after a successful
+/// gain, in pmeteor's order (`Player.cs:2932-2976` + the caller's
+/// `DoBattleAction(0, 0, actionList)`):
 ///
-///   - `charaWork/battleStateForSelf` → `skillPoint[class-1]`,
-///     `playerWork.restBonusExpRate` (self-only).
-///   - `charaWork/stateForAll` → `skillLevel[class-1]`,
-///     `state_mainSkillLevel` (self + broadcast on level-up).
+///   1. `charaWork/stateForAll` → `skillLevel[class-1]`,
+///      `state_mainSkillLevel` (self + nearby broadcast, level-up only),
+///   2. `charaWork/battleStateForSelf` → `skillPoint[class-1]`,
+///      `playerWork.restBonusExpRate` (self-only),
+///   3. one 0x0139-family CommandResult batch carrying the text rows
+///      ("You earn …" / "You attain level …" / "You learn …").
 ///
-/// The level-up packets now fan to nearby Players via the shared
-/// `broadcast_around_actor` helper — the `/stateForAll` target name
-/// is retail's convention for "everyone who can see this actor
-/// needs this value", and matches how Meteor's `QueuePackets` fans
-/// `ActorPropertyPacketUtil` output after a level up.
+/// Wire rules (the reason this path's first live run showed nothing
+/// client-side):
+///   - Ship RAW subpacket bytes — the connection write task wraps each
+///     mpsc frame in a BasePacket itself
+///     (`server.rs`/`wrap_subpackets_in_basepacket`); pre-wrapping with
+///     `BasePacket::create_from_subpacket` double-framed every packet
+///     and the world-server proxy read the inner BasePacket header as
+///     a garbage subpacket.
+///   - Stamp the owner's session into self-bound subpackets — the
+///     proxy fan-out drops `target_id == 0` frames (the rule
+///     `send_to_self_if_player` / `apply_send_game_message` already
+///     follow). Broadcast legs stay 0 for per-recipient stamping
+///     inside `broadcast_around_actor`.
+///   - Text ids 33909/33926/the 33934-family render ONLY as
+///     CommandResult rows on the battle-log channel; the previous
+///     `build_game_message` emission used opcode 0x01FD, which exists
+///     in neither pmeteor's packet family nor the 1.x opcode table.
 #[allow(clippy::too_many_arguments)]
 async fn emit_exp_property_updates(
     actor_id: u32,
     class_id: u8,
+    base_exp: i32,
+    effective_gain: i32,
     new_exp: i32,
     new_level: i16,
     levels_gained: i16,
@@ -2586,38 +2742,15 @@ async fn emit_exp_property_updates(
         return;
     };
     let class_slot = class_id.saturating_sub(1);
+    // Silent None when the zone isn't live (pure DB-only tests) — the
+    // broadcast legs just skip.
+    let zone = world.zone(handle.zone_id).await;
 
-    // Self-only: skillPoint + restBonusExpRate — owner sees their
-    // own XP bar and rested-exp UI widget, nobody else needs to.
-    let mut self_only_packets = Vec::new();
-    {
-        let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
-            actor_id,
-            "charaWork/battleStateForSelf",
-        );
-        b.add_int(
-            &format!("charaWork.battleSave.skillPoint[{}]", class_slot),
-            new_exp as u32,
-        );
-        if rested_before != rested_after {
-            b.add_int("playerWork.restBonusExpRate", rested_after as u32);
-        }
-        self_only_packets.extend(b.done());
-    }
-    for sub in &self_only_packets {
-        if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
-            client.send_bytes(base.to_bytes()).await;
-        }
-    }
-
-    // Level-up: skillLevel + state_mainSkillLevel. Fan to nearby
-    // players AND self — the owner's client also reads the stateForAll
-    // row, so it needs the same bytes. Source is excluded by
-    // `actors_around` inside the broadcast helper, but we still
-    // send to the owning client directly so the packet isn't
-    // dropped if the broadcast grid happens not to include them
-    // (e.g. first frame after a zone-change before the grid
-    // re-registers the player).
+    // 1. Level-up: skillLevel + state_mainSkillLevel, self + nearby —
+    // `/stateForAll` is retail's "everyone who can see this actor"
+    // convention. The source is excluded by `actors_around`, so the
+    // direct self leg is required (same pair the live combat log's
+    // `broadcast_results` uses).
     if levels_gained > 0 {
         let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
             actor_id,
@@ -2631,127 +2764,153 @@ async fn emit_exp_property_updates(
             "charaWork.parameterSave.state_mainSkillLevel",
             new_level as u16,
         );
-        let level_packets = b.done();
-        for sub in &level_packets {
-            if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
-                client.send_bytes(base.to_bytes()).await;
+        for sub in b.done() {
+            let bytes = sub.to_bytes();
+            crate::runtime::dispatcher::send_to_self_if_player(
+                registry,
+                world,
+                actor_id,
+                bytes.clone(),
+            )
+            .await;
+            if let Some(zone) = &zone {
+                let _ = crate::runtime::broadcast::broadcast_around_actor(
+                    world,
+                    registry,
+                    zone,
+                    handle.actor_id,
+                    bytes,
+                )
+                .await;
             }
         }
-        // Nearby broadcast — look up the zone by the player's
-        // current zone id, fan each subpacket bytes to every
-        // nearby Player. Silent no-op if the zone isn't live (e.g.
-        // in a pure DB-only integration test).
-        if let Some(zone) = world.zone(handle.zone_id).await {
-            for sub in &level_packets {
-                if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
-                    let _ = crate::runtime::broadcast::broadcast_around_actor(
-                        world,
-                        registry,
-                        &zone,
-                        handle.actor_id,
-                        base.to_bytes(),
-                    )
-                    .await;
-                }
-            }
-        }
-
-        // "You attain level [level]." (textId 33909) + the
-        // ability-unlock chain Meteor runs in
-        // `Player.EquipAbilitiesAtLevel`. One game-message per
-        // crossed level so a multi-level rollover reports each
-        // threshold distinctly — matches retail's per-level
-        // feedback cadence. For each newly-reached level we look up
-        // the class's battle-command ids at that level via
-        // `Catalogs::commands_unlocked_at` and fire one 33926
-        // ("You learn X") per unlock, with the command id as the
-        // LuaParam.
-        emit_level_up_game_messages(
-            actor_id,
-            class_id,
-            new_level,
-            levels_gained,
-            client.clone(),
-            lua,
-        )
-        .await;
     }
-}
 
-/// Emit the per-level "You attain level N" + "You learn X" game
-/// messages a level-up rollover should produce. Iterates over the
-/// `levels_gained` most-recent level thresholds so a rollover that
-/// crossed 2 levels in one call (rare but possible with large
-/// `AddExp` grants) reports both. Silent no-op if `lua` is `None`
-/// (test harness) or the catalog is empty.
-async fn emit_level_up_game_messages(
-    actor_id: u32,
-    class_id: u8,
-    new_level: i16,
-    levels_gained: i16,
-    client: crate::data::ClientHandle,
-    lua: Option<&Arc<LuaEngine>>,
-) {
-    use common::luaparam::LuaParam;
+    // 2. Self-only: skillPoint + restBonusExpRate — owner sees their
+    // own XP bar and rested-exp UI widget, nobody else needs to.
+    {
+        let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
+            actor_id,
+            "charaWork/battleStateForSelf",
+        );
+        b.add_int(
+            &format!("charaWork.battleSave.skillPoint[{}]", class_slot),
+            new_exp as u32,
+        );
+        if rested_before != rested_after {
+            b.add_int("playerWork.restBonusExpRate", rested_after as u32);
+        }
+        for mut sub in b.done() {
+            sub.set_target_id(session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
+    }
 
-    // Retail text ids — see `Player.EquipAbilitiesAtLevel` at
-    // `origin/develop:Map Server/Actors/Chara/Player/Player.cs:2618`
-    // (`33926: You learn [command]`) and `LevelUp`
-    // (`33909: You attain level [level]`).
-    const TEXT_LEVEL_ATTAINED: u16 = 33909;
-    const TEXT_LEARN_COMMAND: u16 = 33926;
-
+    // 3. The text batch — pmeteor's actionList rows verbatim
+    // (`CommandResult(targetId, worldMasterTextId, effectId, amount,
+    // param, hitNum = 1)`):
+    //   exp:   (Id, ClassExperienceTextIds[class], 0, exp, bonus%) —
+    //          "You earn [exp](+[bonus]%) experience points."
+    //          (Player.cs:2939; amount caps at u16 — "the exp graphic
+    //          overflows after ~65k", Player.cs:2931). The bonus here
+    //          is garlemald's rested-XP cut.
+    //   level: (Id, 33909, 0, level) — "You attain level [level]."
+    //          one per crossed level, oldest first (Player.cs:3011).
+    //   learn: (Id, 33926, 0, commandId) — "You learn [command]." per
+    //          `Catalogs::commands_unlocked_at` (Player.cs:2995,
+    //          `EquipAbilitiesAtLevel`).
+    let mut rows: Vec<crate::packets::send::actor_battle::CommandResult> = Vec::new();
+    if effective_gain > 0
+        && let Some(text_id) = class_experience_text_id(class_id)
+    {
+        let bonus_pct = if base_exp > 0 && effective_gain > base_exp {
+            (((effective_gain - base_exp) as i64 * 100) / base_exp as i64) as u32
+        } else {
+            0
+        };
+        rows.push(crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            worldmaster_text_id: text_id,
+            amount: effective_gain.min(u16::MAX as i32) as u32,
+            param: bonus_pct.min(u8::MAX as u32),
+            hit_num: 1,
+            ..Default::default()
+        });
+    }
     for gained_idx in (0..levels_gained).rev() {
         // `new_level` is the *final* post-rollover level; the
         // intermediate levels we passed through are at
         // `new_level - gained_idx`.
         let at_level = new_level - gained_idx;
-
-        // "You attain level N."
-        let level_msg = crate::packets::send::misc::build_game_message(
-            actor_id,
-            crate::packets::send::misc::GameMessageOptions {
-                sender_actor_id: 0,
-                receiver_actor_id: actor_id,
-                text_id: TEXT_LEVEL_ATTAINED,
-                log: 0x20,
-                display_id: None,
-                custom_sender: None,
-                lua_params: vec![LuaParam::UInt32(at_level as u32)],
-            },
-        );
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&level_msg, true, false) {
-            client.send_bytes(base.to_bytes()).await;
-        }
-
-        // Ability unlocks at this level — one message per command.
-        let Some(lua) = lua else {
-            continue;
-        };
-        let commands = lua.catalogs().commands_unlocked_at(class_id, at_level);
-        for command_id in commands {
-            tracing::info!(
-                actor = actor_id,
-                class = class_id,
-                level = at_level,
-                command_id,
-                "ability unlock: You learn <command>",
-            );
-            let learn_msg = crate::packets::send::misc::build_game_message(
-                actor_id,
-                crate::packets::send::misc::GameMessageOptions {
-                    sender_actor_id: 0,
-                    receiver_actor_id: actor_id,
-                    text_id: TEXT_LEARN_COMMAND,
-                    log: 0x20,
-                    display_id: None,
-                    custom_sender: None,
-                    lua_params: vec![LuaParam::UInt32(command_id as u32)],
-                },
-            );
-            if let Ok(base) = common::BasePacket::create_from_subpacket(&learn_msg, true, false) {
-                client.send_bytes(base.to_bytes()).await;
+        rows.push(crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            worldmaster_text_id: 33909,
+            amount: at_level.max(0) as u32,
+            hit_num: 1,
+            ..Default::default()
+        });
+        if let Some(lua) = lua {
+            for command_id in lua.catalogs().commands_unlocked_at(class_id, at_level) {
+                tracing::info!(
+                    actor = actor_id,
+                    class = class_id,
+                    level = at_level,
+                    command_id,
+                    "ability unlock: You learn <command>",
+                );
+                rows.push(crate::packets::send::actor_battle::CommandResult {
+                    target_id: actor_id,
+                    worldmaster_text_id: 33926,
+                    amount: command_id as u32,
+                    hit_num: 1,
+                    ..Default::default()
+                });
             }
+        }
+    }
+    let mut offset = 0usize;
+    while offset < rows.len() {
+        // pmeteor container choice (matches `broadcast_results`): X01
+        // for a single row, X10 up to 10, X18 beyond.
+        let remaining = rows.len() - offset;
+        let sub = if remaining == 1 {
+            let row = &rows[offset];
+            offset += 1;
+            crate::packets::send::actor_battle::build_command_result_x01(actor_id, 0, 0, row)
+        } else if remaining <= 10 {
+            crate::packets::send::actor_battle::build_command_result_x10(
+                actor_id,
+                0,
+                0,
+                &rows,
+                &mut offset,
+            )
+        } else {
+            crate::packets::send::actor_battle::build_command_result_x18(
+                actor_id,
+                0,
+                0,
+                &rows,
+                &mut offset,
+            )
+        };
+        let bytes = sub.to_bytes();
+        crate::runtime::dispatcher::send_to_self_if_player(
+            registry,
+            world,
+            actor_id,
+            bytes.clone(),
+        )
+        .await;
+        if let Some(zone) = &zone {
+            let _ = crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                zone,
+                handle.actor_id,
+                bytes,
+            )
+            .await;
         }
     }
 }
@@ -3860,6 +4019,7 @@ pub(crate) async fn broadcast_quest_enpc_update(
 /// textIdOwner, textId, log)`.
 pub(crate) async fn apply_send_game_message(
     actor_id: u32,
+    text_owner_id: u32,
     text_id: u32,
     log_type: u8,
     registry: &ActorRegistry,
@@ -3872,10 +4032,15 @@ pub(crate) async fn apply_send_game_message(
     let Some(client) = world.client(session_id).await else {
         return;
     };
+    // The text OWNER is load-bearing: the client resolves `text_id`
+    // against the owner's text sheet. The old hardcoded WorldMaster
+    // owner made quest-sheet ids (man0l1's 320/321 on static actor
+    // 0xA0F1ADB2) resolve as garbage and crashed the client at the
+    // Hob handoff — 8-for-8 across the packet logs.
     let mut sub = crate::packets::send::build_game_message_actor1(
-        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        text_owner_id,
         actor_id,
-        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        text_owner_id,
         text_id.min(u16::MAX as u32) as u16,
         log_type,
     );
