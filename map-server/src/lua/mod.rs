@@ -499,6 +499,68 @@ impl LuaEngine {
         PartialLuaCallResult { commands, error }
     }
 
+    /// Call a quest-script *getter* — `getJournalInformation` /
+    /// `getJournalMapMarkerList` — and capture its return values as wire
+    /// LuaParams. Direct call, no coroutine: pmeteor routes these through
+    /// `LuaEngine.CallLuaFunctionForReturn` and the getters are pure
+    /// `(player, quest) → values` lookups (no `callClientFunction`
+    /// yields). A missing getter returns an empty list (most quests don't
+    /// override them); conversion stops at the first nil, matching Lua's
+    /// `unpack` semantics in pmeteor's
+    /// `RequestQuestJournalCommand.lua::onEventStarted`. Commands the
+    /// getter happens to enqueue are dropped — the journal pane is a
+    /// read-only view. (Garlemald-Server #46.)
+    pub fn call_quest_getter(
+        &self,
+        script_path: &Path,
+        getter_name: &str,
+        player_snapshot: userdata::PlayerSnapshot,
+        quest_handle: userdata::LuaQuestHandle,
+    ) -> anyhow::Result<Vec<common::luaparam::LuaParam>> {
+        use common::luaparam::LuaParam;
+        let (lua, queue) = self.load_script(script_path)?;
+        let quest_handle = userdata::LuaQuestHandle {
+            queue: queue.clone(),
+            ..quest_handle
+        };
+        let globals = lua.globals();
+        let f: Function = match globals.get(getter_name) {
+            Ok(f) => f,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let player_ud = lua
+            .create_userdata(userdata::LuaPlayer {
+                snapshot: player_snapshot,
+                queue: queue.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+        let quest_ud = lua
+            .create_userdata(quest_handle)
+            .map_err(|e| anyhow::anyhow!("create_userdata(LuaQuestHandle): {e}"))?;
+        let call = f.call::<MultiValue>((player_ud, quest_ud));
+        let dropped = CommandQueue::drain(&queue);
+        if !dropped.is_empty() {
+            tracing::debug!(
+                getter = getter_name,
+                dropped = dropped.len(),
+                "quest getter enqueued commands — dropped (read-only view)",
+            );
+        }
+        let values = call.map_err(|e| anyhow::anyhow!("{getter_name}: {e}"))?;
+        let mut out = Vec::new();
+        for v in values {
+            match v {
+                Value::Integer(i) => out.push(LuaParam::Int32(i as i32)),
+                Value::Number(n) => out.push(LuaParam::Int32(n as i32)),
+                Value::Boolean(true) => out.push(LuaParam::True),
+                Value::Boolean(false) => out.push(LuaParam::False),
+                Value::String(s) => out.push(LuaParam::String(s.to_string_lossy().to_string())),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// NPC-specific helper: try the unique-override script first, then fall
     /// back to the base-class script. Mirrors the C# `CallLuaFunctionNpc`.
     pub fn call_npc(
@@ -1490,6 +1552,122 @@ mod tests {
         assert!(result.commands.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Garlemald-Server #46 — `call_quest_getter` captures the journal
+    /// getters' return values: integers convert to Int32, conversion
+    /// stops at the first nil (Lua `unpack` semantics), a missing getter
+    /// is an empty list, and commands the getter enqueues are dropped.
+    #[test]
+    fn call_quest_getter_captures_returns_and_stops_at_nil() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("quests/man")).unwrap();
+        std::fs::write(
+            root.join("quests/man/man0l0.lua"),
+            r#"
+                function getJournalMapMarkerList(player, quest)
+                    quest:SetQuestFlag(9) -- read-only view: must be dropped
+                    return 11000101, 11000102, nil, 11000103
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("quests/man/man0l0.lua");
+        let values = engine
+            .call_quest_getter(
+                &script_path,
+                "getJournalMapMarkerList",
+                sample_snapshot(),
+                sample_quest_handle(CommandQueue::new()),
+            )
+            .expect("getter should run");
+        assert_eq!(
+            values,
+            vec![
+                common::luaparam::LuaParam::Int32(11_000_101),
+                common::luaparam::LuaParam::Int32(11_000_102),
+            ],
+            "two ids before the nil, nothing after",
+        );
+
+        let missing = engine
+            .call_quest_getter(
+                &script_path,
+                "getJournalInformation",
+                sample_snapshot(),
+                sample_quest_handle(CommandQueue::new()),
+            )
+            .expect("missing getter is a quiet empty");
+        assert!(missing.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Garlemald-Server #46 — drive the REAL `man0l1.lua` journal
+    /// getters. Pins the marker beat-map (`getJournalMapMarkerList`) and
+    /// the counter-derived journal info (`getJournalInformation`) against
+    /// the production script, which also syntax-checks the whole file.
+    #[test]
+    fn real_man0l1_journal_getters() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0l1.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        let handle_at = |sequence: u32, counters: [u16; 3]| userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence,
+            flags: 0,
+            counters,
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+            queue: CommandQueue::new(),
+        };
+        let markers = |sequence: u32, counters: [u16; 3]| {
+            engine
+                .call_quest_getter(
+                    &script_path,
+                    "getJournalMapMarkerList",
+                    sample_snapshot(),
+                    handle_at(sequence, counters),
+                )
+                .expect("marker getter should run")
+        };
+        use common::luaparam::LuaParam::Int32;
+
+        // SEQ_003: Camp Bearded Rock attunement → base+2.
+        assert_eq!(markers(3, [0; 3]), vec![Int32(11_000_102)]);
+        // SEQ_007 fresh: both guild errands outstanding → CUL + MSK.
+        assert_eq!(
+            markers(7, [0; 3]),
+            vec![Int32(11_000_103), Int32(11_000_104)],
+        );
+        // SEQ_007 after the Balloonfish sale (CUL counter=1, slot 1) and
+        // the MSK Echo exit (MSK counter=4, slot 2): no markers left.
+        assert_eq!(markers(7, [0, 1, 4]), vec![]);
+        // SEQ_048: Zephyr Gate muster → base+6.
+        assert_eq!(markers(48, [0; 3]), vec![Int32(11_000_106)]);
+        // SEQ_050 (escort instance) and SEQ_070 (linkshell beat): none.
+        assert_eq!(markers(50, [0; 3]), vec![]);
+        assert_eq!(markers(70, [0; 3]), vec![]);
+        // SEQ_092: back to Baderon → base+1.
+        assert_eq!(markers(92, [0; 3]), vec![Int32(11_000_101)]);
+
+        // getJournalInformation: (0, CUL*5, MSK*5) from the SEQ_007
+        // counters.
+        let info = engine
+            .call_quest_getter(
+                &script_path,
+                "getJournalInformation",
+                sample_snapshot(),
+                handle_at(7, [0, 1, 4]),
+            )
+            .expect("info getter should run");
+        assert_eq!(info, vec![Int32(0), Int32(5), Int32(20)]);
     }
 
     #[test]

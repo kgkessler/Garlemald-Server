@@ -95,6 +95,29 @@ TRINNE					= 1000268;
 ECHO_EXIT_TRIGGER2		= 1090007;
 
 -- Quest Markers
+--
+-- Marker ids select rows in the client's quest_marker sheet (see
+-- pmeteor RequestQuestJournalCommand.lua: "Check the quest sheet and
+-- quest_marker sheet for valid entries for your quest"). The sibling
+-- quests follow a questId-suffix block convention (man0u0/110009 →
+-- 1100090x) EXCEPT the Limsa pair, which is swapped: man0l0 (110001)
+-- ships with the 1100020x block, so man0l1 (110002) takes 1100010x.
+-- The sheet lives client-side only — if the markers render in the
+-- wrong spots (or not at all), flip MRKR_BASE to 11000200, the only
+-- other candidate block. Indices are in quest beat order, the same
+-- ordering every sibling block uses. (Garlemald-Server #46)
+MRKR_BASE			= 11000100;
+MRKR_BADERON		= MRKR_BASE + 1;	-- SEQ_000/005/006/092: Baderon at the Drowning Wench
+MRKR_BEARDED_ROCK	= MRKR_BASE + 2;	-- SEQ_003: Camp Bearded Rock aetheryte
+MRKR_CUL_GUILD		= MRKR_BASE + 3;	-- SEQ_007: Charlys at the Bismarck
+MRKR_MSK_GUILD		= MRKR_BASE + 4;	-- SEQ_007: Isandorel at Naldiq & Vymelli's
+MRKR_FSH_GUILD		= MRKR_BASE + 5;	-- SEQ_035/040/065: Nnmulika at the Fishermen's Guild
+MRKR_ZEPHYR_GATE	= MRKR_BASE + 6;	-- SEQ_048: Zephyr Gate escort muster
+MRKR_LIGHTHOUSE		= MRKR_BASE + 7;	-- SEQ_055: the corpse at Oschon's Torch
+MRKR_SISIPU			= MRKR_BASE + 8;	-- SEQ_060: Sisipu at the lighthouse
+MRKR_ARM_BSM_GUILD	= MRKR_BASE + 9;	-- SEQ_075: Bodenolf at Naldiq & Vymelli's forge
+MRKR_HNAANZA		= MRKR_BASE + 10;	-- SEQ_080: H'naanza in the forge interior
+MRKR_GUILD_EXIT		= MRKR_BASE + 11;	-- SEQ_085: the Echo exit trigger
 
 -- Quest Data
 CNTR_SEQ7_CUL		= 1;
@@ -730,5 +753,43 @@ end
 
 function getJournalMapMarkerList(player, quest)
 	local sequence = quest:getSequence();
-	
+	local data = quest:GetData();
+	local possibleMarkers = {};
+
+	if (sequence == SEQ_000 or sequence == SEQ_005 or sequence == SEQ_006) then
+		table.insert(possibleMarkers, MRKR_BADERON);
+	elseif (sequence == SEQ_003) then
+		table.insert(possibleMarkers, MRKR_BEARDED_ROCK);
+	elseif (sequence == SEQ_007) then
+		-- Both guild errands run in parallel; drop each marker as its
+		-- sub-quest completes (CUL counter latches at 1 after the
+		-- Balloonfish sale, MSK at 4 after the Echo exit).
+		if (data:GetCounter(CNTR_SEQ7_CUL) == 0) then
+			table.insert(possibleMarkers, MRKR_CUL_GUILD);
+		end
+		if (data:GetCounter(CNTR_SEQ7_MSK) < 4) then
+			table.insert(possibleMarkers, MRKR_MSK_GUILD);
+		end
+	elseif (sequence == SEQ_035 or sequence == SEQ_040 or sequence == SEQ_065) then
+		table.insert(possibleMarkers, MRKR_FSH_GUILD);
+	elseif (sequence == SEQ_048) then
+		table.insert(possibleMarkers, MRKR_ZEPHYR_GATE);
+	elseif (sequence == SEQ_055) then
+		table.insert(possibleMarkers, MRKR_LIGHTHOUSE);
+	elseif (sequence == SEQ_060) then
+		table.insert(possibleMarkers, MRKR_SISIPU);
+	elseif (sequence == SEQ_075) then
+		table.insert(possibleMarkers, MRKR_ARM_BSM_GUILD);
+	elseif (sequence == SEQ_080) then
+		table.insert(possibleMarkers, MRKR_HNAANZA);
+	elseif (sequence == SEQ_085) then
+		table.insert(possibleMarkers, MRKR_GUILD_EXIT);
+	elseif (sequence == SEQ_092) then
+		table.insert(possibleMarkers, MRKR_BADERON);
+	end
+	-- SEQ_050 (escort instance) and the SEQ_070/SEQ_090 linkshell beats
+	-- have no map destination — empty list, same as the sibling quests'
+	-- non-travel sequences.
+
+	return unpack(possibleMarkers);
 end

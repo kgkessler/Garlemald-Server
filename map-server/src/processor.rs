@@ -7520,7 +7520,8 @@ impl PacketProcessor {
         if owner_actor_id == Self::REQUEST_QUEST_JOURNAL_COMMAND
             && event_name_for_match == "commandRequest"
         {
-            self.send_quest_journal_data(&handle, session_id).await;
+            self.send_quest_journal_data(&handle, session_id, &lua_params_for_cmd)
+                .await;
         }
 
         // Generic client-command dispatch — run `commands/<Name>.lua::
@@ -8118,55 +8119,131 @@ impl PacketProcessor {
     }
 
     /// Mirror of pmeteor's `RequestQuestJournalCommand.lua::onEventStarted`
-    /// — emit one `0x0133 GenericDataPacket(["requestedData", "qtdata",
-    /// questId, sequence])` per active quest, then a single `EndEvent`.
-    /// The default empty journalInfo is fine for the man0g0 opener path
-    /// (and most quests that don't override `getJournalInformation`).
-    async fn send_quest_journal_data(&self, handle: &ActorHandle, session_id: u32) {
+    /// — the client's EventStart carries `(questId, mapCode)` LuaParams:
+    /// `mapCode == nil` is the journal text pane (reply `["requestedData",
+    /// "qtdata", questId, sequence, …getJournalInformation()]`), a present
+    /// mapCode is the journal MAP pane (reply `["requestedData", "qtmap",
+    /// questId, …getJournalMapMarkerList()]` — the marker ids select rows
+    /// in the client's quest_marker sheet). Both replies ride 0x0133
+    /// GenericDataPacket, then a single `EndEvent`. (Garlemald-Server #46.)
+    ///
+    /// When the request params don't parse (no numeric questId), fall back
+    /// to the previous behaviour — one default qtdata per active quest —
+    /// which is the shape the man0g0 opener path was validated against.
+    async fn send_quest_journal_data(
+        &self,
+        handle: &ActorHandle,
+        session_id: u32,
+        lua_params: &[common::luaparam::LuaParam],
+    ) {
+        use common::luaparam::LuaParam;
         let Some(client) = self.world.client(session_id).await else {
             return;
         };
         let actor_id = handle.actor_id;
 
-        let active_quests: Vec<(u32, u32)> = {
-            let c = handle.character.read().await;
-            c.quest_journal
-                .slots
-                .iter()
-                .flatten()
-                .map(|q| (q.quest_id(), q.get_sequence()))
-                .collect()
-        };
+        // (questId, mapCode) = the first two numeric params. The qtdata
+        // request ends after questId (mapCode rides as Nil/absent), the
+        // qtmap request carries the map sheet code second.
+        let mut nums = lua_params.iter().filter_map(|p| match p {
+            LuaParam::Int32(v) => Some(*v as i64),
+            LuaParam::UInt32(v) => Some(*v as i64),
+            _ => None,
+        });
+        let requested_quest_id = nums.next().and_then(|v| u32::try_from(v).ok());
+        let map_code = nums.next();
 
-        for (quest_id, sequence) in active_quests {
-            // Match pmeteor's exact param shape: [String, String, Int32,
-            // Int32, Nil] — pmeteor's lua tail does
-            // `unpack(journalInfo)` after the questId/sequence ints, and
-            // even with `journalInfo == {}` C# pads at least one Nil into
-            // the packet so the client's reader sees a 5-param payload.
-            let params = vec![
-                common::luaparam::LuaParam::String("requestedData".to_string()),
-                common::luaparam::LuaParam::String("qtdata".to_string()),
-                common::luaparam::LuaParam::Int32(quest_id as i32),
-                common::luaparam::LuaParam::Int32(sequence as i32),
-                common::luaparam::LuaParam::Nil,
-            ];
-            let mut pkt = crate::packets::send::player::build_generic_data(actor_id, &params);
-            // 1.x client silently drops event-flavoured subpackets where
-            // SubPacketHeader.target_id != receiving actor's session id.
-            // Pmeteor's queue dispatcher stamps `target_id = player.Id`
-            // for all queued packets; garlemald's `build_generic_data`
-            // leaves it 0, which makes the client ignore the qtdata
-            // payload and the journal pane never populates the
-            // description. Same gotcha as `broadcast_quest_enpc_update`.
-            pkt.set_target_id(actor_id);
-            client.send_bytes(pkt.to_bytes()).await;
-            tracing::debug!(
-                player = actor_id,
-                quest = quest_id,
-                sequence = sequence,
-                "RequestQuestJournalCommand → qtdata sent",
-            );
+        // Single-quest reply for a parseable request.
+        let mut replied = false;
+        if let Some(quest_id) = requested_quest_id {
+            let quest_state = {
+                let c = handle.character.read().await;
+                c.quest_journal.get(quest_id).map(|q| {
+                    (
+                        q.get_sequence(),
+                        crate::lua::LuaQuestHandle {
+                            player_id: actor_id,
+                            quest_id,
+                            has_quest: true,
+                            sequence: q.get_sequence(),
+                            flags: q.get_flags(),
+                            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                            npc_ls_from: q.get_npc_ls_from(),
+                            npc_ls_msg_step: q.get_npc_ls_msg_step(),
+                            queue: crate::lua::command::CommandQueue::new(),
+                        },
+                    )
+                })
+            };
+            if let Some((sequence, quest_handle)) = quest_state {
+                let (tag, getter) = if map_code.is_none() {
+                    ("qtdata", "getJournalInformation")
+                } else {
+                    ("qtmap", "getJournalMapMarkerList")
+                };
+                let extra = self.call_journal_getter(handle, quest_id, getter, quest_handle).await;
+                let mut params = vec![
+                    LuaParam::String("requestedData".to_string()),
+                    LuaParam::String(tag.to_string()),
+                    LuaParam::Int32(quest_id as i32),
+                ];
+                if tag == "qtdata" {
+                    params.push(LuaParam::Int32(sequence as i32));
+                }
+                if extra.is_empty() {
+                    // pmeteor's C# pads at least one Nil when the unpacked
+                    // table is empty, so the client's reader always sees a
+                    // tail param.
+                    params.push(LuaParam::Nil);
+                } else {
+                    params.extend(extra);
+                }
+                let mut pkt = crate::packets::send::player::build_generic_data(actor_id, &params);
+                // 1.x client silently drops event-flavoured subpackets
+                // where SubPacketHeader.target_id != receiving actor's
+                // session id (same gotcha as `broadcast_quest_enpc_update`).
+                pkt.set_target_id(actor_id);
+                client.send_bytes(pkt.to_bytes()).await;
+                tracing::debug!(
+                    player = actor_id,
+                    quest = quest_id,
+                    sequence,
+                    tag,
+                    "RequestQuestJournalCommand → reply sent",
+                );
+                replied = true;
+            }
+        }
+
+        if !replied && requested_quest_id.is_none() {
+            // Legacy fallback: default qtdata per active quest.
+            let active_quests: Vec<(u32, u32)> = {
+                let c = handle.character.read().await;
+                c.quest_journal
+                    .slots
+                    .iter()
+                    .flatten()
+                    .map(|q| (q.quest_id(), q.get_sequence()))
+                    .collect()
+            };
+            for (quest_id, sequence) in active_quests {
+                let params = vec![
+                    LuaParam::String("requestedData".to_string()),
+                    LuaParam::String("qtdata".to_string()),
+                    LuaParam::Int32(quest_id as i32),
+                    LuaParam::Int32(sequence as i32),
+                    LuaParam::Nil,
+                ];
+                let mut pkt = crate::packets::send::player::build_generic_data(actor_id, &params);
+                pkt.set_target_id(actor_id);
+                client.send_bytes(pkt.to_bytes()).await;
+                tracing::debug!(
+                    player = actor_id,
+                    quest = quest_id,
+                    sequence = sequence,
+                    "RequestQuestJournalCommand → qtdata sent (fallback)",
+                );
+            }
         }
 
         // Pmeteor's lua tail calls `player:EndEvent()` after queueing the
@@ -8181,6 +8258,60 @@ impl PacketProcessor {
         );
         end.set_target_id(actor_id);
         client.send_bytes(end.to_bytes()).await;
+    }
+
+    /// Run `getJournalInformation` / `getJournalMapMarkerList` against the
+    /// quest's script and capture its returns (see
+    /// [`crate::lua::LuaEngine::call_quest_getter`]). Empty on any miss —
+    /// quests without the getter fall back to pmeteor's default-empty
+    /// journalInfo / marker list.
+    async fn call_journal_getter(
+        &self,
+        handle: &ActorHandle,
+        quest_id: u32,
+        getter_name: &'static str,
+        quest_handle: crate::lua::LuaQuestHandle,
+    ) -> Vec<common::luaparam::LuaParam> {
+        let Some(engine) = self.lua.as_ref() else {
+            return Vec::new();
+        };
+        let Some(script_name) = engine.catalogs().quest_script_name(quest_id) else {
+            return Vec::new();
+        };
+        let script_path = engine.resolver().quest(&script_name);
+        if !script_path.exists() {
+            return Vec::new();
+        }
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_from_character(&c)
+        };
+        let engine_clone = engine.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            engine_clone.call_quest_getter(&script_path, getter_name, snapshot, quest_handle)
+        })
+        .await;
+        match result {
+            Ok(Ok(values)) => values,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    quest = quest_id,
+                    getter = getter_name,
+                    err = %e,
+                    "journal getter failed",
+                );
+                Vec::new()
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    quest = quest_id,
+                    getter = getter_name,
+                    error = %join_err,
+                    "journal getter dispatch panicked",
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Look up the NPC's live state and fire `<hook_name>(player, quest, npc)`
