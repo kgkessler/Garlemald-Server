@@ -54,6 +54,13 @@ pub enum LuaCommand {
     /// limits" caution. The WorldMaster actor is the text owner.
     SendGameMessage {
         actor_id: u32,
+        /// The actor whose TEXT SHEET hosts `text_id` — the client
+        /// resolves the id against this actor's sheet (WorldMaster for
+        /// system lines, the quest's static actor 0xA0F0xxxx for quest
+        /// lines). A wrong owner is fatal client-side: ids 320/321
+        /// resolved against WorldMaster's sheet crashed the client on
+        /// every Hob → inn handoff (8-for-8 in the packet logs).
+        text_owner_id: u32,
         text_id: u32,
         log_type: u8,
     },

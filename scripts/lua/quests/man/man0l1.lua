@@ -113,22 +113,22 @@ NPCLS_MSGS = {
 function onStart(player, quest)	
 	quest:StartSequence(SEQ_000);
 	
-	-- Immediately move to the Adventurer's Guild private area
+	-- Immediately move to the Adventurer's Guild private area.
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent010");
-	-- Close the Hob talk event BEFORE the warp. Upstream pmeteor's
-	-- closer lives in hob.lua (a PrivateArea populace script garlemald's
-	-- talk dispatch never reaches — man0l0's HOB arm early-returns at
-	-- ReplaceQuest), and pmeteor could afford to close AFTER its warp
-	-- call. garlemald's DoZoneChange ships the full zone-in replay
-	-- inline — including the delete for Hob, this event's owner — so an
-	-- open event here dereferences a deleted actor client-side and
-	-- crashes (two 2026-06-12 live runs: EndEvent absent, then EndEvent
-	-- trailing the bundle — both fatal). EndEvent-then-warp is the
-	-- live-proven ordering from the SEQ_005 director tails.
-	player:EndEvent();
-	GetWorldManager():DoZoneChange(player, 133, "PrivateAreaMasterPast", 2, 15, -459.619873, 40.0005722, 196.370377, 2.010813);
+	-- pmeteor's script order sends the arrival texts BEFORE the warp;
+	-- the previous port put them after, which (with the deferred
+	-- same-region bundle) shipped 0x0157 game messages into the
+	-- client's Now-Loading gap — present in every crashing Hob run and
+	-- absent from every working load of the identical destination (cold
+	-- login + the GM private-area warp).
 	player:SendGameMessage(quest, 320, 0x20);
 	player:SendGameMessage(quest, 321, 0x20);
+	-- Close the Hob talk event, THEN warp — 0x0131 ahead of the 0x00E2
+	-- reload latch is retail's invariant ordering on every captured
+	-- transition (the talk event's owner is also torn down by the
+	-- warp's keep-list commit, so it must close first).
+	player:EndEvent();
+	GetWorldManager():DoZoneChange(player, 133, "PrivateAreaMasterPast", 2, 15, -459.619873, 40.0005722, 196.370377, 2.010813);
 end
 
 function onFinish(player, quest)

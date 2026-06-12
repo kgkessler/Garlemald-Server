@@ -229,10 +229,12 @@ pub async fn apply_runtime_lua_command(
         // opening stoppers' "caution" circle (text 34109 "off limits").
         LC::SendGameMessage {
             actor_id,
+            text_owner_id,
             text_id,
             log_type,
         } => {
-            apply_send_game_message(actor_id, text_id, log_type, registry, world).await;
+            apply_send_game_message(actor_id, text_owner_id, text_id, log_type, registry, world)
+                .await;
             true
         }
         LC::AddExp {
@@ -4017,6 +4019,7 @@ pub(crate) async fn broadcast_quest_enpc_update(
 /// textIdOwner, textId, log)`.
 pub(crate) async fn apply_send_game_message(
     actor_id: u32,
+    text_owner_id: u32,
     text_id: u32,
     log_type: u8,
     registry: &ActorRegistry,
@@ -4029,10 +4032,15 @@ pub(crate) async fn apply_send_game_message(
     let Some(client) = world.client(session_id).await else {
         return;
     };
+    // The text OWNER is load-bearing: the client resolves `text_id`
+    // against the owner's text sheet. The old hardcoded WorldMaster
+    // owner made quest-sheet ids (man0l1's 320/321 on static actor
+    // 0xA0F1ADB2) resolve as garbage and crashed the client at the
+    // Hob handoff — 8-for-8 across the packet logs.
     let mut sub = crate::packets::send::build_game_message_actor1(
-        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        text_owner_id,
         actor_id,
-        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        text_owner_id,
         text_id.min(u16::MAX as u32) as u16,
         log_type,
     );

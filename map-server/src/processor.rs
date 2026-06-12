@@ -1496,11 +1496,13 @@ impl PacketProcessor {
             }
             LC::SendGameMessage {
                 actor_id,
+                text_owner_id,
                 text_id,
                 log_type,
             } => {
                 crate::runtime::quest_apply::apply_send_game_message(
                     actor_id,
+                    text_owner_id,
                     text_id,
                     log_type,
                     &self.registry,
