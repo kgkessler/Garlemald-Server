@@ -1472,18 +1472,39 @@ pub(crate) async fn apply_content_finished(
         apply_despawn_actor(parent_zone_id, actor_id, registry, world).await;
     }
 
-    // 3 + 4. Roster + content-script clears.
+    // 3 + 4. Roster + content-script clears. The content director was
+    //    also installed as the session's LOGIN director by the opener
+    //    flows (`doContentArea` → `player:SetLoginDirector(director)`)
+    //    — clear that too, or every later zone-in bundle RESURRECTS the
+    //    despawned director: spawn packets for a dead actor with a
+    //    stale zone-suffixed name, plus the player's "Is Init Director"
+    //    script bind referencing it. That corpse rode every crashing
+    //    Hob → inn bundle and none of the working loads (cold logins /
+    //    GM warps carry no login director). pmeteor never resurrects it
+    //    either — `RemoveDirector` drops it from `ownedDirectors`
+    //    before any `SendZoneInPackets` runs.
     snap.transient_director_members.remove(&director_id);
     snap.transient_party_members.clear();
     snap.active_content_script = None;
+    if snap
+        .login_director
+        .as_ref()
+        .is_some_and(|spec| spec.actor_id == director_id)
+    {
+        snap.login_director = None;
+    }
     world.upsert_session(snap).await;
 
-    // 5. Player teardown — MinimumHpLock off.
+    // 5. Player teardown — MinimumHpLock off + the chara-side login-
+    //    director reference (the bundle's player-bind branch reads it).
     let player_id = match registry.by_session(session_id).await {
         Some(player) => {
             {
                 let mut c = player.character.write().await;
                 c.chara.mods.set(crate::actor::Modifier::MinimumHpLock, 0.0);
+                if c.chara.login_director_actor_id == director_id {
+                    c.chara.login_director_actor_id = 0;
+                }
             }
             player.actor_id
         }
