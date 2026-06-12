@@ -1771,6 +1771,33 @@ pub(crate) async fn apply_do_zone_change(
             &mut status_outbox,
         );
     }
+    // Persist the new zone + private area + coords to the characters
+    // row IMMEDIATELY (pmeteor `Player.CleanupAndSave` semantics). The
+    // DB writer existed but had zero callers, so currentZoneId only
+    // ever held the lobby-creation value — any crash/force-quit after a
+    // warp made the next login cold-load the STALE zone (the recurring
+    // "softlocked on Now Loading showing the ship" relogs).
+    if let Err(e) = db
+        .save_player_position(
+            player_id,
+            zone_id,
+            private_area.as_deref().unwrap_or(""),
+            private_area_type,
+            zone_id,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+        )
+        .await
+    {
+        tracing::warn!(
+            player = player_id,
+            err = %e,
+            "DoZoneChange: position persist failed",
+        );
+    }
     // Same drain shape as the processor's `drain_status_outbox` —
     // without the Lua engine the wire/save/recalc fan-out is dropped
     // but the in-memory purge above has already landed.
