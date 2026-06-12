@@ -4532,6 +4532,90 @@ mod battle_npc_spawn_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Garlemald-Server #46 — migration 056 seeds the Man0l1 Zephyr
+    /// Gate escort: Sisipu (bnpcId=16, ally) + the ankle-biter packs
+    /// (17-24, Chigoe genus), plus the un-stripped actor classes the
+    /// spawn path requires (2290007 Sisipu / 2205603 ankle biter /
+    /// 1090004 ZEPHYR_TRIGGER with its r=12 push circle).
+    #[tokio::test]
+    async fn load_battle_npc_spawn_man0l1_escort() {
+        use common::db::ConnCallExt;
+        let path = tempdb("escort");
+        let db = Database::open(&path).await.expect("open db");
+
+        let sisipu = db
+            .load_battle_npc_spawn(16)
+            .await
+            .expect("query")
+            .expect("sisipu row");
+        assert_eq!(sisipu.group_id, 11);
+        assert_eq!(sisipu.actor_class_id, 2_290_007);
+        assert_eq!(sisipu.script_name, "sisipu");
+        assert_eq!(sisipu.allegiance, 1, "sisipu escorts as an ally");
+        assert_eq!(sisipu.zone_id, 128);
+
+        let biter = db
+            .load_battle_npc_spawn(17)
+            .await
+            .expect("query")
+            .expect("ankle biter row");
+        assert_eq!(biter.actor_class_id, 2_205_603);
+        assert_eq!(biter.allegiance, 0);
+        assert_eq!(biter.zone_id, 128);
+
+        // The migration's UPDATEs filled the stripped class rows.
+        let sisipu_class = db
+            .load_actor_class(2_290_007)
+            .await
+            .expect("query")
+            .expect("sisipu class");
+        assert_eq!(
+            sisipu_class.class_path,
+            "/Chara/Npc/Monster/Fighter/FighterAllyOpeningAttacker",
+        );
+        let biter_class = db
+            .load_actor_class(2_205_603)
+            .await
+            .expect("query")
+            .expect("biter class");
+        assert_eq!(
+            biter_class.class_path,
+            "/Chara/Npc/Monster/Chigoe/ChigoeLesserStandard",
+        );
+        let trigger_class = db
+            .load_actor_class(1_090_004)
+            .await
+            .expect("query")
+            .expect("trigger class");
+        assert_eq!(
+            trigger_class.class_path,
+            "/Chara/Npc/Populace/PopulaceStandard",
+        );
+        assert!(
+            trigger_class
+                .event_conditions
+                .contains("pushWithCircleEventConditions"),
+            "ZEPHYR_TRIGGER must carry the r=12 push circle",
+        );
+
+        // And the zone-128 trigger spawn row exists.
+        let spawn_count: i64 = db
+            .conn_for_test()
+            .call_db(|c| {
+                c.query_row(
+                    r"SELECT COUNT(*) FROM server_spawn_locations
+                      WHERE actorClassId = 1090004 AND zoneId = 128
+                        AND uniqueId = 'seafld0_push_limsa_entrance'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(spawn_count, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Missing `bnpc_id` returns `None`, not an error.
     #[tokio::test]
     async fn load_battle_npc_spawn_missing_id() {

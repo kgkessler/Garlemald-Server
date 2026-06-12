@@ -310,9 +310,8 @@ pub async fn apply_runtime_lua_command(
             true
         }
         LC::HandInRegionalLeve { player_id, leve_id } => {
-            let _ =
-                apply_regional_leve_hand_in(player_id, leve_id, registry, Some(world), db, lua)
-                    .await;
+            let _ = apply_regional_leve_hand_in(player_id, leve_id, registry, Some(world), db, lua)
+                .await;
             true
         }
         LC::AcceptRegionalLeve {

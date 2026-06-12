@@ -2053,6 +2053,186 @@ mod tests {
         );
     }
 
+    /// Garlemald-Server #46 — drive the REAL
+    /// `SimpleContentMan0l101.lua` escort through its lifecycle:
+    /// onCreate spawns Sisipu (bnpc 16) + the 8 ankle biters (17-24),
+    /// then onUpdate (1) walks the escort toward the first waypoint on
+    /// a clear road, (2) holds the walk + pulls mobs when an ankle
+    /// biter is close, and (3) fires `sendSignal("escortComplete")`
+    /// after the final waypoint is reached with the road cleared. Also
+    /// syntax-checks the script.
+    #[test]
+    fn real_man0l1_escort_content_walks_holds_and_signals() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("content/SimpleContentMan0l101.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        // onCreate: spawns + roster + locks. The escortState entry for
+        // player 42 (sample_snapshot) arms the onUpdate machine in the
+        // process-cached VM.
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_content_hook(
+            &script_path,
+            "onCreate",
+            sample_snapshot(),
+            sample_content_area(dummy_queue.clone()),
+            sample_director(dummy_queue.clone()),
+        );
+        assert!(
+            result.error.is_none(),
+            "onCreate errored: {:?}",
+            result.error
+        );
+        let spawn_ids: Vec<u32> = result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::SpawnBattleNpcById { bnpc_id, .. } => Some(*bnpc_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spawn_ids,
+            (16..=24).collect::<Vec<u32>>(),
+            "onCreate must spawn Sisipu (16) + 8 ankle biters (17-24)",
+        );
+
+        let escort_actor =
+            |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
+                actor_id: 0x4008_0001,
+                name: "sisipu".to_string(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 128,
+                zone_name: String::new(),
+                state: 2,
+                pos,
+                rotation: 0.0,
+                queue,
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
+            };
+        let mob_actor =
+            |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
+                actor_id: 0x4008_0011,
+                name: "ankle_biter".to_string(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 128,
+                zone_name: String::new(),
+                state: 2,
+                pos,
+                rotation: 0.0,
+                queue,
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
+            };
+
+        // Tick 1 — road clear (the only live mob is the far third
+        // cluster): the escort takes a walking step toward waypoint 1
+        // (south = +Z).
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(sample_snapshot());
+        area.allies
+            .push(escort_actor((-60.0, 33.15, 170.0), q.clone()));
+        area.monsters
+            .push(mob_actor((-17.0, 33.15, 308.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 1, area);
+        assert!(result.error.is_none(), "tick1: {:?}", result.error);
+        let step = result.commands.iter().find_map(|c| match c {
+            LuaCommand::MoveActorToPosition {
+                actor_id: 0x4008_0001,
+                z,
+                ..
+            } => Some(*z),
+            _ => None,
+        });
+        assert!(
+            step.is_some_and(|z| z > 170.0),
+            "clear road must step the escort south; got {:?}",
+            result.commands,
+        );
+
+        // Tick 2 — ambush: a live ankle biter inside the hold radius
+        // freezes the walk and pulls the mob onto the escort party.
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(sample_snapshot());
+        area.allies
+            .push(escort_actor((-60.0, 33.15, 170.0), q.clone()));
+        area.monsters
+            .push(mob_actor((-58.0, 33.15, 180.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 2, area);
+        assert!(result.error.is_none(), "tick2: {:?}", result.error);
+        assert!(
+            !result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::MoveActorToPosition { .. })),
+            "ambush must hold the walk; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::ActorEngage { .. })),
+            "ambush must pull the mob/escort into combat; got {:?}",
+            result.commands,
+        );
+
+        // Ticks 3-6 — sequential waypoint arrivals on a cleared road,
+        // ending with the completion signal at the final waypoint.
+        let waypoints = [
+            (-52.0f32, 210.0f32),
+            (-36.0, 255.0),
+            (-20.0, 300.0),
+            (-8.0, 340.0),
+        ];
+        let mut signaled = false;
+        for (i, (wx, wz)) in waypoints.iter().enumerate() {
+            let q = CommandQueue::new();
+            let mut area = sample_content_area(q.clone());
+            area.players.push(sample_snapshot());
+            area.allies.push(escort_actor((*wx, 33.15, *wz), q.clone()));
+            let result = engine.call_content_on_update(&script_path, 3 + i as u64, area);
+            assert!(
+                result.error.is_none(),
+                "arrival tick {i}: {:?}",
+                result.error
+            );
+            signaled = result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete"));
+        }
+        assert!(
+            signaled,
+            "final waypoint with a clear road must fire escortComplete",
+        );
+    }
+
+    /// Garlemald-Server #46 — the rewritten QuestDirectorMan0l101
+    /// loads (syntax check incl. its `require("quests/man/man0l1")`)
+    /// and `init()` returns the director class path.
+    #[test]
+    fn real_quest_director_man0l101_loads() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("directors/Quest/QuestDirectorMan0l101.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+        let (lua, _q) = engine.load_script(&script_path).expect("director loads");
+        let init: Function = lua.globals().get("init").expect("init defined");
+        let path: String = init.call(()).expect("init runs");
+        assert_eq!(path, "/Director/Quest/QuestDirectorMan0l101");
+    }
+
     /// B7: `call_content_hook(.., "onZoneIn", ..)` runs a script's
     /// `onZoneIn(player, contentArea, director)` hook and drains
     /// commands. Mirrors the

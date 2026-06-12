@@ -8181,7 +8181,9 @@ impl PacketProcessor {
                 } else {
                     ("qtmap", "getJournalMapMarkerList")
                 };
-                let extra = self.call_journal_getter(handle, quest_id, getter, quest_handle).await;
+                let extra = self
+                    .call_journal_getter(handle, quest_id, getter, quest_handle)
+                    .await;
                 let mut params = vec![
                     LuaParam::String("requestedData".to_string()),
                     LuaParam::String(tag.to_string()),

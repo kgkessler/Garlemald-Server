@@ -557,14 +557,13 @@ function onPush(player, quest, npc)
 		if (classId == ZEPHYR_TRIGGER) then
 			local result = callClientFunction(player, "delegateEvent", player, quest, "contentsJoinAskInBasaClass");
 			if (result == 1) then
-				-- DO ESCORT DUTY HERE
-				-- startMan0l1Content(player, quest);
-				-- For now just skip the sequence
-				quest:StartSequence(SEQ_050);
-				callClientFunction(player, "delegateEvent", player, quest, "processEvent605");
-				player:EndEvent();
-				quest:StartSequence(SEQ_055);
-				GetWorldManager():DoZoneChange(player, 128, "PrivateAreaMasterPast", 2, 15, 137.44, 60.33, 1322.0, -1.60);
+				-- The Zephyr Gate escort duty (Garlemald-Server #46) —
+				-- replaces the inherited pmeteor skip ("For now just
+				-- skip the sequence") that jumped straight to the
+				-- processEvent605 arrival. The escort's completion beat
+				-- (605 → SEQ_055 → lighthouse-echo warp) now lives in
+				-- QuestDirectorMan0l101's coroutine.
+				startMan0l1Content(player, quest);
 				return;
 			end
 			player:EndEvent();
@@ -744,19 +743,33 @@ function onNpcLS(player, quest, from, msgStep)
 end
 
 function startMan0l1Content(player, quest)
-	quest:StartSequence(SEQ_050);	
+	quest:StartSequence(SEQ_050);
+	-- "Cutscene for the start of the escort content" (wiki event table)
+	-- — plays before the instance warp, like man0l0's pre-content
+	-- processEvent000_2.
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
 	player:EndEvent();
-		
-	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContent30002", "Quest/QuestDirectorMan0l101");
-	
+
+	-- Content-start shape mirrors the live-proven man0l0 doExitDoor
+	-- flow (StartDirector(false) + explicit noticeEvent kick +
+	-- SetLoginDirector), not the upstream StartDirector(true) form. The
+	-- 4th arg is the CONTENT SCRIPT name: the upstream port passed
+	-- "SimpleContent30002", which in garlemald is the Limsa deck
+	-- tutorial's script (one VM per script path — reusing it would run
+	-- the tutorial's onCreate against the escort area).
+	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
+
 	if (contentArea == nil) then
 		return;
 	end
-	
+
 	local director = contentArea:GetContentDirector();
 	player:AddDirector(director);
-	director:StartDirector(true);
+	director:StartDirector(false);
+
+	player:KickEvent(director, "noticeEvent", true);
+	player:SetLoginDirector(director);
+
 	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
 end
 
