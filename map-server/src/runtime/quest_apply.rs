@@ -1803,18 +1803,23 @@ pub(crate) async fn apply_do_zone_change(
 
     // 5. Dispatch the zone-in bundle — retail-paced. SAME-REGION map
     //    changes get the bundle DEFERRED ~6 s behind the 0x00E2 latch
-    //    (parked on the session; the game ticker fires it): retail
-    //    leaves that window of wire silence on every warp
-    //    (return_to_inn / move_out_of_room / teleport_to_gridania
-    //    pcaps, uniformly ~5.8-6.0 s), and the same-region reload path
-    //    needs it to tear down the resident scene — flushing
-    //    immediately crashed the 230 → 133 Drowning Wench warp five
-    //    live runs in a row while a cold login into the identical
-    //    destination bundle works. Cross-region warps keep the
-    //    live-proven immediate flush (the region mismatch forces a
-    //    clean full scene rebuild client-side). The 34108 PrivateArea
-    //    notice travels with whichever path dispatches the bundle
-    //    (pmeteor sends it after the bundle, WorldManager.cs:887-888).
+    //    (parked on the session; the game ticker fires it), matching
+    //    retail's bundle pacing (return_to_inn / move_out_of_room /
+    //    teleport_to_gridania pcaps, uniformly ~5.8-6.0 s of
+    //    bundle-silence — though never SESSION-silence: pongs keep
+    //    flowing). Decomp note (FUN_0059ced0/FUN_0059e3c0, 2026-06-12):
+    //    the client's scene teardown is asynchronous and driven by the
+    //    0x00CE order machine, NOT by this gap — the deferral is
+    //    retail parity, not a proven client requirement, and could
+    //    likely be shortened. It shipped as part of the fix stack that
+    //    stopped the 230 → 133 Drowning Wench warp crash (with the
+    //    keep-list cleanup and the per-class NPC init binds — the
+    //    latter being the proven in-bundle crash: door NPCs with the
+    //    populace-shaped bind tail die in initForEvent mid-load).
+    //    Cross-region warps keep the live-proven immediate flush. The
+    //    34108 PrivateArea notice travels with whichever path
+    //    dispatches the bundle (pmeteor: after it, WorldManager.cs:
+    //    887-888).
     let same_region = {
         let old_region = match world.zone(old_zone_id).await {
             Some(z) => z.read().await.core.region_id,

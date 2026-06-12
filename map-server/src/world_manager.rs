@@ -2370,19 +2370,18 @@ impl WorldManager {
         // teleport_to_gridania pcaps) never wipe the old zone's actors
         // ahead of the bundle: they populate the destination first,
         // then send 0x0006 (start) + 0x0008 exempt lists naming every
-        // just-spawned actor — the player's own id included — and the
-        // 0x0007 commit, which deletes everything NOT listed. Retail's
-        // login flow carries no trio at all (login.pcapng), so
-        // login-style callers pass `commit_keep_list = false`; the
-        // same-zone content warp keeps its pmeteor-verified bare-wipe
-        // shape and also passes false. The prior warp shape — a bare
-        // 0x0007 wipe-all ahead of the bundle — deleted the player's
-        // actor mid-scene: tolerated on cross-region warps, fatal on
-        // the same-region 230 → 133 Drowning Wench map change (four
-        // live crash runs; cold login into the identical destination
-        // bundle works). Emitted before the quest-ENPC SetEventStatus
-        // replay to match retail's ordering (spawns → keep-list →
-        // 0x0136 batch).
+        // just-spawned actor + the 0x0007 commit, which deletes
+        // everything NOT listed. Decomp of the commit handler
+        // (FUN_004dc690 case 7, 2026-06-12): my-player, the world/debug
+        // masters, the event partner, and 0xC0-band ids are protected
+        // unconditionally — the trio can never delete the player; the
+        // old bare-wipe-first shape stripped the NPC/scene actors
+        // mid-reload instead. Retail's login flow carries no trio at
+        // all (login.pcapng), so login-style callers pass
+        // `commit_keep_list = false`; the same-zone content warp keeps
+        // its pmeteor-verified bare-wipe shape and also passes false.
+        // Emitted before the quest-ENPC SetEventStatus replay to match
+        // retail's ordering (spawns → keep-list → 0x0136 batch).
         if commit_keep_list {
             let mut keep: Vec<u32> = vec![
                 actor_id,

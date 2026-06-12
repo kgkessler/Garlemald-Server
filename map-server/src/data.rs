@@ -83,14 +83,13 @@ pub struct Session {
     /// corresponding `KickEventPacket` as the final step so the client
     /// dispatches the event on the freshly-spawned director actor.
     pub pending_kick_event: Option<PendingKickEvent>,
-    /// Deferred zone-in bundle for SAME-REGION warps. Retail paces
-    /// every warp with ~6 s of wire silence between the 0x00E2
-    /// force-reload latch and the zone-in bundle — the client needs
-    /// that window to tear down the resident scene, and flushing the
-    /// bundle immediately crashed the same-region 230 → 133 Drowning
-    /// Wench map change in five live runs (cross-region warps survive
-    /// the immediate flush because the region mismatch forces a clean
-    /// full rebuild). Parked by `do_zone_change_with_private_area`,
+    /// Deferred zone-in bundle for SAME-REGION warps — retail pacing:
+    /// retail leaves ~6 s between the 0x00E2 force-reload latch and
+    /// the zone-in bundle (bundle-silent, never session-silent; pongs
+    /// keep flowing). Decomp (2026-06-12): the client's teardown is
+    /// asynchronous and does NOT require this gap — it ships as
+    /// retail parity within the fix stack for the same-region
+    /// 230 → 133 warp crash. Parked by `apply_do_zone_change`,
     /// dispatched by the game ticker once due; while parked, inbound
     /// position updates are ignored so the client's stale old-zone
     /// coordinate reports can't relocate the warp destination.
