@@ -569,22 +569,64 @@ impl CommandProcessor {
     /// warp without the director piggyback (quest scripts can still
     /// create the director separately).
     async fn handle_warp(&self, args: &Args<'_>) -> String {
-        const USAGE: &str = "usage: warp <x> <y> <z> [name] | warp <zone> <x> <y> <z> [name]";
+        const USAGE: &str = "usage: warp <x> <y> <z> [name] | warp <zone> <x> <y> <z> [name] | \
+                             warp <zone> <privateAreaName> <paLevel> <x> <y> <z> [name]";
         // Meteor's `warp.lua` dispatches on argc: exactly three numeric
         // args means "move within the current zone" (the
         // `DoPlayerMoveInZone` branch); four or more is the cross-zone
-        // `DoZoneChange` form.
+        // `DoZoneChange` form. The private-area form (arg 1 non-numeric)
+        // routes the player into the named PrivateArea instance — the
+        // test harness for quest destinations like
+        // `warp 133 PrivateAreaMasterPast 2 -459.62 40 196.37 <name>`.
         let same_zone_form = args.len() == 3
             && args.parse_f32(0).is_ok()
             && args.parse_f32(1).is_ok()
             && args.parse_f32(2).is_ok();
-        let (explicit_zone, x, y, z, name) = if same_zone_form {
+        let private_area_form =
+            args.len() >= 6 && args.parse_u32(0).is_ok() && args.parse_f32(1).is_err();
+        let (explicit_zone, private_area, private_area_type, x, y, z, name) = if same_zone_form {
             (
                 None,
+                None,
+                0u32,
                 args.parse_f32(0).unwrap(),
                 args.parse_f32(1).unwrap(),
                 args.parse_f32(2).unwrap(),
                 args.rest_joined(3),
+            )
+        } else if private_area_form {
+            let zone_id = match args.parse_u32(0) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let pa_name = match args.rest().get(1) {
+                Some(s) => s.to_string(),
+                None => return USAGE.into(),
+            };
+            let pa_level = match args.parse_u32(2) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let x = match args.parse_f32(3) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let y = match args.parse_f32(4) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let z = match args.parse_f32(5) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            (
+                Some(zone_id),
+                Some(pa_name),
+                pa_level,
+                x,
+                y,
+                z,
+                args.rest_joined(6),
             )
         } else {
             let zone_id = match args.parse_u32(0) {
@@ -603,7 +645,7 @@ impl CommandProcessor {
                 Ok(v) => v,
                 Err(e) => return format!("{USAGE} — {e}"),
             };
-            (Some(zone_id), x, y, z, args.rest_joined(4))
+            (Some(zone_id), None, 0u32, x, y, z, args.rest_joined(4))
         };
         let Some(name) = name else {
             return USAGE.into();
@@ -671,8 +713,8 @@ impl CommandProcessor {
             crate::runtime::quest_apply::apply_do_zone_change(
                 actor_id,
                 zone_id,
-                None,
-                0,
+                private_area.clone(),
+                private_area_type,
                 2, // retail "warp by gm" spawn code
                 x,
                 y,
