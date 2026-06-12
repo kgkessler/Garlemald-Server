@@ -373,6 +373,14 @@ function onTalk(player, quest, npc)
 		if (classId == BADERON) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEventComplete");
 			callClientFunction(player, "delegateEvent", player, quest, "sqrwa", 300, 1, 1, 2);
+			-- Completion rewards: 200 EXP + 6,000 gil (era guides;
+			-- FFXIVenturer "Treasures of the Main" completion box). The
+			-- guides also list an unnamed food item — no surviving
+			-- source names it (quest_new_reward.csv isn't in any local
+			-- dump), so the item grant stays TODO until the sheet row
+			-- is recovered. (Garlemald-Server #46)
+			player:AddExp(200, player.charaWork.parameterSave.state_mainSkill[0], 0);
+			player:AddGil(6000);
 			player:EndEvent();
 			player:CompleteQuest(quest);
 			return;
@@ -466,6 +474,11 @@ function seq007_onTalk(player, quest, npc, classId)
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent035_2");
 		end
 	elseif (classId == MERLZIRN) then
+		-- "processEvent40_2" is NOT a typo for processEvent040_2: the
+		-- client's decompiled Man0l1 event table really names this one
+		-- without the zero padding, unlike its 0-padded siblings
+		-- (meteor-decomp tools/decode_lpb.py on Man0l1.lpb). Renaming it
+		-- would make the client drop the RPC. (Garlemald-Server #46)
 		callClientFunction(player, "delegateEvent", player, quest, "processEvent40_2");
 	elseif (classId == INTIMIDATING_BARRACUDA) then
 		callClientFunction(player, "delegateEvent", player, quest, "processEvent050_2");
@@ -748,6 +761,11 @@ function startMan0l1Content(player, quest)
 end
 
 function getJournalInformation(player, quest)
+	-- The leading 0 is intentional, not a stub: the journal sheet's
+	-- first qtdata arg slot is unused for this quest (the SEQ_007
+	-- objective text reads args 2-3 — '0,5,20' renders "visited both
+	-- guilds", see the SEQ_007 sequence note up top). Sibling quests
+	-- pass quest-item ids in this slot; man0l1 has none.
 	return 0, quest:GetData():GetCounter(CNTR_SEQ7_CUL) * 5, quest:GetData():GetCounter(CNTR_SEQ7_MSK) * 5;
 end
 
