@@ -644,25 +644,46 @@ impl CommandProcessor {
         // which is SetActorPosition with the embedded actor id set to
         // 0xFFFFFFFF ("self") — NOT the player's id; the client ignores
         // the move otherwise. `warp.lua` passes spawn type 0x00
-        // (SPAWNTYPE_FADEIN) on this path. Cross-zone warp needs a full
-        // DoZoneChange flow the caller can drive by logging out +
-        // logging back in (left as a follow-up).
-        if current_zone_id == zone_id
-            && let Some(client) = self.world.client(session_id).await
-        {
-            // The world-server relay drops subpackets whose target_id
-            // is 0 (`world-server/src/server.rs`, zone-reply fan-out),
-            // so stamp the destination session on both — verified via
-            // packet logs: un-stamped 0xE2/0xCE reached the world and
-            // were never forwarded to the client.
-            let mut e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
-            e2.set_target_id(session_id);
-            client.send_bytes(e2.to_bytes()).await;
-            let mut pkt = crate::packets::send::build_set_actor_position(
-                actor_id, -1, x, y, z, rotation, 0, false,
-            );
-            pkt.set_target_id(session_id);
-            client.send_bytes(pkt.to_bytes()).await;
+        // (SPAWNTYPE_FADEIN) on this path.
+        if current_zone_id == zone_id {
+            if let Some(client) = self.world.client(session_id).await {
+                // The world-server relay drops subpackets whose target_id
+                // is 0 (`world-server/src/server.rs`, zone-reply fan-out),
+                // so stamp the destination session on both — verified via
+                // packet logs: un-stamped 0xE2/0xCE reached the world and
+                // were never forwarded to the client.
+                let mut e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
+                e2.set_target_id(session_id);
+                client.send_bytes(e2.to_bytes()).await;
+                let mut pkt = crate::packets::send::build_set_actor_position(
+                    actor_id, -1, x, y, z, rotation, 0, false,
+                );
+                pkt.set_target_id(session_id);
+                client.send_bytes(pkt.to_bytes()).await;
+            }
+        } else {
+            // Cross-zone warp — the full `DoZoneChange` flow: actor
+            // migration, 0x00E2 latch, and the zone-in bundle with the
+            // retail keep-list cleanup. Same-region destinations get the
+            // retail ~6 s deferred bundle (see `apply_do_zone_change`),
+            // which also makes this command the repeatable harness for
+            // exercising that path without replaying a quest flow.
+            crate::runtime::quest_apply::apply_do_zone_change(
+                actor_id,
+                zone_id,
+                None,
+                0,
+                2, // retail "warp by gm" spawn code
+                x,
+                y,
+                z,
+                rotation,
+                &self.registry,
+                &self.db,
+                &self.world,
+                Some(&self.lua),
+            )
+            .await;
         }
         format!("warped {name} to zone {zone_id} at ({x:.2}, {y:.2}, {z:.2})")
     }

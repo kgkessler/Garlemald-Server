@@ -1874,7 +1874,12 @@ impl Database {
                     .optional()?;
                 if let Some(vals) = levels {
                     for (i, cid) in columns.iter().enumerate() {
-                        save.skill_level[(*cid - 1) as usize] = vals[i];
+                        // In-memory battle_save arrays are indexed by CLASS
+                        // ID (the convention `apply_add_exp` and the GM
+                        // giveexp reader use); the `-1` wire-slot shift
+                        // happens only at property emission. The previous
+                        // `cid - 1` here silently desynced every consumer.
+                        save.skill_level[*cid as usize] = vals[i];
                     }
                 }
 
@@ -1892,7 +1897,7 @@ impl Database {
                     .optional()?;
                 if let Some(vals) = exps {
                     for (i, cid) in columns.iter().enumerate() {
-                        save.skill_point[(*cid - 1) as usize] = vals[i];
+                        save.skill_point[*cid as usize] = vals[i];
                     }
                 }
 

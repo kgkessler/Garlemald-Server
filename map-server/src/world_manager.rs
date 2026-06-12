@@ -1341,6 +1341,29 @@ impl WorldManager {
                 c.chara.hotbar.clone(),
             )
         };
+        // Active-class progression for the `/_init` dump — job slot when
+        // one is active, class otherwise (state_mainSkill resolve order).
+        // battle_save is indexed by class id; the wire's `[class-1]`
+        // shift happens inside the builder. Previously the bundle
+        // hardcoded level 1 / 0 SP, so any EXP earned before a warp
+        // rendered as a level-down at the next zone-in.
+        let (active_level, active_skill_point) = {
+            let c = actor_handle.character.read().await;
+            let active = if c.chara.current_job > 0 {
+                c.chara.current_job as usize
+            } else {
+                c.chara.class.max(0) as usize
+            };
+            (
+                c.battle_save
+                    .skill_level
+                    .get(active)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1) as u8,
+                c.battle_save.skill_point.get(active).copied().unwrap_or(0),
+            )
+        };
         // #28 S3.1 — resolve the equipped hotbar into the pre-masked
         // `(slot0, command, maxRecast, recastEnd)` tuples the `/_init`
         // dump emits. Lobby creation stores RAW command ids, the equip
@@ -1705,7 +1728,8 @@ impl WorldManager {
             mp_max,
             tp,
             class_slot,
-            1,
+            active_level,
+            active_skill_point,
             0x20, // commandBorder: C# CharaWork default is 0x20
             tribe,
             guardian,
@@ -1733,7 +1757,11 @@ impl WorldManager {
             actor_id, hp, hp_max, mp, mp_max, tp,
         ));
         subpackets.extend(tx::actor::build_player_state_at_quickly_for_all(
-            actor_id, hp, hp_max, class_slot, 1,
+            actor_id,
+            hp,
+            hp_max,
+            class_slot,
+            active_level as u16,
         ));
         // `battleTemp.generalParameter[0..3] = 1` matches C# defaults for
         // NAMEPLATE_SHOWN (0), TARGETABLE (1), NAMEPLATE_SHOWN2 (2), and

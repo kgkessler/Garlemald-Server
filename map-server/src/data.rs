@@ -83,6 +83,18 @@ pub struct Session {
     /// corresponding `KickEventPacket` as the final step so the client
     /// dispatches the event on the freshly-spawned director actor.
     pub pending_kick_event: Option<PendingKickEvent>,
+    /// Deferred zone-in bundle for SAME-REGION warps. Retail paces
+    /// every warp with ~6 s of wire silence between the 0x00E2
+    /// force-reload latch and the zone-in bundle — the client needs
+    /// that window to tear down the resident scene, and flushing the
+    /// bundle immediately crashed the same-region 230 → 133 Drowning
+    /// Wench map change in five live runs (cross-region warps survive
+    /// the immediate flush because the region mismatch forces a clean
+    /// full rebuild). Parked by `do_zone_change_with_private_area`,
+    /// dispatched by the game ticker once due; while parked, inbound
+    /// position updates are ignored so the client's stale old-zone
+    /// coordinate reports can't relocate the warp destination.
+    pub pending_zone_in: Option<PendingZoneIn>,
     /// Retainer currently summoned by this session. Mirrors
     /// `Player.currentSpawnedRetainer` in C#. `None` means no
     /// retainer is in the world for this player right now; on
@@ -233,6 +245,21 @@ pub struct PendingKickEvent {
     /// client's event dispatcher doesn't have the arguments the
     /// tutorial opening event expects and silently no-ops.
     pub args: Vec<common::luaparam::LuaParam>,
+}
+
+/// A zone-in bundle parked for retail-paced dispatch — see
+/// `Session::pending_zone_in`.
+#[derive(Debug, Clone)]
+pub struct PendingZoneIn {
+    /// Unix milliseconds at which the ticker dispatches the bundle.
+    pub fire_at_unix_ms: u64,
+    pub spawn_type: u16,
+    /// Forward to `send_zone_in_bundle` — true for warps (the trailing
+    /// Mass Delete keep-list commit cleans the old zone's actors).
+    pub commit_keep_list: bool,
+    /// Emit the 34108 "instance" message after the bundle (pmeteor
+    /// sends it when the destination is a PrivateArea).
+    pub notify_private_area: bool,
 }
 
 impl Session {

@@ -403,6 +403,47 @@ impl PacketProcessor {
             }
         }
 
+        // Per-class levels + skill points → in-memory battle_save (slot
+        // = class id), so the `/_init` dump and the AddExp rollover see
+        // persisted progression across relogs instead of a fresh
+        // level-1/0-SP character. The active class's level also feeds
+        // `chara.level` (the displayed level + stat-pipeline input) —
+        // without this, tutorial EXP earned before a warp rendered as a
+        // level-down to 1/0 at the next zone-in.
+        match self.db.load_class_levels_and_exp(actor_id).await {
+            Ok(save) => {
+                // The DB-side struct and the runtime battle_save differ
+                // in array length — copy the overlapping class-id slots.
+                for (i, v) in save.skill_point.iter().enumerate() {
+                    if let Some(slot) = character.battle_save.skill_point.get_mut(i) {
+                        *slot = *v;
+                    }
+                }
+                for (i, v) in save.skill_level.iter().enumerate() {
+                    if let Some(slot) = character.battle_save.skill_level.get_mut(i) {
+                        *slot = *v;
+                    }
+                }
+                let active = if character.chara.current_job > 0 {
+                    character.chara.current_job as usize
+                } else {
+                    character.chara.class.max(0) as usize
+                };
+                if let Some(lvl) = character.battle_save.skill_level.get(active).copied()
+                    && lvl > 0
+                {
+                    character.chara.level = lvl;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    actor = actor_id,
+                    "load_class_levels_and_exp failed; starting at level 1",
+                );
+            }
+        }
+
         self.registry
             .insert(ActorHandle::new(
                 actor_id,
@@ -8343,6 +8384,17 @@ impl PacketProcessor {
             return Ok(());
         };
         let actor_id = handle.actor_id;
+
+        // Hold stale position reports off the character while a
+        // deferred zone-in is parked — the client keeps reporting
+        // OLD-zone coordinates through the Now-Loading gap (retail
+        // captures show the same), and writing them would relocate the
+        // warp destination before the bundle reads it.
+        if let Some(session) = self.world.session(session_id).await
+            && session.pending_zone_in.is_some()
+        {
+            return Ok(());
+        }
 
         // 1. Update Character position.
         {

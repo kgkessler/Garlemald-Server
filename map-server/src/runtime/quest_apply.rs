@@ -1692,6 +1692,13 @@ pub(crate) async fn apply_do_zone_change(
         return;
     }
 
+    // Pre-move zone — feeds the same-region detection in step 5.
+    let old_zone_id = world
+        .session(session_id)
+        .await
+        .map(|s| s.current_zone_id)
+        .unwrap_or(0);
+
     // 1. Migrate the actor between zones (no-op if zone_id is the
     //    same as the current zone). `do_zone_change_with_private_area`
     //    also updates the session's destination + zone +
@@ -1794,35 +1801,75 @@ pub(crate) async fn apply_do_zone_change(
         client.send_bytes(e2.to_bytes()).await;
     }
 
-    // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
-    //    from the session + character we just updated, so the
-    //    bundle spawns the player at the new coords; the trailing
-    //    keep-list commit then deletes the OLD zone's actors.
-    world
-        .send_zone_in_bundle(
-            registry,
-            db,
-            lua.map(|l| l.catalogs()),
-            session_id,
-            spawn_type as u16,
-            /* commit_keep_list */ true,
-        )
-        .await;
-
-    // 6. pmeteor sends the 34108 "instance" message AFTER the bundle
-    //    when the destination is a PrivateArea (`if (newArea is
-    //    PrivateArea)`, WorldManager.cs:887-888) — the SEQ_005 return
-    //    warp into zone 155's PrivateAreaMasterPast takes this branch
-    //    in the reference capture. (Garlemald-Server #28.)
-    if private_area.is_some() {
-        let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
-            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-            34108,
-            0x20,
+    // 5. Dispatch the zone-in bundle — retail-paced. SAME-REGION map
+    //    changes get the bundle DEFERRED ~6 s behind the 0x00E2 latch
+    //    (parked on the session; the game ticker fires it): retail
+    //    leaves that window of wire silence on every warp
+    //    (return_to_inn / move_out_of_room / teleport_to_gridania
+    //    pcaps, uniformly ~5.8-6.0 s), and the same-region reload path
+    //    needs it to tear down the resident scene — flushing
+    //    immediately crashed the 230 → 133 Drowning Wench warp five
+    //    live runs in a row while a cold login into the identical
+    //    destination bundle works. Cross-region warps keep the
+    //    live-proven immediate flush (the region mismatch forces a
+    //    clean full scene rebuild client-side). The 34108 PrivateArea
+    //    notice travels with whichever path dispatches the bundle
+    //    (pmeteor sends it after the bundle, WorldManager.cs:887-888).
+    let same_region = {
+        let old_region = match world.zone(old_zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => 0,
+        };
+        let new_region = match world.zone(zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => u16::MAX,
+        };
+        old_region == new_region
+    };
+    if same_region {
+        const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
+        let fire_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            + RETAIL_ZONE_CHANGE_GAP_MS;
+        if let Some(mut snap) = world.session(session_id).await {
+            snap.pending_zone_in = Some(crate::data::PendingZoneIn {
+                fire_at_unix_ms,
+                spawn_type: spawn_type as u16,
+                commit_keep_list: true,
+                notify_private_area: private_area.is_some(),
+            });
+            world.upsert_session(snap).await;
+        }
+        tracing::info!(
+            player = player_id,
+            zone = zone_id,
+            old_zone = old_zone_id,
+            "zone-in bundle deferred (retail same-region pacing)",
         );
-        msg.set_target_id(session_id);
-        client.send_bytes(msg.to_bytes()).await;
+    } else {
+        world
+            .send_zone_in_bundle(
+                registry,
+                db,
+                lua.map(|l| l.catalogs()),
+                session_id,
+                spawn_type as u16,
+                /* commit_keep_list */ true,
+            )
+            .await;
+
+        if private_area.is_some() {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
     }
 
     tracing::info!(
