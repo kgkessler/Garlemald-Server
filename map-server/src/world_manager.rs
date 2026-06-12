@@ -312,6 +312,7 @@ fn generate_npc_actor_name(
     actor_number: u32,
     zone_id: u32,
     priv_level: u32,
+    in_private_area: bool,
 ) -> String {
     fn lowercase_first(s: &str) -> String {
         let mut c = s.chars();
@@ -339,7 +340,7 @@ fn generate_npc_actor_name(
             ("Standard", "Std"),
         ],
     );
-    let zone_short = replace_all(
+    let mut zone_short = replace_all(
         zone_name,
         &[
             ("Field", "Fld"),
@@ -352,6 +353,14 @@ fn generate_npc_actor_name(
             ("Office", "Ofc"),
         ],
     );
+    // Private-area spawns replace the zone segment's last char with
+    // 'P' (pmeteor Actor.cs:521-523) — e.g. "sea0Twn01" → "sea0Twn0P".
+    // The client binds the actor to the private layout through this
+    // marker plus the priv-level digits in the name suffix.
+    if in_private_area && !zone_short.is_empty() {
+        zone_short.pop();
+        zone_short.push('P');
+    }
     let class_lower = lowercase_first(&class_short);
     let zone_lower = lowercase_first(&zone_short);
     // Truncate class to fit under 20 chars combined; mirrors Meteor's
@@ -386,7 +395,7 @@ pub fn build_retainer_spawn_bundle(
     zone_name: &str,
 ) -> Vec<common::subpacket::SubPacket> {
     let mut out = Vec::new();
-    push_npc_spawn(&mut out, character, zone_name, 0, None);
+    push_npc_spawn(&mut out, character, zone_name, 0, false, None);
     out
 }
 
@@ -395,6 +404,7 @@ fn push_npc_spawn(
     character: &crate::actor::Character,
     zone_name: &str,
     priv_level: u32,
+    in_private_area: bool,
     // Registry kind of the actor, when known. `Some(BattleNpc)` /
     // `Some(Ally)` means the actor went through the REAL BattleNpc
     // pipeline (stats, state_mainSkill, battleSave populated) and may
@@ -448,8 +458,14 @@ fn push_npc_spawn(
     // `(4<<28 | zone<<19 | num&0x7FFFF)` set by `Npc::new`.
     let actor_number = actor_id & 0x7FFFF;
     let zone_id = character.base.zone_id;
-    let actor_name =
-        generate_npc_actor_name(&class_name, zone_name, actor_number, zone_id, priv_level);
+    let actor_name = generate_npc_actor_name(
+        &class_name,
+        zone_name,
+        actor_number,
+        zone_id,
+        priv_level,
+        in_private_area,
+    );
 
     let script_bind_params = vec![
         common::luaparam::LuaParam::String(class_path_lower.clone()),
@@ -1379,6 +1395,54 @@ impl WorldManager {
             )
         };
 
+        // Private-area script bind — when the session is routed into a
+        // private area, the area-master 0x00CC below must carry the
+        // PRIVATE area's bind, not the parent zone's. pmeteor virtual-
+        // dispatches `CurrentArea.GetSpawnPackets()` (Player.cs:644), so
+        // a PrivateArea emits `PrivateArea.CreateScriptBindPacket`
+        // (PrivateArea.cs:79) with `(privateAreaName, privateAreaType)`
+        // in the param list — the 1.23b client's ONLY signal that it is
+        // entering a private layout. Shipping the public Zone bind
+        // instead is survivable when the destination's public variant is
+        // loadable (sea0Town01a) and FATAL when the zone only exists as
+        // the private flashback layout (sea0Town01 — the Hob → inn warp
+        // crash, three live runs 2026-06-12; wire-confirmed: the fatal
+        // bundle carried privateAreaName="" / type=-1 and the client
+        // died mid-scene-mount, never sending zone-in-complete).
+        struct PrivateAreaBind {
+            class_path: String,
+            class_name: String,
+            area_name: String,
+            area_level: u32,
+            bgm_day: u16,
+            is_inn: bool,
+            can_ride_chocobo: bool,
+            can_stealth: bool,
+        }
+        let private_area_bind: Option<PrivateAreaBind> = {
+            let z = zone_arc.read().await;
+            session.current_private_area_name.as_ref().and_then(|name| {
+                z.get_private_area(name, session.current_private_area_level)
+                    .map(|pa| PrivateAreaBind {
+                        class_path: pa.core.class_path.clone(),
+                        class_name: pa.core.class_name.clone(),
+                        area_name: pa.private_area_name.clone(),
+                        area_level: pa.private_area_level,
+                        bgm_day: pa.core.bgm_day,
+                        is_inn: pa.core.is_inn,
+                        can_ride_chocobo: pa.core.can_ride_chocobo,
+                        can_stealth: pa.core.can_stealth,
+                    })
+            })
+        };
+        // The private area's own music row (pmeteor sources the zone-in
+        // BGM from `CurrentArea.bgmDay`, Player.cs:622 — the Past areas
+        // play their own track, e.g. 40 vs the live town's 59).
+        let bgm_day = private_area_bind
+            .as_ref()
+            .map(|b| b.bgm_day)
+            .unwrap_or(bgm_day);
+
         // SEQ-005 content-warp — ship the UNMODIFIED parent region.
         //
         // History: a same-zone `DoZoneChangeContent` (man0g01 stays in
@@ -1704,12 +1768,25 @@ impl WorldManager {
         const WORLD_MASTER_ACTOR_ID: u32 = 0x5FF8_0001;
         const DEBUG_ACTOR_ID: u32 = 0x5FF8_0002;
 
-        // AreaMaster (Zone). 15 LuaParams per `Zone.CreateScriptBindPacket`:
+        // AreaMaster — two variants, dispatched on the session's routing
+        // exactly like pmeteor's `CurrentArea.GetSpawnPackets()` virtual
+        // call (Player.cs:644):
+        //
+        // Zone (public): 15 LuaParams per `Zone.CreateScriptBindPacket`:
         //   classPath, false, true, zoneName, "", -1,
         //   canRideChocobo?1:0 (byte), canStealth, isInn,
         //   false, false, false, true, isInstanceRaid, isEntranceDesion
         // We don't track `isEntranceDesion` per-session so pass false (the
         // C# default — the flag only flips during seamless boundary crossings).
+        //
+        // PrivateArea: 15 LuaParams per `PrivateArea.CreateScriptBindPacket`
+        // (PrivateArea.cs:79):
+        //   classPath, false, true, zoneName, privateAreaName,
+        //   privateAreaType, canRideChocobo?1:0 (byte), canStealth, isInn,
+        //   false, false, false, false, false, false
+        // — six trailing falses; the Zone-only `true` at param 13 and the
+        // isInstanceRaid slot are NOT part of the private bind. The wire
+        // className becomes the private area's (e.g. "PrivateAreaMasterPast").
         let (can_ride_chocobo, can_stealth, is_inn, is_instance_raid) = {
             let z = zone_arc.read().await;
             (
@@ -1719,51 +1796,77 @@ impl WorldManager {
                 z.core.is_instance_raid,
             )
         };
-        let area_master_params: Vec<common::luaparam::LuaParam> = vec![
-            common::luaparam::LuaParam::String(zone_class_path.clone()),
-            common::luaparam::LuaParam::False,
-            common::luaparam::LuaParam::True,
-            common::luaparam::LuaParam::String(zone_name.clone()),
-            common::luaparam::LuaParam::String(String::new()),
-            common::luaparam::LuaParam::Int32(-1),
-            // C# `Zone.CreateScriptBindPacket` passes
-            // `canRideChocobo ? (byte)1 : (byte)0` — explicit byte cast,
-            // LuaParam type 0xC (1 payload byte) on the wire. Emitting
-            // this as UInt32 would inject three extra zero bytes into
-            // the param stream and shift every following param out of
-            // alignment. The 1.23b client's Lua reads the parsed params
-            // positionally; a misaligned stream is read as `nil` where
-            // a value was expected, which surfaces as the Client Script
-            // ERROR "attempt to index a nil value" the client reports
-            // back to us wrapped in an EventStart packet.
-            common::luaparam::LuaParam::Byte(if can_ride_chocobo { 1 } else { 0 }),
-            if can_stealth {
+        fn lp_bool(b: bool) -> common::luaparam::LuaParam {
+            if b {
                 common::luaparam::LuaParam::True
             } else {
                 common::luaparam::LuaParam::False
-            },
-            if is_inn {
-                common::luaparam::LuaParam::True
-            } else {
-                common::luaparam::LuaParam::False
-            },
-            common::luaparam::LuaParam::False,
-            common::luaparam::LuaParam::False,
-            common::luaparam::LuaParam::False,
-            common::luaparam::LuaParam::True,
-            if is_instance_raid {
-                common::luaparam::LuaParam::True
-            } else {
-                common::luaparam::LuaParam::False
-            },
-            common::luaparam::LuaParam::False,
-        ];
+            }
+        }
+        let (area_master_class_name, area_master_params): (
+            String,
+            Vec<common::luaparam::LuaParam>,
+        ) = if let Some(bind) = &private_area_bind {
+            (
+                bind.class_name.clone(),
+                vec![
+                    common::luaparam::LuaParam::String(bind.class_path.clone()),
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::True,
+                    common::luaparam::LuaParam::String(zone_name.clone()),
+                    common::luaparam::LuaParam::String(bind.area_name.clone()),
+                    common::luaparam::LuaParam::Int32(bind.area_level as i32),
+                    // Byte cast as in the Zone variant below — see the
+                    // alignment note there.
+                    common::luaparam::LuaParam::Byte(if bind.can_ride_chocobo { 1 } else { 0 }),
+                    lp_bool(bind.can_stealth),
+                    lp_bool(bind.is_inn),
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                ],
+            )
+        } else {
+            (
+                zone_class_name.clone(),
+                vec![
+                    common::luaparam::LuaParam::String(zone_class_path.clone()),
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::True,
+                    common::luaparam::LuaParam::String(zone_name.clone()),
+                    common::luaparam::LuaParam::String(String::new()),
+                    common::luaparam::LuaParam::Int32(-1),
+                    // C# `Zone.CreateScriptBindPacket` passes
+                    // `canRideChocobo ? (byte)1 : (byte)0` — explicit byte cast,
+                    // LuaParam type 0xC (1 payload byte) on the wire. Emitting
+                    // this as UInt32 would inject three extra zero bytes into
+                    // the param stream and shift every following param out of
+                    // alignment. The 1.23b client's Lua reads the parsed params
+                    // positionally; a misaligned stream is read as `nil` where
+                    // a value was expected, which surfaces as the Client Script
+                    // ERROR "attempt to index a nil value" the client reports
+                    // back to us wrapped in an EventStart packet.
+                    common::luaparam::LuaParam::Byte(if can_ride_chocobo { 1 } else { 0 }),
+                    lp_bool(can_stealth),
+                    lp_bool(is_inn),
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::True,
+                    lp_bool(is_instance_raid),
+                    common::luaparam::LuaParam::False,
+                ],
+            )
+        };
         let area_master_name = format!("_areaMaster@{:05X}", zone_actor_id << 8);
         push_master_spawn(
             &mut subpackets,
             zone_actor_id,
             area_master_name,
-            zone_class_name.clone(),
+            area_master_class_name,
             area_master_params,
         );
 
@@ -1997,10 +2100,14 @@ impl WorldManager {
                 &mut npc_bundle,
                 &character,
                 &zone_name,
-                // Priv-level is 0 for the root Zone (non-PrivateArea).
-                // PrivateArea spawns route through a different fanout
-                // and will need their own priv-level threading later.
-                0,
+                // Private-area zone-ins thread the area level (=
+                // privateAreaType) into the name suffix and flip the
+                // 'P' marker; root-Zone spawns keep (0, false).
+                private_area_bind
+                    .as_ref()
+                    .map(|b| b.area_level)
+                    .unwrap_or(0),
+                private_area_bind.is_some(),
                 Some(handle.kind),
             );
             for mut sub in npc_bundle {
