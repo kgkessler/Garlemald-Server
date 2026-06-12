@@ -1003,6 +1003,114 @@ async fn add_gil_creates_stack_then_increments() {
     let _ = named_params! { ":x": 0 }; // silence unused-import if the macro is unused above
 }
 
+/// Garlemald-Server #46 — `apply_add_gil` with a live world pushes the
+/// new balance to the owning client: the currency-package delta bracket
+/// (`0x016D → 0x0146(320,99) → 0x0148 → 0x0147 → 0x016E`), every
+/// subpacket target-stamped (proxy rule), the X01 row carrying the gil
+/// item id + post-grant total, then the 25246 "You obtain" toast for
+/// the positive delta.
+#[tokio::test]
+async fn apply_add_gil_emits_currency_bracket_and_obtain_toast() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Charlys Customer')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let chara = Character::new(42);
+    registry
+        .insert(ActorHandle::new(42, ActorKindTag::Player, 230, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_add_gil(42, 2000, &registry, Some(&world), &db).await;
+
+    // The channel carries raw subpacket streams (the writer task owns
+    // BasePacket framing) — parse each frame as one subpacket.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        &opcodes[..5],
+        &[
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_LIST_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "bracket order; saw {opcodes:?}",
+    );
+    assert_eq!(opcodes.len(), 6, "bracket + one toast; saw {opcodes:?}");
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+    // SetBegin body: u32 actor, u16 capacity 320, u16 code 99.
+    let set_begin = &subs[1].data;
+    assert_eq!(
+        u16::from_le_bytes([set_begin[4], set_begin[5]]),
+        crate::inventory::CAP_CURRENCY,
+    );
+    assert_eq!(
+        u16::from_le_bytes([set_begin[6], set_begin[7]]),
+        crate::inventory::PKG_CURRENCY_CRYSTALS,
+    );
+    // X01 item record: u64 unique_id, i32 quantity @8, u32 item_id @12.
+    let item = &subs[2].data;
+    let qty = i32::from_le_bytes([item[8], item[9], item[10], item[11]]);
+    let item_id = u32::from_le_bytes([item[12], item[13], item[14], item[15]]);
+    assert_eq!(qty, 2000, "X01 carries the post-grant balance");
+    assert_eq!(item_id, 1_000_001, "X01 carries the gil item id");
+    let unique_id = u64::from_le_bytes(item[..8].try_into().unwrap());
+    assert_ne!(unique_id, 0, "gil row must carry its server_items.id");
+
+    // A deduction updates the bracket but never toasts "You obtain".
+    crate::runtime::quest_apply::apply_add_gil(42, -500, &registry, Some(&world), &db).await;
+    let mut deduction_opcodes = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            deduction_opcodes.push(sub.game_message.opcode);
+        }
+    }
+    assert_eq!(
+        deduction_opcodes.len(),
+        5,
+        "deduction = bracket only, no toast; saw {deduction_opcodes:?}",
+    );
+}
+
 #[tokio::test]
 async fn set_exp_persists_per_class_column() {
     use common::db::ConnCallExt;
@@ -10587,7 +10695,7 @@ async fn hand_in_fieldcraft_leve_grants_gil_and_clears_journal() {
 
     let (db, registry, lua) = setup_completed_leve(201, 130_001, 0, 0).await;
 
-    let outcome = apply_regional_leve_hand_in(201, 130_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(201, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 200); // seed 048 band-0 gil
     assert_eq!(
@@ -10625,7 +10733,7 @@ async fn hand_in_battlecraft_unenlisted_grants_gil_no_seals() {
 
     let (db, registry, lua) = setup_completed_leve(202, 140_001, 0, 0).await;
 
-    let outcome = apply_regional_leve_hand_in(202, 140_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(202, 140_001, &registry, None, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 300); // seed 048 battlecraft band-0 gil
     assert_eq!(
@@ -10642,7 +10750,7 @@ async fn hand_in_battlecraft_enlisted_grants_gil_and_seals() {
 
     let (db, registry, lua) = setup_completed_leve(203, 140_001, 0, GC_MAELSTROM).await;
 
-    let outcome = apply_regional_leve_hand_in(203, 140_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(203, 140_001, &registry, None, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 300);
     assert_eq!(
@@ -10708,7 +10816,7 @@ async fn hand_in_incomplete_leve_is_noop() {
         ))
         .await;
 
-    let outcome = apply_regional_leve_hand_in(204, 130_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(204, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(!outcome.applied, "incomplete leve hand-in must no-op");
     assert_eq!(outcome.gil_granted, 0);
 
@@ -10727,10 +10835,10 @@ async fn hand_in_is_idempotent_across_double_calls() {
 
     let (db, registry, lua) = setup_completed_leve(205, 130_001, 0, 0).await;
 
-    let first = apply_regional_leve_hand_in(205, 130_001, &registry, &db, Some(&lua)).await;
+    let first = apply_regional_leve_hand_in(205, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(first.applied);
 
-    let second = apply_regional_leve_hand_in(205, 130_001, &registry, &db, Some(&lua)).await;
+    let second = apply_regional_leve_hand_in(205, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(
         !second.applied,
         "second hand-in on a cleared leve is a no-op"

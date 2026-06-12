@@ -246,7 +246,7 @@ pub async fn apply_runtime_lua_command(
             true
         }
         LC::AddGil { actor_id, amount } => {
-            apply_add_gil(actor_id, amount, db).await;
+            apply_add_gil(actor_id, amount, registry, Some(world), db).await;
             true
         }
         LC::AddItem {
@@ -255,7 +255,16 @@ pub async fn apply_runtime_lua_command(
             item_id,
             quantity,
         } => {
-            apply_add_item(actor_id, item_package, item_id, quantity, db).await;
+            apply_add_item(
+                actor_id,
+                item_package,
+                item_id,
+                quantity,
+                registry,
+                Some(world),
+                db,
+            )
+            .await;
             // Tier 3 #13 — tick any accepted fieldcraft leves whose
             // objective targets this item. Runs after `apply_add_item`
             // so the DB write sequence is: inventory row → leve
@@ -301,7 +310,9 @@ pub async fn apply_runtime_lua_command(
             true
         }
         LC::HandInRegionalLeve { player_id, leve_id } => {
-            let _ = apply_regional_leve_hand_in(player_id, leve_id, registry, db, lua).await;
+            let _ =
+                apply_regional_leve_hand_in(player_id, leve_id, registry, Some(world), db, lua)
+                    .await;
             true
         }
         LC::AcceptRegionalLeve {
@@ -3003,6 +3014,8 @@ pub async fn apply_add_item(
     item_package: u16,
     item_id: u32,
     quantity: i32,
+    registry: &ActorRegistry,
+    world: Option<&WorldManager>,
     db: &Database,
 ) {
     if quantity <= 0 || item_id == 0 {
@@ -3014,7 +3027,7 @@ pub async fn apply_add_item(
     // scripts that incorrectly call `GetItemPackage(99):AddItem(1000001, 10)`
     // should still do the right thing.
     if item_package == crate::inventory::PKG_CURRENCY_CRYSTALS {
-        apply_add_gil(actor_id, quantity, db).await;
+        apply_add_gil(actor_id, quantity, registry, world, db).await;
         return;
     }
     // Everything else lands in NORMAL for the first cut. Key-items /
@@ -3796,6 +3809,7 @@ pub async fn apply_regional_leve_hand_in(
     player_id: u32,
     leve_id: u32,
     registry: &ActorRegistry,
+    world: Option<&WorldManager>,
     db: &Database,
     lua: Option<&Arc<LuaEngine>>,
 ) -> LeveHandInOutcome {
@@ -3855,7 +3869,7 @@ pub async fn apply_regional_leve_hand_in(
     // so the client's message log reads gil → item → seals.
     let gil = data.reward_gil.get(band).copied().unwrap_or(0);
     if gil > 0 {
-        apply_add_gil(player_id, gil, db).await;
+        apply_add_gil(player_id, gil, registry, world, db).await;
         outcome.gil_granted = gil;
     }
     let item_id = data.reward_item_id.get(band).copied().unwrap_or(0);
@@ -3909,13 +3923,30 @@ pub async fn apply_regional_leve_hand_in(
     outcome
 }
 
-pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
+/// `player:AddGil(amount)` — persist the delta, then push the new
+/// balance to the owning client so the currency UI updates without a
+/// re-zone (Garlemald-Server #46: the man0l1 CUL/FSH gil rewards were
+/// the first script-driven grants, and the DB-only applier left the
+/// client's gil display stale until the next login).
+///
+/// `world: None` keeps the DB-only behaviour for callers without a live
+/// zone (integration tests, the leve hand-in's test harness).
+pub async fn apply_add_gil(
+    actor_id: u32,
+    amount: i32,
+    registry: &ActorRegistry,
+    world: Option<&WorldManager>,
+    db: &Database,
+) {
     if amount == 0 {
         return;
     }
     match db.add_gil(actor_id, amount).await {
         Ok(total) => {
             tracing::info!(actor = actor_id, delta = amount, total, "AddGil applied",);
+            if let Some(world) = world {
+                send_gil_update(actor_id, amount, registry, world, db).await;
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -3925,6 +3956,90 @@ pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
                 "AddGil: DB persist failed",
             );
         }
+    }
+}
+
+/// Push the player's post-grant gil balance to their client as a
+/// currency-package delta bracket, then (for positive deltas) the
+/// retail "You obtain [item]." toast.
+///
+/// Bracket shape mirrors pmeteor's `Inventory.SendUpdatePackets` for a
+/// single dirty currency slot — the same sequence the live equip path
+/// emits through the `InventoryEvent` dispatcher arms:
+///   `InventoryBeginChange(no-wipe) 0x016D` →
+///   `InventorySetBegin(320, 99) 0x0146` → `InventoryListX01 0x0148` →
+///   `InventorySetEnd 0x0147` → `InventoryEndChange 0x016E`.
+///
+/// Wire rules (see `emit_exp_property_updates`): raw subpacket bytes
+/// (the writer task adds the BasePacket frame) and every self-bound
+/// subpacket stamped with the session id (the world proxy drops
+/// `target_id == 0` frames).
+///
+/// The item row is re-read from the DB after the grant so the wire
+/// carries the authoritative `unique_id` (`server_items.id`) — the
+/// client tracks item instances by unique id, and `add_gil` may have
+/// just created the row for a first-time grant.
+async fn send_gil_update(
+    actor_id: u32,
+    delta: i32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    const GIL_ITEM_ID: u32 = 1_000_001;
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let rows = db
+        .get_item_package(actor_id, crate::inventory::PKG_CURRENCY_CRYSTALS as u32)
+        .await
+        .unwrap_or_default();
+    let Some(gil_row) = rows.into_iter().find(|i| i.item_id == GIL_ITEM_ID) else {
+        return;
+    };
+    use crate::packets::send::actor_inventory as inv;
+    let subs = vec![
+        inv::build_inventory_begin_change(actor_id, false),
+        inv::build_inventory_set_begin(
+            actor_id,
+            crate::inventory::CAP_CURRENCY,
+            crate::inventory::PKG_CURRENCY_CRYSTALS,
+        ),
+        inv::build_inventory_list_x01(actor_id, &gil_row),
+        inv::build_inventory_set_end(actor_id),
+        inv::build_inventory_end_change(actor_id),
+    ];
+    for mut sub in subs {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+    // "You obtain [1,000,001 = gil] x[delta]." — worldMaster sheet 25246
+    // with `(itemId, quantity)` params, the exact shape pmeteor's quest
+    // scripts use for item grants (`etc1u2.lua: SendGameMessage(
+    // GetWorldMaster(), 25246, 0x20, OBJECTIVE_ITEMID, 1)`). Skipped for
+    // deductions — retail has separate "hand over" lines that the
+    // deducting script owns.
+    if delta > 0 {
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            25246,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[
+                common::luaparam::LuaParam::UInt32(GIL_ITEM_ID),
+                common::luaparam::LuaParam::UInt32(delta as u32),
+            ],
+            false,
+        );
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
     }
 }
 

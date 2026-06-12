@@ -418,11 +418,16 @@ function seq007_onTalk(player, quest, npc, classId)
 	elseif (classId == CHARLYS) then
 		if (subseqCUL == 0) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent030");
-			data:IncCounter(CNTR_SEQ7_CUL);			
+			data:IncCounter(CNTR_SEQ7_CUL);
 			if (data:GetCounter(CNTR_SEQ7_MSK) == 4) then
 				seq007_endSequence(player, quest);
 			end
-			--give 1000g
+			-- Charlys buys the Balloonfish for 2,000 gil — the upstream
+			-- "--give 1000g" TODO undershot it; processEvent030's dialogue
+			-- and the era guides both say 2,000 ("Sell the balloonfish to
+			-- Charlys ... You will receive 2000 gil", FFXIVenturer
+			-- "Treasures of the Main"). (Garlemald-Server #46)
+			player:AddGil(2000);
 		else
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent030_2");
 		end
@@ -530,8 +535,12 @@ function onPush(player, quest, npc)
 		end
 	elseif (sequence == SEQ_065) then
 		if (classId == FSH_TRIGGER) then
-			callClientFunction(player, "delegateEvent", player, quest, "processEvent620");			
-			-- Give 3000 gil
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent620");
+			-- Fishermen's Guild payout for the strongbox delivery —
+			-- 3,000 gil per the upstream TODO and the era guides
+			-- (FFXIVenturer "Treasures of the Main": "You will receive
+			-- 3000 gil"). (Garlemald-Server #46)
+			player:AddGil(3000);
 			player:EndEvent();
 			quest:NewNpcLsMsg(1);
 			quest:StartSequence(SEQ_070);

@@ -1336,25 +1336,17 @@ impl PacketProcessor {
                 .await;
             }
             LC::AddGil { actor_id, amount } => {
-                if amount == 0 {
-                    return;
-                }
-                match self.db.add_gil(actor_id, amount).await {
-                    Ok(total) => {
-                        tracing::info!(actor = actor_id, delta = amount, total, "AddGil applied",);
-                        // Currency-package inventory refresh packet emission
-                        // deferred — the next zone-in / explicit inventory
-                        // resync reflects the new balance.
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            actor = actor_id,
-                            delta = amount,
-                            err = %e,
-                            "AddGil: DB persist failed",
-                        );
-                    }
-                }
+                // Shared applier: DB persist + the currency-package
+                // delta bracket and 25246 "You obtain" toast to the
+                // owning client (Garlemald-Server #46).
+                crate::runtime::quest_apply::apply_add_gil(
+                    actor_id,
+                    amount,
+                    &self.registry,
+                    Some(&self.world),
+                    &self.db,
+                )
+                .await;
             }
             LC::Die { actor_id } => {
                 let Some(zone) = self.world.zone(handle.zone_id).await else {
@@ -1399,6 +1391,8 @@ impl PacketProcessor {
                     item_package,
                     item_id,
                     quantity,
+                    &self.registry,
+                    Some(&self.world),
                     &self.db,
                 )
                 .await;
@@ -1423,6 +1417,7 @@ impl PacketProcessor {
                     player_id,
                     leve_id,
                     &self.registry,
+                    Some(&self.world),
                     &self.db,
                     self.lua.as_ref(),
                 )
