@@ -1255,6 +1255,7 @@ impl WorldManager {
         catalogs: Option<&Arc<crate::lua::Catalogs>>,
         session_id: u32,
         spawn_type: u16,
+        commit_keep_list: bool,
     ) {
         let Some(session) = self.session(session_id).await else {
             tracing::warn!(session = session_id, "send_zone_in_bundle: no session");
@@ -2079,6 +2080,7 @@ impl WorldManager {
         // WorldManager.cs:622). So the 3 Limsa-opening monster actors
         // (opening_jelly, opening_yshtola, opening_stahlmann) go
         // through the same populace pipeline.
+        let mut spawned_npc_ids: Vec<u32> = Vec::new();
         for (neighbour_id, kind) in neighbours {
             use crate::zone::area::ActorKind;
             if !matches!(
@@ -2095,6 +2097,7 @@ impl WorldManager {
                 continue;
             }
             emitted += 1;
+            spawned_npc_ids.push(neighbour_id);
             let mut npc_bundle = Vec::new();
             push_npc_spawn(
                 &mut npc_bundle,
@@ -2307,6 +2310,63 @@ impl WorldManager {
         for mut sub in director_subpackets {
             sub.set_target_id(session_id);
             client.send_bytes(sub.to_bytes()).await;
+        }
+
+        // Retail actor-cleanup commit — the Mass Delete KEEP-LIST trio.
+        // Retail warps (return_to_inn / move_out_of_room /
+        // teleport_to_gridania pcaps) never wipe the old zone's actors
+        // ahead of the bundle: they populate the destination first,
+        // then send 0x0006 (start) + 0x0008 exempt lists naming every
+        // just-spawned actor — the player's own id included — and the
+        // 0x0007 commit, which deletes everything NOT listed. Retail's
+        // login flow carries no trio at all (login.pcapng), so
+        // login-style callers pass `commit_keep_list = false`; the
+        // same-zone content warp keeps its pmeteor-verified bare-wipe
+        // shape and also passes false. The prior warp shape — a bare
+        // 0x0007 wipe-all ahead of the bundle — deleted the player's
+        // actor mid-scene: tolerated on cross-region warps, fatal on
+        // the same-region 230 → 133 Drowning Wench map change (four
+        // live crash runs; cold login into the identical destination
+        // bundle works). Emitted before the quest-ENPC SetEventStatus
+        // replay to match retail's ordering (spawns → keep-list →
+        // 0x0136 batch).
+        if commit_keep_list {
+            let mut keep: Vec<u32> = vec![
+                actor_id,
+                DEBUG_ACTOR_ID,
+                WORLD_MASTER_ACTOR_ID,
+                zone_actor_id,
+            ];
+            keep.extend(spawned_npc_ids.iter().copied());
+            if let Some(spec) = &login_director_spec {
+                keep.push(spec.actor_id);
+            }
+            if let Some(active) = session.active_content_script.as_ref() {
+                keep.push(active.director_actor_id);
+            }
+            keep.sort_unstable();
+            keep.dedup();
+            let mut start =
+                crate::packets::send::handshake::build_mass_delete_actor_start(actor_id);
+            start.set_target_id(session_id);
+            client.send_bytes(start.to_bytes()).await;
+            // Retail chunks the exempt ids through 0x0008 bodies — ≤8
+            // ids per packet observed in every capture (the format's
+            // capacity is 11).
+            for chunk in keep.chunks(8) {
+                let mut sub =
+                    crate::packets::send::handshake::build_mass_delete_actor_x11(actor_id, chunk);
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+            let mut end = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            end.set_target_id(session_id);
+            client.send_bytes(end.to_bytes()).await;
+            tracing::info!(
+                session = session_id,
+                kept = keep.len(),
+                "mass-delete keep-list committed (retail warp cleanup)",
+            );
         }
 
         // Quest-ENPC re-emission. SetEventStatus + quest-graphic

@@ -1772,20 +1772,23 @@ pub(crate) async fn apply_do_zone_change(
         tracing::warn!(player = player_id, "DoZoneChange: no client");
         return;
     };
-    // Tagged with the session id — untargeted subpackets are dropped by
-    // the world-server proxy fan-out, so this pair never reached the
-    // client before (see the matching block + decomp notes in
-    // `apply_do_zone_change_content`). Cross-zone warps still completed
-    // because a real region change takes the SetMap handler's
-    // region-mismatch arm; delivering the wipe + 0x00E2 restores pmeteor
-    // parity (`DoZoneChange`, WorldManager.cs:877-879). Subcode 0x02 is
-    // what pmeteor sends for full zone changes (0x10 is the in-place /
-    // content-instance variant) — both set the client's force-reload
-    // latch, so the distinction is parity-only. (Garlemald-Server #28.)
+    // Force-reload latch only. Retail warps NEVER wipe the old zone's
+    // actors up front (`return_to_inn` / `teleport_to_gridania` /
+    // `move_out_of_room` pcaps): the old-actor cleanup is the Mass
+    // Delete KEEP-LIST commit at the END of the zone-in bundle
+    // (`send_zone_in_bundle(.., commit_keep_list = true)` below), whose
+    // exempt lists name every just-spawned actor — the player included.
+    // The prior shape here — a bare 0x0007 wipe-all ahead of the bundle
+    // — deleted the player's own actor mid-scene: tolerated on
+    // cross-region warps (the region mismatch forces a clean scene
+    // rebuild) but FATAL on a same-region map change (the 230 → 133
+    // Drowning Wench warp crashed four live runs while a cold login
+    // into the identical destination bundle works). Subcode 0x02 is the
+    // full-zone-change latch value retail/pmeteor use (0x10 is the
+    // in-place / content-instance variant). Tagged with the session id
+    // — untargeted subpackets are dropped by the world-server proxy
+    // fan-out. (Garlemald-Server #28.)
     {
-        let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
-        wipe.set_target_id(session_id);
-        client.send_bytes(wipe.to_bytes()).await;
         let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
         e2.set_target_id(session_id);
         client.send_bytes(e2.to_bytes()).await;
@@ -1793,7 +1796,8 @@ pub(crate) async fn apply_do_zone_change(
 
     // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
     //    from the session + character we just updated, so the
-    //    bundle spawns the player at the new coords.
+    //    bundle spawns the player at the new coords; the trailing
+    //    keep-list commit then deletes the OLD zone's actors.
     world
         .send_zone_in_bundle(
             registry,
@@ -1801,6 +1805,7 @@ pub(crate) async fn apply_do_zone_change(
             lua.map(|l| l.catalogs()),
             session_id,
             spawn_type as u16,
+            /* commit_keep_list */ true,
         )
         .await;
 

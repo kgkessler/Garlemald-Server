@@ -432,6 +432,10 @@ impl PacketProcessor {
                         self.lua.as_ref().map(|l| l.catalogs()),
                         session_id,
                         0x1,
+                        // Fresh-connection arrival — like login, retail
+                        // sends no mass-delete trio (nothing to clean).
+                        /* commit_keep_list */
+                        false,
                     )
                     .await;
             }
@@ -603,6 +607,10 @@ impl PacketProcessor {
                     self.lua.as_ref().map(|l| l.catalogs()),
                     session_id,
                     0x1,
+                    // Login — retail's login.pcapng carries no
+                    // mass-delete trio at all.
+                    /* commit_keep_list */
+                    false,
                 )
                 .await;
         }
@@ -3168,6 +3176,12 @@ impl PacketProcessor {
                 self.lua.as_ref().map(|l| l.catalogs()),
                 session_id,
                 spawn_type as u16,
+                // Content warps keep their pmeteor-verified shape: the
+                // bare 0x0007 wipe ahead of this bundle (see above) is
+                // load-bearing for the same-zone content transition, so
+                // no trailing keep-list commit is added on top.
+                /* commit_keep_list */
+                false,
             )
             .await;
 

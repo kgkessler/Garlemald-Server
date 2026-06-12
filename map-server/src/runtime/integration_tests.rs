@@ -14252,17 +14252,48 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     )
     .await;
 
-    // Wire order: EndEvent → teardown RemoveActors → warp wipe.
+    // Wire order — retail warp shape: EndEvent → teardown RemoveActors →
+    // 0x00E2 force-reload latch → zone-in bundle → Mass Delete KEEP-LIST
+    // commit (0x0006 start + 0x0008 exempt lists + the trailing 0x0007).
+    // The old shape put a bare 0x0007 wipe-all AHEAD of the bundle, which
+    // deleted the player's own actor mid-scene — fatal on same-region map
+    // changes (the 230 → 133 Drowning Wench warp; retail pcaps never
+    // wipe-first).
     let subs = parse_all_subpackets(&mut rx);
     let first_idx = |op: u16| subs.iter().position(|s| s.game_message.opcode == op);
     let end_event = first_idx(crate::packets::opcodes::OP_END_EVENT).expect("EndEvent");
     let remove = first_idx(crate::packets::opcodes::OP_REMOVE_ACTOR).expect("teardown despawn");
-    let wipe = first_idx(crate::packets::opcodes::OP_DELETE_ALL_ACTORS).expect("warp wipe");
     let e2 = first_idx(crate::packets::opcodes::OP_0XE2_PACKET).expect("0x00E2");
+    let keep_start =
+        first_idx(crate::packets::opcodes::OP_MASS_DELETE_ACTOR_START).expect("keep-list start");
+    let keep_body =
+        first_idx(crate::packets::opcodes::OP_MASS_DELETE_ACTOR_X11).expect("keep-list body");
+    let commit =
+        first_idx(crate::packets::opcodes::OP_DELETE_ALL_ACTORS).expect("keep-list commit");
     assert!(
-        end_event < remove && remove < wipe && wipe < e2,
-        "order must be EndEvent → ContentFinished despawns → DoZoneChange wipe; \
-         got end={end_event} remove={remove} wipe={wipe} e2={e2}",
+        end_event < remove && remove < e2 && e2 < keep_start,
+        "head order must be EndEvent → ContentFinished despawns → 0x00E2 → bundle; \
+         got end={end_event} remove={remove} e2={e2} keep_start={keep_start}",
+    );
+    assert!(
+        keep_start < keep_body && keep_body < commit,
+        "keep-list trio must be start → exempt bodies → 0x0007 commit; \
+         got start={keep_start} body={keep_body} commit={commit}",
+    );
+    // The player's own actor id must be in an exempt list — the old
+    // bare-wipe deleted it.
+    let player_exempted = subs
+        .iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_MASS_DELETE_ACTOR_X11)
+        .any(|s| {
+            s.data
+                .chunks_exact(4)
+                .skip(1) // u32 count prefix
+                .any(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) == player_id)
+        });
+    assert!(
+        player_exempted,
+        "the keep-list exempt bodies must name the player's actor id",
     );
     for s in &subs {
         assert_ne!(
@@ -14273,10 +14304,10 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     }
     // S4.3 — the post-warp zone-in bundle re-sends the SOLO party trio
     // (capture line 40887 parity): with the content roster torn down the
-    // 0x017D after the wipe carries member_count 1 again.
+    // 0x017D in the post-latch bundle carries member_count 1 again.
     let solo_begin = subs
         .iter()
-        .skip(wipe)
+        .skip(e2)
         .find(|s| s.game_message.opcode == crate::packets::opcodes::OP_GROUP_MEMBERS_BEGIN)
         .expect("post-warp bundle must re-send the party trio");
     assert_eq!(
@@ -14286,7 +14317,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     );
     assert!(
         subs.iter()
-            .skip(wipe)
+            .skip(e2)
             .any(|s| s.game_message.opcode == crate::packets::opcodes::OP_GROUP_HEADER),
         "post-warp bundle must carry the 0x017C group header",
     );
