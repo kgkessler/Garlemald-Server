@@ -2500,6 +2500,8 @@ pub async fn apply_add_exp(
         emit_exp_property_updates(
             actor_id,
             class_id,
+            exp,
+            effective_gain,
             new_exp,
             new_level,
             levels_gained,
@@ -2550,6 +2552,37 @@ pub fn consume_rested_xp(exp: i32, rested: i32) -> (i32, i32) {
     (total, new_rested)
 }
 
+/// Per-class "You earn [exp] experience points." text ids — pmeteor's
+/// `BattleUtils.ClassExperienceTextIds` (`Map Server/Actors/Chara/Ai/
+/// Utils/BattleUtils.cs:102-123`). One id per class because non-English
+/// locales inflect the class name into the line. Returns `None` for
+/// ids outside the table (e.g. jobs, retired classes): the gain still
+/// applies, the chat line is just skipped.
+fn class_experience_text_id(class_id: u8) -> Option<u16> {
+    Some(match class_id {
+        2 => 33934,  // Pugilist
+        3 => 33935,  // Gladiator
+        4 => 33936,  // Marauder
+        7 => 33937,  // Archer
+        8 => 33938,  // Lancer
+        10 => 33939, // Sentinel (retired class; the text id survives in the client files)
+        22 => 33940, // Thaumaturge
+        23 => 33941, // Conjurer
+        29 => 33945, // Carpenter
+        30 => 33946, // Blacksmith
+        31 => 33947, // Armorer
+        32 => 33948, // Goldsmith
+        33 => 33949, // Leatherworker
+        34 => 33950, // Weaver
+        35 => 33951, // Alchemist
+        36 => 33952, // Culinarian
+        39 => 33953, // Miner
+        40 => 33954, // Botanist
+        41 => 33955, // Fisher
+        _ => return None,
+    })
+}
+
 /// Emit the `SetActorProperty` packets Meteor's `AddExp` sends after
 /// a successful gain. Target strings mirror Meteor's
 /// `ActorPropertyPacketUtil` usage:
@@ -2568,6 +2601,8 @@ pub fn consume_rested_xp(exp: i32, rested: i32) -> (i32, i32) {
 async fn emit_exp_property_updates(
     actor_id: u32,
     class_id: u8,
+    base_exp: i32,
+    effective_gain: i32,
     new_exp: i32,
     new_level: i16,
     levels_gained: i16,
@@ -2606,6 +2641,45 @@ async fn emit_exp_property_updates(
     }
     for sub in &self_only_packets {
         if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
+            client.send_bytes(base.to_bytes()).await;
+        }
+    }
+
+    // "You earn [exp] experience points." — pmeteor announces every
+    // gain through `BattleUtils.ClassExperienceTextIds[classId]`
+    // (Player.cs:2939) so the chat log shows the number the XP bar
+    // just absorbed. Param shape mirrors the C# CommandResult tail
+    // `((ushort)exp, bonusPercent)`: the displayed gain includes the
+    // bonus, and the percentage renders the "(+N%)" suffix — here the
+    // bonus is garlemald's rested-XP cut. Delivered through the same
+    // game-message path as the 33909 level-up line below (pmeteor ships
+    // both ids through one CommandResult batch, and 33909 already
+    // renders correctly via this path live).
+    if effective_gain > 0
+        && let Some(text_id) = class_experience_text_id(class_id)
+    {
+        use common::luaparam::LuaParam;
+        let bonus_pct = if base_exp > 0 && effective_gain > base_exp {
+            (((effective_gain - base_exp) as i64 * 100) / base_exp as i64) as u32
+        } else {
+            0
+        };
+        let msg = crate::packets::send::misc::build_game_message(
+            actor_id,
+            crate::packets::send::misc::GameMessageOptions {
+                sender_actor_id: 0,
+                receiver_actor_id: actor_id,
+                text_id,
+                log: 0x20,
+                display_id: None,
+                custom_sender: None,
+                lua_params: vec![
+                    LuaParam::UInt32(effective_gain as u32),
+                    LuaParam::UInt32(bonus_pct),
+                ],
+            },
+        );
+        if let Ok(base) = common::BasePacket::create_from_subpacket(&msg, true, false) {
             client.send_bytes(base.to_bytes()).await;
         }
     }

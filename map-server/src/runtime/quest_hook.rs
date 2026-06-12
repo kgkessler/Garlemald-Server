@@ -30,8 +30,8 @@
 //! free-function version that takes only `(ActorHandle, LuaEngine, …,
 //! bnpc_class_id)`. Hook-emitted commands are drained through the
 //! shared `runtime::quest_apply::apply_runtime_lua_commands` helper so
-//! scripts can legitimately `player:AddExp(100)` / `quest:SetQuestFlag(5)`
-//! on kill and have the side effects persist.
+//! scripts can legitimately `player:AddExp(100, classId)` /
+//! `quest:SetQuestFlag(5)` on kill and have the side effects persist.
 
 #![allow(dead_code)]
 
@@ -343,12 +343,13 @@ mod tests {
         use common::db::ConnCallExt;
 
         let root = tmpdir();
-        // onKillBNpc awards 750 exp to the attacker's current class.
+        // onKillBNpc awards 750 exp to class 3 (Gladiator) — pmeteor's
+        // `AddExp(exp, classId, bonusPercent)` argument order.
         std::fs::write(
             root.join("quests/man/man0l0.lua"),
             r#"
                 function onKillBNpc(player, quest, classId)
-                    player:AddExp(3, 750)
+                    player:AddExp(750, 3)
                 end
             "#,
         )

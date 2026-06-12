@@ -3207,6 +3207,135 @@ mod tests {
         }
     }
 
+    /// Tutorial kill EXP (opening quests): the three REAL SEQ_005
+    /// content scripts award retail's per-kill EXP from `onUpdate` by
+    /// watching the live-hostile count — 1000/kill for the Gridania
+    /// wolves and Limsa aurelias, 3000 for the Ul'dah goobbue
+    /// (FFXIVenturer era guides + open-beta footage OCR; 3000 total per
+    /// city). Per script: arming ticks never grant; a hostile dropping
+    /// off the live roster lands exactly one `AddExp(per_kill, current
+    /// class)` per kill; an empty-ally roster (pre-onCreate window)
+    /// never touches the counter; and a SECOND session interleaved on
+    /// the same cached VM with a different live count neither mints
+    /// phantom EXP nor disturbs the first session's counter.
+    #[test]
+    fn real_seq005_content_scripts_grant_tutorial_kill_exp() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let actor = |id: u32, name: &str| userdata::LuaActor {
+            actor_id: id,
+            name: name.to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 2,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: CommandQueue::new(),
+            is_engaged: false,
+            speed: 0.0,
+            target_actor_id: 0,
+        };
+        let grants_in = |cmds: &[LuaCommand]| {
+            cmds.iter()
+                .filter_map(|c| match c {
+                    LuaCommand::AddExp {
+                        actor_id,
+                        class_id,
+                        exp,
+                    } => Some((*actor_id, *class_id, *exp)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (script, hostiles, per_kill) in [
+            ("content/SimpleContent30010.lua", 3u32, 1000i32), // Gridania wolves
+            ("content/SimpleContent30002.lua", 3, 1000),       // Limsa aurelias
+            ("content/SimpleContent30079.lua", 1, 3000),       // Ul'dah goobbue
+        ] {
+            let script_path = root.join(script);
+            assert!(script_path.exists(), "{script} missing");
+            // Fresh engine per script = fresh VM, like a server boot;
+            // every tick below shares it, like the live ticker.
+            let engine = LuaEngine::new(root);
+            // Session A (actor 42) and session B (actor 77) — each tick
+            // carries its own per-session roster, mirroring
+            // build_content_rosters.
+            let area_for = |player_id: u32, live: u32, with_ally: bool| {
+                let mut snap = sample_snapshot();
+                snap.actor_id = player_id;
+                snap.current_class = 2; // state_mainSkill[0] → AddExp target
+                let mut area = sample_content_area(CommandQueue::new());
+                area.players = vec![snap];
+                if with_ally {
+                    area.allies = vec![actor(0x4500_0000 + player_id, "ally")];
+                }
+                area.monsters = (0..live)
+                    .map(|i| actor(0x4600_0000 + player_id * 16 + i, "mob"))
+                    .collect();
+                area
+            };
+
+            // Pre-onCreate window: no roster at all (no allies) — the
+            // counter must not arm, or a stale value could later pay out
+            // against an unspawned fight.
+            let r0 = engine.call_content_on_update(&script_path, 1, area_for(42, 0, false));
+            assert!(r0.error.is_none(), "{script} tick0 errored: {:?}", r0.error);
+
+            // Session A arms: every hostile live — no grant.
+            let r1 = engine.call_content_on_update(&script_path, 2, area_for(42, hostiles, true));
+            assert!(r1.error.is_none(), "{script} tick1 errored: {:?}", r1.error);
+            assert_eq!(
+                grants_in(&r1.commands),
+                vec![],
+                "{script}: no grant while everything is alive",
+            );
+
+            // Session B arms on the SAME cached VM with its own roster.
+            let r2 = engine.call_content_on_update(&script_path, 3, area_for(77, hostiles, true));
+            assert!(r2.error.is_none(), "{script} tick2 errored: {:?}", r2.error);
+            assert_eq!(
+                grants_in(&r2.commands),
+                vec![],
+                "{script}: session B arming must not read session A's count",
+            );
+
+            // Session A: one hostile gone from the live-only roster
+            // (killed — S0.5 filters dead members out before the script
+            // runs) → exactly one per-kill grant to A.
+            let r3 =
+                engine.call_content_on_update(&script_path, 4, area_for(42, hostiles - 1, true));
+            assert!(r3.error.is_none(), "{script} tick3 errored: {:?}", r3.error);
+            assert_eq!(
+                grants_in(&r3.commands),
+                vec![(42, 2, per_kill)],
+                "{script}: exactly one per-kill grant to the player's class",
+            );
+
+            // Session B still at full strength on the next interleaved
+            // tick: the scalar-global bug would see B's count (3) vs A's
+            // stored 2 and mint phantom EXP here.
+            let r4 = engine.call_content_on_update(&script_path, 5, area_for(77, hostiles, true));
+            assert!(r4.error.is_none(), "{script} tick4 errored: {:?}", r4.error);
+            assert_eq!(
+                grants_in(&r4.commands),
+                vec![],
+                "{script}: session B at full strength must not be paid for A's kill",
+            );
+
+            // Session A again, unchanged count — no repeat grant.
+            let r5 =
+                engine.call_content_on_update(&script_path, 6, area_for(42, hostiles - 1, true));
+            assert!(r5.error.is_none(), "{script} tick5 errored: {:?}", r5.error);
+            assert_eq!(
+                grants_in(&r5.commands),
+                vec![],
+                "{script}: unchanged count must not re-grant",
+            );
+        }
+    }
+
     /// Cross-thread repro of the LIVE ticker topology: the signal resume
     /// (and its `wait()` re-park) happens on one thread while a ticker
     /// thread hammers `engine.tick()` concurrently — mirroring the

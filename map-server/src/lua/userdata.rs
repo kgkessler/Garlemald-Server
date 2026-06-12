@@ -772,6 +772,9 @@ impl UserData for LuaPlayer {
     // here. New scripts should prefer the method form when adding a
     // binding.
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        // Same dot-syntax id LuaActor exposes — the SEQ_005 content
+        // scripts key their per-player kill-EXP counters by it.
+        fields.add_field_method_get("actorId", |_, this| Ok(this.snapshot.actor_id));
         fields.add_field_method_get("hasChocobo", |_, this| Ok(this.snapshot.has_chocobo));
         fields.add_field_method_get("mountState", |_, this| Ok(this.snapshot.mount_state));
         fields.add_field_method_get("chocoboAppearance", |_, this| {
@@ -2089,17 +2092,38 @@ impl UserData for LuaPlayer {
         );
 
         // --- Economy / progression ------------------------------------------
-        methods.add_method("AddExp", |_, this, (class_id, exp): (u8, i32)| {
-            push(
-                &this.queue,
-                LuaCommand::AddExp {
-                    actor_id: this.snapshot.actor_id,
-                    class_id,
-                    exp,
-                },
-            );
-            Ok(())
-        });
+        // `player:AddExp(exp, classId, bonusPercent)` — pmeteor's
+        // `Player.AddExp(int exp, byte classId, byte bonusPercent = 0)`
+        // argument order (Player.cs:2932), which is what the ported
+        // scripts use (`gm/giveexp.lua`, the SEQ_005 tutorial kill
+        // grants). The previous garlemald-only `(classId, exp)` order
+        // silently mis-bound giveexp's qty as the class id. The bonus
+        // is folded into the queued gain the same way upstream does
+        // (`exp += ceil(exp * bonusPercent / 100)`) before the rollover
+        // math in `apply_add_exp` runs.
+        methods.add_method(
+            "AddExp",
+            |_, this, (exp, class_id, bonus_percent): (i32, u8, Option<i32>)| {
+                let bonus = bonus_percent.unwrap_or(0).max(0);
+                let exp = if exp > 0 && bonus > 0 {
+                    // i64 intermediate: `exp * bonus` at the i32 extremes
+                    // would overflow before the /100 brings it back down.
+                    let bonused = exp as i64 + (exp as i64 * bonus as i64 + 99) / 100;
+                    bonused.min(i32::MAX as i64) as i32
+                } else {
+                    exp
+                };
+                push(
+                    &this.queue,
+                    LuaCommand::AddExp {
+                        actor_id: this.snapshot.actor_id,
+                        class_id,
+                        exp,
+                    },
+                );
+                Ok(())
+            },
+        );
 
         // Convenience over Meteor's
         // `player:GetItemPackage(INVENTORY_CURRENCY):AddItem(1000001, qty, 1)`.
