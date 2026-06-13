@@ -7693,6 +7693,45 @@ impl PacketProcessor {
     /// `actor_battle::NO_ENMITY_TARGET`. (Garlemald-Server #28.)
     const SET_TARGET_NONE: u32 = 0xE000_0000;
 
+    /// Does a resumed quest/director coroutine burst (drained on the
+    /// 0x012E EventUpdate) need the LOGIN command applier rather than the
+    /// runtime drain? `apply_runtime_lua_command` has no arms for the
+    /// content-area / quest-handoff / director-staging commands and would
+    /// silently drop them (its `_ => false` catch-all); only
+    /// `apply_login_lua_command` creates content areas, registers
+    /// directors, captures the post-warp KickEvent into the zone-in
+    /// bundle, etc. Each variant here marks a burst that MUST route
+    /// through login:
+    ///  * `CreateContentArea` / `DoZoneChangeContent` — the SEQ_005
+    ///    content warp (man0l0 doExitDoor);
+    ///  * `AddQuest` / `CompleteQuest` — the quest-handoff burst
+    ///    (man0l0 Hob → man0l1);
+    ///  * `Logout` / `QuitGame` — the Exit-game confirm;
+    ///  * `SetLoginDirector` — the after-quest-warp director staging
+    ///    (man0l1 Baderon → AfterQuestWarpDirector): without login
+    ///    routing the director is never created/registered/spawned and
+    ///    its `noticeEvent` kick is direct-dispatched to an unspawned
+    ///    owner the client drops, so the post-warp cutscene desktop-
+    ///    widget mode never clears and the menu / linkpearl / aetheryte
+    ///    stay dead. `SetLoginDirector` appears ONLY in director-staged
+    ///    warp bursts, so it's a precise tell with no false positives.
+    ///    (Round-3 live test — Baderon breaks the menu.)
+    fn is_login_scoped_burst(cmds: &[crate::lua::command::LuaCommand]) -> bool {
+        use crate::lua::command::LuaCommand;
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                LuaCommand::CreateContentArea { .. }
+                    | LuaCommand::DoZoneChangeContent { .. }
+                    | LuaCommand::AddQuest { .. }
+                    | LuaCommand::CompleteQuest { .. }
+                    | LuaCommand::Logout { .. }
+                    | LuaCommand::QuitGame { .. }
+                    | LuaCommand::SetLoginDirector { .. }
+            )
+        })
+    }
+
     fn command_script_name(owner_actor_id: u32) -> Option<&'static str> {
         match owner_actor_id {
             Self::ACTIVATE_COMMAND_A | Self::ACTIVATE_COMMAND_B => Some("ActivateCommand"),
@@ -8666,17 +8705,38 @@ impl PacketProcessor {
             // silently dropped on `apply_event_script_commands`. Route
             // them (and the content/quest bursts) through the login
             // command applier. (Garlemald-Server #46 live test.)
-            let is_login_scoped_burst = cmds.iter().any(|c| {
-                matches!(
-                    c,
-                    crate::lua::command::LuaCommand::CreateContentArea { .. }
-                        | crate::lua::command::LuaCommand::DoZoneChangeContent { .. }
-                        | crate::lua::command::LuaCommand::AddQuest { .. }
-                        | crate::lua::command::LuaCommand::CompleteQuest { .. }
-                        | crate::lua::command::LuaCommand::Logout { .. }
-                        | crate::lua::command::LuaCommand::QuitGame { .. }
-                )
-            });
+            // 3. The after-quest warp burst (CreateDirector /
+            //    StartDirectorMain / SetLoginDirector / KickEvent /
+            //    DoZoneChange) — man0l1's Baderon talk (and every other
+            //    AfterQuestWarpDirector staging site: man0l0/man0g0/man0u0/
+            //    man0g1, the city populace miounne/momodi, the battle-zone
+            //    exit_door/exit_trigger/yda) parks on `processEvent020`
+            //    (`callClientFunction` → `_WAIT_EVENT`) and emits the whole
+            //    director-staging burst when this EventUpdate resumes it.
+            //    `SetLoginDirector` is the load-bearing tell: it ONLY appears
+            //    in director-staged-warp bursts. The runtime drain has NO arm
+            //    for CreateDirector / StartDirectorMain / SetLoginDirector
+            //    (all hit `apply_runtime_lua_command`'s `_ => false`), so the
+            //    director is never created/registered/login-set, never spawns
+            //    in the deferred zone-in bundle, and the runtime KickEvent arm
+            //    (`apply_kick_event`) direct-dispatches the `noticeEvent` kick
+            //    immediately — to an unspawned owner the client silently drops
+            //    (decomp: KickClientOrderEventReceiver gates on actor[+0x5c]).
+            //    `onEventStarted` → `quest:OnNotice` → man0l1 `onNotice(SEQ_003)`
+            //    → `EndEvent` then never runs, so the post-Baderon cutscene
+            //    desktop-widget mode is never cleared and the menu / linkpearl /
+            //    aetheryte stay dead. Routing through `apply_login_lua_command`
+            //    is the proven shape: it registers the director, refreshes the
+            //    session login-director spec, CAPTURES the kick into
+            //    `session.pending_kick_event` (emitted at the END of the
+            //    zone-in bundle, after the director spawn), and threads
+            //    DoZoneChange through the SAME `quest_apply::apply_do_zone_change`
+            //    helper the runtime arm uses. Every other command in the burst
+            //    (RunEventFunction / EndEvent / QuestSetNpcLsFrom / PlayerSetNpcLs /
+            //    QuestStartSequence / QuestUpdateEnpcs / SendMessage) has an
+            //    explicit login-applier arm, so nothing load-bearing falls into
+            //    the login catch-all. (Round-3 live test — Baderon breaks menu.)
+            let is_login_scoped_burst = Self::is_login_scoped_burst(&cmds);
             if is_login_scoped_burst {
                 for cmd in cmds {
                     Box::pin(self.apply_login_lua_command(&handle, cmd)).await;
@@ -9423,6 +9483,66 @@ pub(crate) fn build_player_snapshot_from_character(
         id => id,
     };
     snapshot
+}
+
+#[cfg(test)]
+mod login_burst_routing_tests {
+    use super::*;
+    use crate::lua::command::LuaCommand;
+
+    /// Round-3 live test — a resumed after-quest-warp burst (the man0l1
+    /// Baderon talk) must route through the LOGIN applier. `SetLoginDirector`
+    /// is the tell; without it the AfterQuestWarpDirector is never
+    /// created/spawned and its noticeEvent kick is dropped, leaving the
+    /// client stuck in the post-warp cutscene desktop-widget mode (dead
+    /// menu / linkpearl / aetheryte).
+    #[test]
+    fn set_login_director_burst_routes_to_login() {
+        let burst = vec![
+            LuaCommand::QuestStartSequence {
+                player_id: 1,
+                quest_id: 110_002,
+                sequence: 3,
+            },
+            LuaCommand::SetLoginDirector {
+                player_id: 1,
+                director_actor_id: 0x6428_0002,
+                class_name: "AfterQuestWarpDirector".to_string(),
+                class_path: "/Director/AfterQuestWarpDirector".to_string(),
+            },
+            LuaCommand::KickEvent {
+                player_id: 1,
+                actor_id: 0x6428_0002,
+                trigger: "noticeEvent".to_string(),
+                args: vec![],
+            },
+        ];
+        assert!(
+            PacketProcessor::is_login_scoped_burst(&burst),
+            "a burst containing SetLoginDirector must route through the login applier",
+        );
+    }
+
+    /// A plain combat-tutorial continuation (no content/quest-handoff/
+    /// director-staging command) stays on the runtime drain — the
+    /// SetLoginDirector tell must not over-match ordinary resume bursts.
+    #[test]
+    fn plain_resume_burst_stays_on_runtime() {
+        let burst = vec![
+            LuaCommand::SendSignal {
+                name: "battleComplete".to_string(),
+            },
+            LuaCommand::QuestStartSequence {
+                player_id: 1,
+                quest_id: 110_001,
+                sequence: 10,
+            },
+        ];
+        assert!(
+            !PacketProcessor::is_login_scoped_burst(&burst),
+            "ordinary resume bursts must NOT route through the login applier",
+        );
+    }
 }
 
 #[cfg(test)]
