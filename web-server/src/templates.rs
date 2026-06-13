@@ -148,7 +148,7 @@ pub fn login_page(error: Option<&str>, info: Option<&str>, prefill_username: &st
     page("Sign in", &body)
 }
 
-pub fn signup_page(error: Option<&str>, prefill_username: &str, prefill_email: &str) -> String {
+pub fn signup_page(error: Option<&str>, prefill_username: &str) -> String {
     let body = format!(
         r#"
 <h1>Create account</h1>
@@ -160,9 +160,6 @@ pub fn signup_page(error: Option<&str>, prefill_username: &str, prefill_email: &
          required maxlength="64" pattern="[A-Za-z0-9_.-]{{3,64}}"
          value="{user}" autofocus
          title="3-64 characters: letters, numbers, underscore, dot, hyphen" />
-  <label for="email">Email (optional)</label>
-  <input id="email" name="email" type="email" autocomplete="email"
-         maxlength="254" value="{email}" />
   <label for="password">Password</label>
   <input id="password" name="password" type="password"
          autocomplete="new-password" required minlength="8" maxlength="128" />
@@ -175,7 +172,6 @@ pub fn signup_page(error: Option<&str>, prefill_username: &str, prefill_email: &
 "#,
         banners = banners(error, None),
         user = escape(prefill_username),
-        email = escape(prefill_email),
     );
     page("Create account", &body)
 }
@@ -217,9 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn signup_page_renders_email_prefill() {
-        let html = signup_page(None, "sam", "sam@example.com");
+    fn signup_page_does_not_collect_email() {
+        let html = signup_page(None, "sam");
         assert!(html.contains("value=\"sam\""));
-        assert!(html.contains("value=\"sam@example.com\""));
+        assert!(!html.contains("name=\"email\""));
     }
 }
