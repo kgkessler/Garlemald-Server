@@ -291,7 +291,7 @@ fn push_master_spawn(
 /// Turns `/Chara/Npc/Populace/PopulaceStandard` (what our gamedata
 /// stores) into `/chara/npc/populace/PopulaceStandard` (what Meteor
 /// sends on the wire and the 1.x client's script loader expects).
-fn lowercase_class_path(path: &str) -> String {
+pub(crate) fn lowercase_class_path(path: &str) -> String {
     if let Some(last_slash) = path.rfind('/') {
         let prefix = &path[..last_slash];
         let tail = &path[last_slash..];
@@ -2834,6 +2834,27 @@ impl WorldManager {
                 lua,
                 Some(handle.kind),
             );
+            // Enable the actor's event conditions — pmeteor's
+            // Session.UpdateInstance fires GetSetEventStatusPackets() for
+            // EVERY streamed actor (Session.cs:139/161) right after the
+            // spawn bundle. push_npc_spawn only REGISTERS the conditions
+            // (SetTalkEventCondition); without the SetEventStatus ENABLE
+            // the 1.x client treats the NPC as non-talkable and never
+            // sends a talk EventStart — the live-test "NPCs/aetheryte
+            // show up but interacting does nothing". Defaults mirror C#
+            // (talk/emote/notice enabled, push per-condition). Streamed
+            // root-zone actors are plain populace / objects (the camp +
+            // aetheryte), never quest ENPCs — those are managed by
+            // broadcast_quest_enpc_update — so unconditional enable here
+            // is safe. (Garlemald-Server #46 live test round 2.)
+            npc_bundle.extend(tx::actor::build_actor_event_status_packets(
+                neighbour_id,
+                &character.base.event_conditions,
+                true,
+                true,
+                None,
+                true,
+            ));
             drop(character);
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);

@@ -815,6 +815,76 @@ impl LuaEngine {
         })
     }
 
+    /// Run a plain (non-quest, non-command) NPC/object's own
+    /// `onEventStarted(player, npc, eventType, eventName, ...params)` —
+    /// the path that opens the aetheryte's teleport/homepoint/leve menu
+    /// (`AetheryteParent.lua`) and any base populace dialogue. Mirror of
+    /// pmeteor `LuaEngine.EventStarted` -> `CallLuaFunction(player,
+    /// target, "onEventStarted", ...)` on the TARGET ACTOR's script.
+    /// Builds a `LuaNpc` (not a bare `LuaActor`) so the script's
+    /// `npc:GetActorClassId()` returns the real class id (AetheryteParent
+    /// keys `aetheryteParentLinks` on it). Yielding menus park on
+    /// `_WAIT_EVENT` and resume on the client's 0x012E EventUpdate, exactly
+    /// like command / quest delegate round-trips. (Garlemald-Server #46
+    /// live test round 2.)
+    pub fn call_npc_on_event_started(
+        &self,
+        script_path: &Path,
+        player_snapshot: userdata::PlayerSnapshot,
+        npc_spec: LuaNpcSpec,
+        event_name: String,
+        event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) -> PartialLuaCallResult {
+        let owner_player_id = player_snapshot.actor_id;
+        self.spawn_director_on_event_started(script_path, owner_player_id, |lua, queue| {
+            let player = userdata::LuaPlayer {
+                snapshot: player_snapshot,
+                queue: queue.clone(),
+            };
+            let npc = userdata::LuaNpc {
+                base: userdata::LuaActor {
+                    actor_id: npc_spec.actor_id,
+                    name: npc_spec.name,
+                    class_name: npc_spec.class_name,
+                    class_path: npc_spec.class_path,
+                    unique_id: npc_spec.unique_id,
+                    zone_id: npc_spec.zone_id,
+                    zone_name: npc_spec.zone_name,
+                    state: npc_spec.state,
+                    pos: npc_spec.pos,
+                    rotation: npc_spec.rotation,
+                    queue: queue.clone(),
+                    is_engaged: false,
+                    speed: 5.0,
+                    target_actor_id: 0,
+                },
+                actor_class_id: npc_spec.actor_class_id,
+                quest_graphic: npc_spec.quest_graphic,
+            };
+            let player_ud = lua
+                .create_userdata(player)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+            let npc_ud = lua
+                .create_userdata(npc)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaNpc): {e}"))?;
+            let mut mv = MultiValue::new();
+            mv.push_back(Value::UserData(player_ud));
+            mv.push_back(Value::UserData(npc_ud));
+            mv.push_back(Value::Integer(event_type as mlua::Integer));
+            let event_name_lua = lua
+                .create_string(&event_name)
+                .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
+            mv.push_back(Value::String(event_name_lua));
+            for p in lua_params {
+                let v = lua_param_to_value(lua, p)
+                    .map_err(|e| anyhow::anyhow!("lua_param_to_value: {e}"))?;
+                mv.push_back(v);
+            }
+            Ok(mv)
+        })
+    }
+
     pub fn spawn_director_on_event_started<F>(
         &self,
         script_path: &Path,

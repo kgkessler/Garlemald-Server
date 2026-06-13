@@ -14848,3 +14848,179 @@ async fn send_instance_update_streams_walked_in_npc() {
         "the streamed NPC must be recorded in actor_instance_list",
     );
 }
+
+/// Garlemald-Server #46 live test round 2 — `send_instance_update` must
+/// also ENABLE the streamed actor's event conditions (SetEventStatus
+/// 0x0136), not just register them, or the 1.x client treats the NPC as
+/// non-talkable and never sends a talk EventStart ("NPCs show up but
+/// interacting does nothing"). The camp NPC carries a talkDefault
+/// condition; the stream-in must include its 0x0136 enable.
+#[tokio::test]
+async fn send_instance_update_enables_talk_condition() {
+    use crate::actor::Character;
+    use crate::actor::event_conditions::{EventConditionList, TalkCondition};
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let zone = Zone::new(
+        128,
+        "sea0Field01".to_string(),
+        101,
+        String::new(),
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(128).await.unwrap();
+
+    let mut player = Character::new(1);
+    player.base.zone_id = 128;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 128, 1, player))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    let mut session = MapSession::new(1);
+    session.current_zone_id = 128;
+    world.upsert_session(session).await;
+
+    // Camp NPC with a talkDefault condition (as parsed from the seed
+    // class JSON at spawn).
+    let mut npc = Character::new(0x4000_0010);
+    npc.base.zone_id = 128;
+    npc.chara.actor_class_id = 1_500_013;
+    npc.base.event_conditions = EventConditionList {
+        talk: vec![TalkCondition {
+            condition_name: "talkDefault".to_string(),
+            unknown1: 0,
+            is_disabled: false,
+        }],
+        ..Default::default()
+    };
+    registry
+        .insert(ActorHandle::new(
+            0x4000_0010,
+            ActorKindTag::Npc,
+            128,
+            0,
+            npc,
+        ))
+        .await;
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 0x4000_0010,
+                kind: ActorKind::Npc,
+                position: Vector3::new(3.0, 0.0, 3.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world.send_instance_update(&registry, None, 1, 1).await;
+
+    let mut saw_event_status = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_SET_EVENT_STATUS {
+                saw_event_status = true;
+            }
+        }
+    }
+    assert!(
+        saw_event_status,
+        "send_instance_update must emit a SetEventStatus (0x0136) enabling the talkDefault condition",
+    );
+}
+
+/// Garlemald-Server #46 live test round 2 — drive the REAL
+/// `AetheryteParent.lua` through `call_npc_on_event_started` (FIX A's
+/// helper). It must load, run onEventStarted -> doNormalMenu, and emit
+/// the `eventAetheryteParentSelect` menu round-trip (RunEventFunction)
+/// — proof the new non-quest NPC/object dispatch opens the aetheryte
+/// menu. Before the fix, clicking the aetheryte hit only the quest-hook
+/// fan-out (no-op for a non-quest object) and nothing happened.
+#[test]
+fn real_aetheryte_parent_on_event_started_opens_menu() {
+    use crate::lua::LuaEngine;
+    use crate::lua::userdata::PlayerSnapshot;
+
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+    let script_path = root.join("base/chara/npc/object/aetheryte/AetheryteParent.lua");
+    assert!(script_path.exists());
+    let engine = LuaEngine::new(root);
+
+    let npc_spec = crate::lua::LuaNpcSpec {
+        actor_id: 0x4400_0001,
+        name: "camp_beardedrock_aetheryte".to_string(),
+        class_name: "AetheryteParent".to_string(),
+        class_path: "/Chara/Npc/Object/Aetheryte/AetheryteParent".to_string(),
+        unique_id: String::new(),
+        zone_id: 128,
+        zone_name: "sea0Field01".to_string(),
+        state: 0,
+        pos: (0.0, 0.0, 0.0),
+        rotation: 0.0,
+        actor_class_id: 1_280_002,
+        quest_graphic: 0,
+    };
+    let snapshot = PlayerSnapshot {
+        actor_id: 1,
+        ..Default::default()
+    };
+    let result = engine.call_npc_on_event_started(
+        &script_path,
+        snapshot,
+        npc_spec,
+        "talkDefault".to_string(),
+        1,
+        Vec::new(),
+    );
+    assert!(
+        result.error.is_none(),
+        "AetheryteParent onEventStarted errored: {:?}",
+        result.error,
+    );
+    assert!(
+        result.commands.iter().any(|c| matches!(
+            c,
+            crate::lua::LuaCommandKind::RunEventFunction { function_name, .. }
+                if function_name == "eventAetheryteParentSelect"
+        )),
+        "expected the aetheryte teleport menu round-trip; got {:?}",
+        result.commands,
+    );
+}

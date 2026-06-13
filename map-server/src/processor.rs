@@ -7577,6 +7577,21 @@ impl PacketProcessor {
                 .await;
         }
 
+        // Non-quest NPC / object interaction — run the TARGET actor's OWN
+        // `onEventStarted` script (the aetheryte's teleport/homepoint/leve
+        // menu in AetheryteParent.lua, base populace dialogue, etc.).
+        // pmeteor runs this for EVERY EventStart target via
+        // LuaEngine.EventStarted -> CallLuaFunction(player, target,
+        // "onEventStarted"); garlemald only had quest-hook / command /
+        // journal / NpcLs / director routes, so clicking a plain NPC or
+        // the aetheryte did nothing (live-test round 2). Gated to a live
+        // Npc/object owner that ISN'T a command static actor, the journal
+        // / NpcLs commands, the active content director, or a current
+        // quest ENPC (those are handled by the quest-hook fan-out above —
+        // running their base script too would double-dispatch).
+        self.dispatch_event_start_to_npc(&handle, owner_actor_id, &event_name_for_cmd)
+            .await;
+
         // SEQ-005 content-tutorial handshake (UNRESOLVED — breadcrumb for
         // the next attempt). Packet-diff against the working pmeteor capture
         // captures/pmeteor-quest/20260426-160210-gridania-manual3 shows the
@@ -8525,6 +8540,159 @@ impl PacketProcessor {
     /// `callClientFunction(...)` lines would queue their commands but
     /// they'd be silently dropped at `apply_login_lua_command`.
     ///
+    /// Run a non-quest NPC/object's OWN `onEventStarted` script (port of
+    /// pmeteor's per-target `LuaEngine.EventStarted` dispatch). This is
+    /// what opens the aetheryte's menu (`AetheryteParent.lua`) and any
+    /// base populace dialogue — garlemald previously only routed quest
+    /// hooks / commands / journal / NpcLs / directors, so plain
+    /// NPC/object clicks did nothing. (Garlemald-Server #46 live test
+    /// round 2.)
+    ///
+    /// Guards (skip → leave to the existing routes):
+    ///  * command static actors (`0xA0F0xxxx`) — handled by
+    ///    `command_script_name` / journal / NpcLs above;
+    ///  * the active content director — `dispatch_event_start_to_content_director`;
+    ///  * a current quest ENPC — the quest-hook fan-out already ran its
+    ///    `onTalk`/`onPush`/etc.; running its base script too would
+    ///    double-open the event;
+    ///  * any owner not a live `Npc` in the registry.
+    ///
+    /// Mirrors the content-director resume pattern: try resuming a parked
+    /// coroutine first (the menu's `delegateCommand`/`callClientFunction`
+    /// round-trip parked on `_WAIT_EVENT`), only starting a fresh
+    /// `onEventStarted` when nothing was parked.
+    async fn dispatch_event_start_to_npc(
+        &self,
+        handle: &ActorHandle,
+        owner_actor_id: u32,
+        event_name: &str,
+    ) {
+        // Command static actors + journal/NpcLs are 0xA0F0xxxx; skip.
+        if (owner_actor_id & 0xFFF0_0000) == 0xA0F0_0000 {
+            return;
+        }
+        let Some(lua) = self.lua.as_ref() else {
+            return;
+        };
+        let actor_id = handle.actor_id;
+
+        // Skip the active content director (handled elsewhere).
+        if let Some(active) = self
+            .world
+            .session(handle.session_id)
+            .await
+            .and_then(|s| s.active_content_script)
+            && owner_actor_id == active.director_actor_id
+        {
+            return;
+        }
+
+        // Must be a live NPC actor in the registry.
+        let Some(owner_handle) = self.registry.get(owner_actor_id).await else {
+            return;
+        };
+        if !matches!(owner_handle.kind, crate::runtime::actor_registry::ActorKindTag::Npc) {
+            return;
+        }
+
+        // Skip current quest ENPCs — the quest-hook fan-out owns them.
+        let owner_class_id = {
+            let c = owner_handle.character.read().await;
+            c.chara.actor_class_id
+        };
+        let is_quest_enpc = {
+            let c = handle.character.read().await;
+            c.quest_journal.slots.iter().flatten().any(|q| {
+                q.state
+                    .current
+                    .values()
+                    .any(|e| e.actor_class_id == owner_class_id)
+            })
+        };
+        if is_quest_enpc {
+            return;
+        }
+
+        // First, try to resume a parked coroutine (the menu round-trip).
+        if let Some(cmds) = lua
+            .fire_player_event_and_drain(actor_id, &[])
+            .filter(|c| !c.is_empty())
+        {
+            self.apply_event_script_commands(handle, cmds).await;
+            return;
+        }
+
+        // Resolve the actor's script: unique override first, then the
+        // base class path (lowercased parents, leading '/' stripped —
+        // `resolver.base_class` joins `base/{path}.lua`).
+        let npc_spec = match self.build_npc_spec(owner_actor_id).await {
+            Some(s) => s,
+            None => return,
+        };
+        let zone_name = self
+            .world
+            .zone(npc_spec.zone_id)
+            .await
+            .map(|z| {
+                let zone = z.try_read();
+                zone.map(|z| z.core.zone_name.clone()).unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let unique_path = lua
+            .resolver()
+            .npc(&zone_name, &npc_spec.class_name, &npc_spec.unique_id);
+        let script_path = if !npc_spec.unique_id.is_empty() && unique_path.exists() {
+            unique_path
+        } else {
+            let base_rel = crate::world_manager::lowercase_class_path(&npc_spec.class_path);
+            let base_rel = base_rel.strip_prefix('/').unwrap_or(&base_rel);
+            lua.resolver().base_class(base_rel)
+        };
+        if !script_path.exists() {
+            tracing::debug!(
+                owner = format!("0x{owner_actor_id:08X}"),
+                class = owner_class_id,
+                script = %script_path.display(),
+                "NPC onEventStarted: no script on disk — skipping",
+            );
+            return;
+        }
+
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_from_character(&c)
+        };
+        let lua_clone = lua.clone();
+        let script_path_clone = script_path.clone();
+        let event_name_owned = event_name.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            lua_clone.call_npc_on_event_started(
+                &script_path_clone,
+                snapshot,
+                npc_spec,
+                event_name_owned,
+                0,
+                Vec::new(),
+            )
+        })
+        .await;
+        let partial = match result {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "NPC onEventStarted dispatch panicked");
+                return;
+            }
+        };
+        if let Some(e) = partial.error {
+            tracing::debug!(
+                owner = format!("0x{owner_actor_id:08X}"),
+                error = %e,
+                "NPC onEventStarted errored; applying partial commands",
+            );
+        }
+        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+    }
+
     /// No-ops if the NPC isn't in the registry, or the player has no
     /// active quests.
     async fn fire_quest_hook_for_active_quests(
