@@ -7715,6 +7715,22 @@ impl PacketProcessor {
     const ACTIVATE_COMMAND_A: u32 = 0xA0F0_5209;
     const ACTIVATE_COMMAND_B: u32 = 0xA0F0_520A;
 
+    /// Main-menu System command static actors, decoded from
+    /// `staticactors.bin` (`id | 0xA0F00000`): the client fires an
+    /// `EventStart` against these when the player clicks Exit / Teleport
+    /// / Return in the main menu. Without a dispatch arm the press falls
+    /// through `command_script_name` and the button does nothing — the
+    /// live-test "Exit game / Teleport don't work" report.
+    /// `TeleportCommand` (24220) backs BOTH the Teleport menu
+    /// (`isTeleport == 0`) and Return (`isTeleport == 1`); the on-disk
+    /// `commands/{LogoutCommand,TeleportCommand}.lua` scripts already
+    /// drive the `delegateCommand` confirm round-trip, which parks on
+    /// `_WAIT_EVENT` and resumes on the client's `0x012E EventUpdate`
+    /// exactly like quest `delegateEvent`. (Garlemald-Server #46 live
+    /// test.)
+    const LOGOUT_COMMAND: u32 = 0xA0F0_5E9B;
+    const TELEPORT_COMMAND: u32 = 0xA0F0_5E9C;
+
     /// SetTarget's `attackTarget` "no attack target" sentinel — the value the
     /// 1.x client writes when the player has no locked combat target (pmeteor
     /// `SetTargetPacket.attackTarget` "Usually 0xE0000000"). Same constant as
@@ -7724,6 +7740,8 @@ impl PacketProcessor {
     fn command_script_name(owner_actor_id: u32) -> Option<&'static str> {
         match owner_actor_id {
             Self::ACTIVATE_COMMAND_A | Self::ACTIVATE_COMMAND_B => Some("ActivateCommand"),
+            Self::LOGOUT_COMMAND => Some("LogoutCommand"),
+            Self::TELEPORT_COMMAND => Some("TeleportCommand"),
             _ => None,
         }
     }
@@ -8462,6 +8480,14 @@ impl PacketProcessor {
             // flows) never emit these commands and keep the shared drain,
             // whose direct KickEvent dispatch `kickEventContinue` relies on.
             // (Garlemald-Server #25.)
+            // `Logout` / `QuitGame` are the terminal commands of
+            // `LogoutCommand.lua`'s confirm round-trip (and the
+            // dead-Return path) — they are applied ONLY by
+            // `apply_login_lua_command` (processor.rs:1687-1692), never
+            // the runtime drain, so a resumed Exit-game confirm would be
+            // silently dropped on `apply_event_script_commands`. Route
+            // them (and the content/quest bursts) through the login
+            // command applier. (Garlemald-Server #46 live test.)
             let is_login_scoped_burst = cmds.iter().any(|c| {
                 matches!(
                     c,
@@ -8469,6 +8495,8 @@ impl PacketProcessor {
                         | crate::lua::command::LuaCommand::DoZoneChangeContent { .. }
                         | crate::lua::command::LuaCommand::AddQuest { .. }
                         | crate::lua::command::LuaCommand::CompleteQuest { .. }
+                        | crate::lua::command::LuaCommand::Logout { .. }
+                        | crate::lua::command::LuaCommand::QuitGame { .. }
                 )
             });
             if is_login_scoped_burst {

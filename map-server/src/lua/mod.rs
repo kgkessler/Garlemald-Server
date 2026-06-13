@@ -1960,6 +1960,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Garlemald-Server #46 live test — drive the REAL main-menu
+    /// command scripts (`LogoutCommand.lua`, `TeleportCommand.lua`)
+    /// through `call_command_on_event_started`. Both must load without
+    /// error and emit the `delegateCommand` confirm round-trip
+    /// (`RunEventFunction` with function_name "delegateCommand"), which
+    /// parks the coroutine on `_WAIT_EVENT` — the proof that the new
+    /// dispatch arms (Exit / Teleport buttons) reach a working script.
+    /// Before the fix these EventStarts fell through `command_script_name`
+    /// and the buttons did nothing.
+    #[test]
+    fn real_main_menu_command_scripts_park_on_delegate() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let engine = LuaEngine::new(root);
+        for script in ["LogoutCommand", "TeleportCommand"] {
+            let script_path = root.join(format!("commands/{script}.lua"));
+            assert!(script_path.exists(), "{script} must be on disk");
+            let result = engine.call_command_on_event_started(
+                &script_path,
+                sample_snapshot(),
+                0xA0F0_5E9B, // command static actor (id is cosmetic here)
+                "commandRequest".to_string(),
+                0,
+                Vec::new(),
+            );
+            assert!(
+                result.error.is_none(),
+                "{script} onEventStarted errored: {:?}",
+                result.error,
+            );
+            assert!(
+                result.commands.iter().any(|c| matches!(
+                    c,
+                    LuaCommand::RunEventFunction { function_name, .. }
+                        if function_name == "delegateCommand"
+                )),
+                "{script} must fire a delegateCommand round-trip; got {:?}",
+                result.commands,
+            );
+        }
+    }
+
     /// #28 S0.4 — drive the REAL `SimpleContent30010.lua::onUpdate`
     /// with an engaged player + an unengaged ally and assert the
     /// `SetMod(modifiersGlobal.MovementSpeed, 8)` line reaches the

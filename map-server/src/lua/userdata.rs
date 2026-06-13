@@ -2922,6 +2922,21 @@ impl UserData for LuaPlayer {
             );
             Ok(())
         });
+        // `player:PlayAnimation(animation_id)` — mirror of the LuaActor
+        // binding (userdata.rs ~141). TeleportCommand.lua fires
+        // `player:PlayAnimation(0x4000FFA/FFB)` for the teleport cast +
+        // arrival; without it on LuaPlayer the teleport/return menu
+        // errored out mid-script. (Garlemald-Server #46 live test.)
+        methods.add_method("PlayAnimation", |_, this, animation_id: u32| {
+            push(
+                &this.queue,
+                LuaCommand::PlayAnimation {
+                    actor_id: this.snapshot.actor_id,
+                    animation_id,
+                },
+            );
+            Ok(())
+        });
         methods.add_method(
             "Warp",
             |_, this, (zone_id, x, y, z, rot): (u32, f32, f32, f32, Option<f32>)| {
