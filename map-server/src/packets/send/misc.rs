@@ -576,6 +576,44 @@ pub fn build_text_sheet_dispid_x60(
     )
 }
 
+/// Auto-tier picker for the DispId-sender family — mirror of
+/// `build_text_sheet_no_source_auto`. Picks the smallest 0x0161-0x0165
+/// tier that fits the params (probing the serialized byte length), the
+/// same way pmeteor's `GameMessagePacket.BuildPacket` DispId overload
+/// selects its opcode. The man*l*1 NPC-linkshell narration passes NO
+/// params → the 0x0161 (30b) tier. (Garlemald-Server #46.)
+pub fn build_text_sheet_dispid_auto(
+    receiver_actor_id: u32,
+    disp_id: u32,
+    sender_actor_id: u32,
+    text_id: u16,
+    log_flag: u8,
+    lua_params: &[LuaParam],
+) -> SubPacket {
+    let mut probe = Vec::<u8>::new();
+    luaparam::write_lua_params(&mut probe, lua_params).unwrap();
+    let p_len = probe.len();
+    let builder = if p_len <= 4 {
+        build_text_sheet_dispid_x30
+    } else if p_len <= 12 {
+        build_text_sheet_dispid_x38
+    } else if p_len <= 20 {
+        build_text_sheet_dispid_x40
+    } else if p_len <= 36 {
+        build_text_sheet_dispid_x50
+    } else {
+        build_text_sheet_dispid_x60
+    };
+    builder(
+        receiver_actor_id,
+        disp_id,
+        sender_actor_id,
+        text_id,
+        log_flag,
+        lua_params,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_text_sheet_dispid_n(
     receiver_actor_id: u32,

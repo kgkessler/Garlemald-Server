@@ -1605,6 +1605,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Garlemald-Server #46 live test — drive the REAL `man0l1.lua`
+    /// `onNpcLS` hook at SEQ_003 (from=1, msgStep=1), the Path-Companion
+    /// linkshell beat that ends tutorial mode. Asserts the hook (a)
+    /// emits the localized-display-name narration line (msg 339 from
+    /// pack 1, sender display 1000015) via the new 0x0161 path, and (b)
+    /// delivers `endTutorialMode` = SendDataPacket(7) — the belt-and-
+    /// braces menu unlock. Before the fix `onNpcLS` was unreachable (no
+    /// HandleNpcLs dispatch) and SendDataPacket was dropped on the
+    /// quest-hook drain.
+    #[test]
+    fn real_man0l1_on_npc_ls_seq003_ends_tutorial() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0l1.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        let quest_handle = userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence: 3, // SEQ_003
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 1,
+            npc_ls_msg_step: 1,
+            queue: CommandQueue::new(),
+        };
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onNpcLS",
+            sample_snapshot(),
+            quest_handle,
+            vec![QuestHookArg::Int(1), QuestHookArg::Int(1)],
+        );
+        assert!(
+            result.error.is_none(),
+            "onNpcLS errored: {:?}",
+            result.error
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessageLocalizedDisplayName {
+                    text_id: 339,
+                    display_id: 1_000_015,
+                    ..
+                }
+            )),
+            "expected the Path-Companion narration line (msg 339, sender 1000015); got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendDataPacket { .. })),
+            "expected endTutorialMode → SendDataPacket(7); got {:?}",
+            result.commands,
+        );
+    }
+
     /// Garlemald-Server #46 — drive the REAL `man0l1.lua` journal
     /// getters. Pins the marker beat-map (`getJournalMapMarkerList`) and
     /// the counter-derived journal info (`getJournalInformation`) against

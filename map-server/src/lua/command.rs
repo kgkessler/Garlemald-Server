@@ -64,6 +64,22 @@ pub enum LuaCommand {
         text_id: u32,
         log_type: u8,
     },
+    /// `player:SendGameMessageLocalizedDisplayName(textOwner, textId,
+    /// log, displayId, ...)` — a text-sheet line whose SENDER is shown
+    /// by a display-name id (e.g. an NPC's name) rather than a runtime
+    /// actor. Mirror of C# `Player.SendGameMessageLocalizedDisplayName`
+    /// (Player.cs:1004) → the 0x0161-0x0165 DispId-sender family. The
+    /// man*l*1 NPC-linkshell narration (`NPCLS_MSGS[pack][step]`) rides
+    /// this. `text_owner_actor_id` is the TEXT-SHEET host (the quest's
+    /// 0xA0F0xxxx static actor — same owner rule as `SendGameMessage`).
+    SendGameMessageLocalizedDisplayName {
+        player_id: u32,
+        text_owner_actor_id: u32,
+        text_id: u16,
+        log_type: u8,
+        display_id: u32,
+        params: Vec<common::luaparam::LuaParam>,
+    },
     EndEvent {
         player_id: u32,
         event_owner: u32,

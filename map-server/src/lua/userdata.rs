@@ -1459,32 +1459,71 @@ impl UserData for LuaPlayer {
         methods.add_method("SetNpcLs", set_npc_ls_handler);
         methods.add_method("SetNpcLS", set_npc_ls_handler);
 
-        // `player:SendGameMessageLocalizedDisplayName(quest, msgId,
-        // messageType, npcDisplayNameId)` — sheet-message dispatch
-        // with the NPC display name as the sender. Used heavily by
-        // the man*l*.lua NPC-linkshell narration (`NPCLS_MSGS[pack][step]`).
-        // 8 call sites. Routes through the existing SendMessage path
-        // for now (canonical 0x015C-0x0160 Text Sheet "Custom Sender"
-        // builders are defined but not yet auto-wired); the message
-        // body lands in chat with a synthetic sender placeholder so
-        // the script flow doesn't error.
+        // `player:SendGameMessageLocalizedDisplayName(textOwner, msgId,
+        // messageType, npcDisplayNameId, ...)` — the real 0x0161 DispId
+        // text-sheet line, sender shown by display-name id. Mirror of C#
+        // `Player.SendGameMessageLocalizedDisplayName` (Player.cs:1004):
+        // BuildPacket(worldMaster, textOwner.Id, textId, displayId, log).
+        // Drives the man*l*1 NPC-linkshell narration
+        // (`NPCLS_MSGS[pack][step]`, 8 call sites). `textOwner` is the
+        // TEXT-SHEET host — the quest's 0xA0F0xxxx static actor (the
+        // `quest` userdata) — so the client resolves the id against the
+        // quest's sheet, NOT WorldMaster's (the load-bearing text-owner
+        // rule; wrong owner crashes the client). (Garlemald-Server #46
+        // live test.)
         methods.add_method(
             "SendGameMessageLocalizedDisplayName",
             |_,
              this,
-             (_quest, msg_id, message_type, sender_display_name_id): (
-                mlua::AnyUserData,
+             (text_owner, msg_id, message_type, sender_display_name_id, varargs): (
+                mlua::Value,
                 u32,
                 u8,
                 Option<u32>,
+                mlua::Variadic<mlua::Value>,
             )| {
+                // Resolve the text-sheet owner. The script passes the
+                // `quest` userdata; derive the quest's static actor id
+                // (0xA0F00000 | questId). Fall back to WorldMaster for any
+                // non-quest owner (matches the system-line owner default).
+                let text_owner_actor_id = match &text_owner {
+                    mlua::Value::UserData(ud) => ud
+                        .borrow::<LuaQuestHandle>()
+                        .map(|q| 0xA0F0_0000 | (q.quest_id & 0xF_FFFF))
+                        .unwrap_or(crate::packets::send::misc::WORLD_MASTER_ACTOR_ID),
+                    _ => crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                };
+                // Marshal trailing varargs → LuaParams, stopping at the
+                // first nil (Lua vararg convention). man0l1 passes none.
+                let mut params = Vec::new();
+                for v in varargs.iter() {
+                    match v {
+                        mlua::Value::Integer(i) => {
+                            params.push(common::luaparam::LuaParam::Int32(*i as i32))
+                        }
+                        mlua::Value::Number(n) => {
+                            params.push(common::luaparam::LuaParam::Int32(*n as i32))
+                        }
+                        mlua::Value::Boolean(b) => params.push(if *b {
+                            common::luaparam::LuaParam::True
+                        } else {
+                            common::luaparam::LuaParam::False
+                        }),
+                        mlua::Value::String(s) => params.push(
+                            common::luaparam::LuaParam::String(s.to_string_lossy().to_string()),
+                        ),
+                        _ => break,
+                    }
+                }
                 push(
                     &this.queue,
-                    LuaCommand::SendMessage {
-                        actor_id: this.snapshot.actor_id,
-                        message_type,
-                        sender: format!("[{}]", sender_display_name_id.unwrap_or(0)),
-                        text: format!("[sheet:{}]", msg_id),
+                    LuaCommand::SendGameMessageLocalizedDisplayName {
+                        player_id: this.snapshot.actor_id,
+                        text_owner_actor_id,
+                        text_id: msg_id as u16,
+                        log_type: message_type,
+                        display_id: sender_display_name_id.unwrap_or(0),
+                        params,
                     },
                 );
                 Ok(())

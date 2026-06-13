@@ -237,6 +237,29 @@ pub async fn apply_runtime_lua_command(
                 .await;
             true
         }
+        // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
+        // linkshell narration line (0x0161 DispId-sender family).
+        LC::SendGameMessageLocalizedDisplayName {
+            player_id,
+            text_owner_actor_id,
+            text_id,
+            log_type,
+            display_id,
+            params,
+        } => {
+            apply_send_game_message_localized_display_name(
+                player_id,
+                text_owner_actor_id,
+                text_id,
+                log_type,
+                display_id,
+                &params,
+                registry,
+                world,
+            )
+            .await;
+            true
+        }
         LC::AddExp {
             actor_id,
             class_id,
@@ -4165,6 +4188,57 @@ pub(crate) async fn apply_send_game_message(
         text_id,
         log = format!("0x{log_type:02X}"),
         "SendGameMessage emitted",
+    );
+}
+
+/// `player:SendGameMessageLocalizedDisplayName(...)` — port of C#
+/// `Player.SendGameMessageLocalizedDisplayName` (Player.cs:1004) →
+/// `GameMessagePacket.BuildPacket(worldMaster, textOwner.Id, textId,
+/// displayId, log)`, the 0x0161-0x0165 DispId-sender family. The
+/// SubPacket source is WorldMaster (matching the system-toast source);
+/// the body's `textOwnerActorId` is the TEXT-SHEET host (the quest's
+/// 0xA0F0xxxx static actor — `text_id` resolves against ITS sheet, the
+/// same load-bearing owner rule as `apply_send_game_message`), and the
+/// sender name shown to the player is `display_id`. Self-only, stamped
+/// (the proxy drops `target_id == 0`). (Garlemald-Server #46.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_send_game_message_localized_display_name(
+    player_id: u32,
+    text_owner_actor_id: u32,
+    text_id: u16,
+    log_type: u8,
+    display_id: u32,
+    params: &[common::luaparam::LuaParam],
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let mut sub = crate::packets::send::misc::build_text_sheet_dispid_auto(
+        crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+        display_id,
+        text_owner_actor_id,
+        text_id,
+        log_type,
+        params,
+    );
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        player = player_id,
+        text_id,
+        display_id,
+        owner = format!("0x{text_owner_actor_id:08X}"),
+        log = format!("0x{log_type:02X}"),
+        "SendGameMessageLocalizedDisplayName emitted (0x0161 DispId family)",
     );
 }
 

@@ -167,9 +167,15 @@ impl QuestData {
     }
 
     /// `SetNpcLsFrom(from)` — flag a new NPC linkshell as driving
-    /// this quest's chain.
+    /// this quest's chain. Mirrors C# `QuestData.SetNpcLsFrom`
+    /// (`npcLsFrom = from; npcLsMessageStep = 1;`): the message step
+    /// starts at 1, NOT 0, because quest scripts index their message
+    /// packs 1-based (`NPCLS_MSGS[pack][msgStep]`, man0l1.lua) — leaving
+    /// it 0 nil-indexed the first onNpcLS line. (Garlemald-Server #46
+    /// live test.)
     pub fn set_npc_ls_from(&mut self, from: u32) {
         self.npc_ls_from = from;
+        self.npc_ls_msg_step = 1;
         self.dirty = true;
     }
 

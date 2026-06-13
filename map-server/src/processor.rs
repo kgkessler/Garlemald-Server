@@ -357,6 +357,10 @@ impl PacketProcessor {
         // registry-reachable state. EquipAbility/UnequipAbility/
         // SwapAbilities apply paths mutate this vec in-place.
         character.chara.hotbar = loaded.hotbar.clone();
+        // Owned NPC linkshells — hydrated for the zone-in pearl re-emit
+        // (Garlemald-Server #46). The PlayerSetNpcLs apply path keeps
+        // the DB row authoritative; this mirror is read-only at zone-in.
+        character.chara.npc_linkshells = loaded.npc_linkshells.clone();
         // SNpc / Path Companion hydration — same registry-reachability
         // motivation. The SetSNpc apply path mutates these in-place +
         // persists via db.save_snpc.
@@ -1505,6 +1509,29 @@ impl PacketProcessor {
                 )
                 .await;
             }
+            // The NPC-linkshell narration line, drained on the onNpcLS
+            // fan-out (which routes through this login applier).
+            // (Garlemald-Server #46 live test.)
+            LC::SendGameMessageLocalizedDisplayName {
+                player_id,
+                text_owner_actor_id,
+                text_id,
+                log_type,
+                display_id,
+                params,
+            } => {
+                crate::runtime::quest_apply::apply_send_game_message_localized_display_name(
+                    player_id,
+                    text_owner_actor_id,
+                    text_id,
+                    log_type,
+                    display_id,
+                    &params,
+                    &self.registry,
+                    &self.world,
+                )
+                .await;
+            }
             LC::SetHomePoint {
                 player_id,
                 homepoint,
@@ -1856,6 +1883,23 @@ impl PacketProcessor {
             // runtime applier so the equip + 0x014E refresh actually run.
             // (Garlemald-Server #28.)
             cmd @ LC::EquipFromPackage { .. } => {
+                crate::runtime::quest_apply::apply_runtime_lua_command(
+                    cmd,
+                    &self.registry,
+                    &self.db,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
+            }
+            // `player:SendDataPacket(n)` from a quest/NPC hook drained on
+            // the login path — most importantly `endTutorialMode` =
+            // SendDataPacket(7), fired from man0l1/man0g1 onNpcLS. The
+            // runtime drain owns this command (apply_send_data_packet)
+            // but the login drain had no arm, so the tutorial-mode exit
+            // was silently dropped on the onNpcLS fan-out, leaving the
+            // client masked. (Garlemald-Server #46 live test.)
+            cmd @ LC::SendDataPacket { .. } => {
                 crate::runtime::quest_apply::apply_runtime_lua_command(
                     cmd,
                     &self.registry,
@@ -4774,6 +4818,34 @@ impl PacketProcessor {
             "SetNpcLs persisted",
         );
 
+        // Flashing-pearl delta — mirror C# `Player.SetNpcLs`
+        // (Player.cs:2042-2045): push the `playerWork.npcLinkshellChat
+        // {Extra,Calling}[N]` property pair to the owning client so the
+        // main-menu linkpearl glows (ALERT) / clears. Without this the
+        // client never shows a pending NPC-linkshell message and the
+        // player never opens the chat that drives onNpcLS. EXTRA-then-
+        // CALLING order matches the C# delta. (Garlemald-Server #46.)
+        if let Some(handle) = self.registry.get(player_id).await
+            && let Some(client) = self.world.client(handle.session_id).await
+        {
+            let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
+                player_id,
+                "playerWork/npcLinkshellChat",
+            );
+            b.add_byte(
+                &format!("playerWork.npcLinkshellChatExtra[{zero_based}]"),
+                is_extra as u8,
+            );
+            b.add_byte(
+                &format!("playerWork.npcLinkshellChatCalling[{zero_based}]"),
+                is_calling as u8,
+            );
+            for mut sub in b.done() {
+                sub.set_target_id(handle.session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+        }
+
         // First-add toast — fire only when transitioning from "not
         // owned" to "owned". State 0 (GONE) is not an "ownership"
         // state itself, so we also gate on the new state being
@@ -5720,7 +5792,7 @@ impl PacketProcessor {
         };
         if let Err(e) = self
             .db
-            .save_quest_npc_ls(player_id, slot, from, /* msg_step preserved */ {
+            .save_quest_npc_ls(player_id, slot, from, /* msg_step now 1 */ {
                 let c = handle.character.read().await;
                 c.quest_journal
                     .get(quest_id)
@@ -5733,6 +5805,26 @@ impl PacketProcessor {
                 player = player_id, quest = quest_id, from, err = %e,
                 "QuestSetNpcLsFrom: DB persist failed",
             );
+        }
+
+        // The "new NPC linkshell message" toast — C# `Quest.NewNpcLsMsg`
+        // (Quest.cs:142-150) fires `SendGameMessage(25119, 0x20)` after
+        // SetNpcLsFrom + SetNpcLs(ALERT). Same WorldMaster-owned system-
+        // toast shape as the 25118 "linkpearl obtained" line. The
+        // SetNpcLs(ALERT) glow itself is emitted by apply_player_set_npc_ls
+        // (the PlayerSetNpcLs command NewNpcLsMsg also enqueues).
+        // (Garlemald-Server #46.)
+        if let Some(client) = self.world.client(handle.session_id).await {
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                25119,
+                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                &[common::luaparam::LuaParam::UInt32(from)],
+                false,
+            );
+            pkt.set_target_id(handle.session_id);
+            client.send_bytes(pkt.to_bytes()).await;
         }
     }
 
@@ -7324,6 +7416,17 @@ impl PacketProcessor {
     /// sequence + journalInfo.
     const REQUEST_QUEST_JOURNAL_COMMAND: u32 = 0xA0F0_5E93;
 
+    /// `NpcLinkshellChatCommand` static-actor id — `0xA0F00000 | 0x5E95`
+    /// (decoded from `staticactors.bin`). The client fires `EventStart`
+    /// against this actor when the player opens an NPC-linkshell chat
+    /// (the flashing linkpearl); the first integer LuaParam is the
+    /// `npcLsId`. pmeteor routes it to `Player.HandleNpcLs`, which finds
+    /// the active quest whose `npcLsFrom == npcLsId` and fires its
+    /// `onNpcLS(player, quest, from, msgStep)` hook. (Garlemald-Server
+    /// #46 live test — the man0l1 SEQ_003 Path-Companion progression +
+    /// endTutorialMode ride this path.)
+    const NPC_LINKSHELL_CHAT_COMMAND: u32 = 0xA0F0_5E95;
+
     // `pub(crate)` so the #28 S3.2 integration test can drive a synthetic
     // retail-shaped 0x012D through the same parse + dispatch path the
     // socket reader uses.
@@ -7522,6 +7625,20 @@ impl PacketProcessor {
         {
             self.send_quest_journal_data(&handle, session_id, &lua_params_for_cmd)
                 .await;
+        }
+
+        // NPC linkshell chat — the client opened the flashing linkpearl.
+        // Mirror pmeteor `Player.HandleNpcLs` (Player.cs:1975-1986):
+        // find the active quest whose `npcLsFrom == npcLsId` and fire its
+        // `onNpcLS(player, quest, from, msgStep)` hook (which drains the
+        // Path-Companion messages, advances the sequence, and — at
+        // man0l1 SEQ_003 — calls endTutorialMode). Routed by owner id,
+        // like the journal command above; the on-disk
+        // commands/NpcLinkshellChatCommand.lua is a stale revision and is
+        // deliberately bypassed. (Garlemald-Server #46 live test.)
+        if owner_actor_id == Self::NPC_LINKSHELL_CHAT_COMMAND {
+            self.handle_npc_ls_chat(&handle, &lua_params_for_cmd).await;
+            return Ok(());
         }
 
         // Generic client-command dispatch — run `commands/<Name>.lua::
@@ -8132,6 +8249,72 @@ impl PacketProcessor {
             &self.registry,
             actor_id,
             bytes,
+        )
+        .await;
+    }
+
+    /// Port of pmeteor `Player.HandleNpcLs` (Player.cs:1975-1986): the
+    /// client opened an NPC-linkshell chat (`npcLsId` = first integer
+    /// LuaParam). Find the first active quest whose `npcLsFrom ==
+    /// npcLsId` and fire its `onNpcLS(player, quest, from, msgStep)`
+    /// hook via `fire_quest_event_hook` (which builds the LuaQuestHandle
+    /// with the npc-ls scratchpad fields and bridges the script's own
+    /// `player:EndEvent()` through the EventOutbox). If no quest claims
+    /// the id, mirror the script's else-branch by closing the event so
+    /// the client doesn't soft-lock in the LS window.
+    async fn handle_npc_ls_chat(
+        &self,
+        handle: &ActorHandle,
+        lua_params: &[common::luaparam::LuaParam],
+    ) {
+        use common::luaparam::LuaParam;
+        let npc_ls_id = lua_params.iter().find_map(|p| match p {
+            LuaParam::Int32(v) => u32::try_from(*v).ok(),
+            LuaParam::UInt32(v) => Some(*v),
+            _ => None,
+        });
+        let Some(npc_ls_id) = npc_ls_id else {
+            tracing::debug!(
+                player = handle.actor_id,
+                "NpcLs chat: no npcLsId param — closing event",
+            );
+            self.end_command_event(handle).await;
+            return;
+        };
+        // Find the active quest with a matching pending NpcLs chain.
+        let matched = {
+            let c = handle.character.read().await;
+            c.quest_journal
+                .slots
+                .iter()
+                .flatten()
+                .find(|q| q.get_npc_ls_from() == npc_ls_id)
+                .map(|q| (q.quest_id(), q.get_npc_ls_from(), q.get_npc_ls_msg_step()))
+        };
+        let Some((quest_id, from, msg_step)) = matched else {
+            tracing::debug!(
+                player = handle.actor_id,
+                npc_ls_id,
+                "NpcLs chat: no active quest claims this id — closing event",
+            );
+            self.end_command_event(handle).await;
+            return;
+        };
+        tracing::debug!(
+            player = handle.actor_id,
+            quest = quest_id,
+            from,
+            msg_step,
+            "NpcLs chat → firing onNpcLS",
+        );
+        self.fire_quest_event_hook(
+            handle,
+            quest_id,
+            "onNpcLS",
+            vec![
+                crate::lua::QuestHookArg::Int(from as i64),
+                crate::lua::QuestHookArg::Int(msg_step as i64),
+            ],
         )
         .await;
     }

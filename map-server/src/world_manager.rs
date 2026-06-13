@@ -1431,6 +1431,19 @@ impl WorldManager {
                 c.chara.gc_rank_uldah,
             )
         };
+        // Owned NPC linkshells with a pending/owned state — re-emitted as
+        // `playerWork.npcLinkshellChat{Calling,Extra}[N]` below so the
+        // flashing-pearl cue survives a relog (Garlemald-Server #46). Ids
+        // are stored zero-based (the SetNpcLs apply path decremented).
+        let npc_linkshells: Vec<(u16, bool, bool)> = {
+            let c = actor_handle.character.read().await;
+            c.chara
+                .npc_linkshells
+                .iter()
+                .filter(|e| e.is_calling || e.is_extra)
+                .map(|e| (e.npc_ls_id, e.is_calling, e.is_extra))
+                .collect()
+        };
         let (zone_actor_id, region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
             let z = zone_arc.read().await;
             (
@@ -1764,6 +1777,29 @@ impl WorldManager {
             &active_quests,
             &hotbar_props,
         ));
+        // NPC-linkshell pearl state — re-emit each owned linkshell's
+        // `playerWork.npcLinkshellChat{Calling,Extra}[N]` so a pending
+        // message's flashing pearl survives a relog (the live SetNpcLs
+        // delta only fires in-session). Mirrors C# GetInitPackets'
+        // Calling-then-Extra ordering (Player.cs:577-582). Skipped
+        // entirely for a player with no owned NPC linkshells (the common
+        // case), so this adds nothing to the bundle pre-Baderon.
+        // (Garlemald-Server #46.)
+        if !npc_linkshells.is_empty() {
+            let mut b = tx::actor::ActorPropertyPacketBuilder::new(
+                actor_id,
+                "playerWork/npcLinkshellChat",
+            );
+            for (id, is_calling, is_extra) in &npc_linkshells {
+                if *is_calling {
+                    b.add_byte(&format!("playerWork.npcLinkshellChatCalling[{id}]"), 1);
+                }
+                if *is_extra {
+                    b.add_byte(&format!("playerWork.npcLinkshellChatExtra[{id}]"), 1);
+                }
+            }
+            subpackets.extend(b.done());
+        }
         // Post-init property emission — C# `PostUpdate` drives these on
         // the first tick after spawn, but the client's
         // `DepictionJudge:judgeNameplate` runs BEFORE that tick lands
