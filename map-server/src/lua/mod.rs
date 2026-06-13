@@ -1675,6 +1675,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Garlemald-Server #46 live test round 4 — the man0l1 SEQ_003
+    /// `onNotice` hook (fired server-driven by the AfterQuestWarpDirector
+    /// kick after the Baderon talk) must push `endTutorialMode` =
+    /// SendDataPacket(7) to lift the desktopWidgetMode-16 mask
+    /// processEvent020 leaves the client in (dead menu / linkpearl /
+    /// aetheryte). Without it the only un-mask is a linkpearl click that
+    /// mode 16 itself blocks — a deadlock.
+    #[test]
+    fn real_man0l1_on_notice_seq003_ends_tutorial() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0l1.lua");
+        let engine = LuaEngine::new(root);
+
+        let quest_handle = userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence: 3, // SEQ_003
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 1,
+            npc_ls_msg_step: 1,
+            queue: CommandQueue::new(),
+        };
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onNotice",
+            sample_snapshot(),
+            quest_handle,
+            vec![QuestHookArg::Nil],
+        );
+        assert!(
+            result.error.is_none(),
+            "onNotice errored: {:?}",
+            result.error
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendDataPacket { .. })),
+            "man0l1 onNotice(SEQ_003) must push endTutorialMode (SendDataPacket); got {:?}",
+            result.commands,
+        );
+    }
+
     /// Garlemald-Server #46 live test — drive the REAL `man0l1.lua`
     /// `onNpcLS` hook at SEQ_003 (from=1, msgStep=1), the Path-Companion
     /// linkshell beat that ends tutorial mode. Asserts the hook (a)

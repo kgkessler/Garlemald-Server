@@ -695,11 +695,27 @@ end
 
 function onNotice(player, quest, target)
 	local sequence = quest:getSequence();
-	
+
 	if (sequence == SEQ_003) then
+		-- Lift the tutorial desktop-widget mask the client entered during
+		-- the Baderon talk. processEvent020 deliberately leaves the client
+		-- in desktopWidgetMode 16 (HUD hidden, Map/menu/linkpearl/NPC/
+		-- aetheryte interaction all disabled — movement still works),
+		-- verified by disassembling the shipped Man0l1.lpb. On retail the
+		-- only un-mask for the Limsa opener is endTutorialMode =
+		-- SendDataPacket(7), normally fired from onNpcLS when the player
+		-- clicks the flashing Path-Companion linkpearl — but that click is
+		-- itself suppressed by mode 16 (deadlock). The Gridania opener
+		-- (man0g0) avoids this by cancelling mode 16 client-side in
+		-- processTtrAfterBtl001; man0l1 does not. So push endTutorialMode
+		-- HERE: onNotice fires server-driven from the AfterQuestWarpDirector
+		-- kick AFTER the warp + cutscene, breaking the deadlock. It is
+		-- idempotent with the later onNpcLS endTutorialMode. (Garlemald-
+		-- Server #46 live test round 4 — Baderon breaks the menu.)
+		endTutorialMode(player);
 		player:EndEvent();
 	end
-		
+
 	quest:UpdateENPCs();
 end
 
