@@ -1786,10 +1786,8 @@ impl WorldManager {
         // case), so this adds nothing to the bundle pre-Baderon.
         // (Garlemald-Server #46.)
         if !npc_linkshells.is_empty() {
-            let mut b = tx::actor::ActorPropertyPacketBuilder::new(
-                actor_id,
-                "playerWork/npcLinkshellChat",
-            );
+            let mut b =
+                tx::actor::ActorPropertyPacketBuilder::new(actor_id, "playerWork/npcLinkshellChat");
             for (id, is_calling, is_extra) in &npc_linkshells {
                 if *is_calling {
                     b.add_byte(&format!("playerWork.npcLinkshellChatCalling[{id}]"), 1);

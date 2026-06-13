@@ -14820,9 +14820,7 @@ async fn send_instance_update_streams_walked_in_npc() {
         );
     }
 
-    world
-        .send_instance_update(&registry, None, 1, 1)
-        .await;
+    world.send_instance_update(&registry, None, 1, 1).await;
 
     // The client received the NPC's AddActor (push_npc_spawn's first
     // packet is the 0x00CA AddActor).

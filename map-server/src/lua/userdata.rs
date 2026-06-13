@@ -1509,9 +1509,9 @@ impl UserData for LuaPlayer {
                         } else {
                             common::luaparam::LuaParam::False
                         }),
-                        mlua::Value::String(s) => params.push(
-                            common::luaparam::LuaParam::String(s.to_string_lossy().to_string()),
-                        ),
+                        mlua::Value::String(s) => params.push(common::luaparam::LuaParam::String(
+                            s.to_string_lossy().to_string(),
+                        )),
                         _ => break,
                     }
                 }
