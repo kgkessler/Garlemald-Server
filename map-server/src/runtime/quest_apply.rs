@@ -4341,6 +4341,39 @@ pub(crate) async fn apply_player_set_npc_ls(
     let Some(handle) = registry.get(player_id).await else {
         return;
     };
+    // Keep the in-memory CharaState in sync with the DB row. The zone-in
+    // bundle's pearl re-emit (world_manager::send_zone_in_bundle) reads
+    // `chara.npc_linkshells`, which is otherwise only populated at LOGIN.
+    // Without this sync the re-emit restores the pearl after a relog but
+    // NOT after a SAME-SESSION warp — and NewNpcLsMsg's ALERT glow is
+    // immediately followed by a warp on the man0l1 Baderon beat
+    // (DoZoneChange 133→133). The warp re-inits the client's
+    // playerWork.npcLinkshellChat, the re-emit finds an empty in-memory
+    // list and skips it, so the client's `isNpcLinkshellChatCalling()`
+    // gate stays false and the NPC-linkshell read (the command's
+    // `canFire`) never fires → the player can never read Baderon's
+    // message → softlock. (Garlemald-Server #46.)
+    {
+        let mut c = handle.character.write().await;
+        let zb = zero_based as u16;
+        if let Some(e) = c
+            .chara
+            .npc_linkshells
+            .iter_mut()
+            .find(|e| e.npc_ls_id == zb)
+        {
+            e.is_calling = is_calling;
+            e.is_extra = is_extra;
+        } else {
+            c.chara
+                .npc_linkshells
+                .push(crate::gamedata::NpcLinkshellEntry {
+                    npc_ls_id: zb,
+                    is_calling,
+                    is_extra,
+                });
+        }
+    }
     let Some(client) = world.client(handle.session_id).await else {
         return;
     };

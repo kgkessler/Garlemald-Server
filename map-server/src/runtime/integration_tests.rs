@@ -15036,6 +15036,23 @@ async fn runtime_drain_applies_player_set_npc_ls_glow() {
         saw_property,
         "PlayerSetNpcLs(ALERT) must emit the playerWork.npcLinkshellChat pearl-glow property",
     );
+
+    // The in-memory CharaState must also be synced (npc_ls_id 1 → zero-based
+    // 0, calling). The zone-in bundle's pearl re-emit reads
+    // chara.npc_linkshells, so without this sync the pearl is lost on a
+    // SAME-SESSION warp (the man0l1 Baderon beat) and the NPC-linkshell read
+    // never fires → softlock. (Garlemald-Server #46.)
+    let handle = registry.get(1).await.expect("actor present");
+    let c = handle.character.read().await;
+    assert!(
+        c.chara
+            .npc_linkshells
+            .iter()
+            .any(|e| e.npc_ls_id == 0 && e.is_calling && e.is_extra),
+        "PlayerSetNpcLs(ALERT) must sync chara.npc_linkshells (id 0, calling+extra) so the \
+         post-warp zone-in re-emit restores the pearl; got {:?}",
+        c.chara.npc_linkshells,
+    );
 }
 
 /// Garlemald-Server #46 live test round 2 — drive the REAL
