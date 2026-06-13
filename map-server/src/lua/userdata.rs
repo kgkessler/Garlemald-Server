@@ -2457,6 +2457,14 @@ impl UserData for LuaPlayer {
                         "Man0l0" => 110001,
                         "Man0g0" => 110005,
                         "Man0u0" => 110009,
+                        // Second opening quests (the "go attune the
+                        // aetheryte" leg) — AetheryteParent.lua resolves
+                        // these by name to advance SEQ_003/SEQ_005 on
+                        // attunement. (Garlemald-Server #46 live test
+                        // round 2.)
+                        "Man0l1" => 110002,
+                        "Man0g1" => 110006,
+                        "Man0u1" => 110010,
                         other => {
                             // Lenient fallback: search snapshot for any
                             // active quest with this exact name (case-

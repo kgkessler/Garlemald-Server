@@ -15096,3 +15096,80 @@ fn real_aetheryte_parent_on_event_started_opens_menu() {
         result.commands,
     );
 }
+
+/// Garlemald-Server #46 live test round 2 — attuning the Camp Bearded
+/// Rock aetheryte while on man0l1 SEQ_003 advances the quest: the ported
+/// AetheryteParent.lua Main-Scenario-Intro block fires processEvent025
+/// (delegateEvent) + StartSequence(SEQ_005). Drives the real script with
+/// a man0l1@SEQ_003 snapshot. Depends on GetQuest("Man0l1") resolving to
+/// 110002 (the second-quest name-table entry added with this fix).
+#[test]
+fn real_aetheryte_parent_attunement_advances_man0l1() {
+    use crate::lua::LuaEngine;
+    use crate::lua::userdata::{PlayerSnapshot, QuestStateSnapshot};
+
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+    let script_path = root.join("base/chara/npc/object/aetheryte/AetheryteParent.lua");
+    let engine = LuaEngine::new(root);
+
+    let npc_spec = crate::lua::LuaNpcSpec {
+        actor_id: 0x4400_0001,
+        name: "camp_beardedrock_aetheryte".to_string(),
+        class_name: "AetheryteParent".to_string(),
+        class_path: "/Chara/Npc/Object/Aetheryte/AetheryteParent".to_string(),
+        unique_id: String::new(),
+        zone_id: 128,
+        zone_name: "sea0Field01".to_string(),
+        state: 0,
+        pos: (0.0, 0.0, 0.0),
+        rotation: 0.0,
+        actor_class_id: 1_280_002,
+        quest_graphic: 0,
+    };
+    let snapshot = PlayerSnapshot {
+        actor_id: 1,
+        active_quests: vec![110_002],
+        active_quest_states: vec![QuestStateSnapshot {
+            quest_id: 110_002,
+            sequence: 3, // SEQ_003
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }],
+        ..Default::default()
+    };
+    let result = engine.call_npc_on_event_started(
+        &script_path,
+        snapshot,
+        npc_spec,
+        "talkDefault".to_string(),
+        1,
+        Vec::new(),
+    );
+    assert!(
+        result.error.is_none(),
+        "AetheryteParent (man0l1 SEQ_003) errored: {:?}",
+        result.error,
+    );
+    // The block fires `callClientFunction(processEvent025)` (which parks
+    // the coroutine on _WAIT_EVENT) THEN StartSequence(SEQ_005) on the
+    // EventUpdate resume — so the first slice carries only the
+    // processEvent025 delegate. Its presence proves the man0l1 SEQ_003
+    // branch ran: GetQuest("Man0l1") resolved to 110002 AND
+    // GetSequence()==SEQ_003 matched (else the branch is skipped). The
+    // quest actor in the delegate args (0xA0F1ADB2 = man0l1) confirms it.
+    assert!(
+        result.commands.iter().any(|c| matches!(
+            c,
+            crate::lua::LuaCommandKind::RunEventFunction { function_name, args, .. }
+                if function_name == "delegateEvent"
+                    && args.iter().any(|a| matches!(
+                        a,
+                        crate::lua::command::LuaCommandArg::String(s) if s == "processEvent025"
+                    ))
+        )),
+        "attunement at man0l1 SEQ_003 must fire processEvent025; got {:?}",
+        result.commands,
+    );
+}
