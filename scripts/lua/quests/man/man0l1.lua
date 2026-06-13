@@ -701,18 +701,19 @@ function onNotice(player, quest, target)
 		-- the Baderon talk. processEvent020 deliberately leaves the client
 		-- in desktopWidgetMode 16 (HUD hidden, Map/menu/linkpearl/NPC/
 		-- aetheryte interaction all disabled — movement still works),
-		-- verified by disassembling the shipped Man0l1.lpb. On retail the
-		-- only un-mask for the Limsa opener is endTutorialMode =
-		-- SendDataPacket(7), normally fired from onNpcLS when the player
-		-- clicks the flashing Path-Companion linkpearl — but that click is
-		-- itself suppressed by mode 16 (deadlock). The Gridania opener
-		-- (man0g0) avoids this by cancelling mode 16 client-side in
-		-- processTtrAfterBtl001; man0l1 does not. So push endTutorialMode
-		-- HERE: onNotice fires server-driven from the AfterQuestWarpDirector
-		-- kick AFTER the warp + cutscene, breaking the deadlock. It is
-		-- idempotent with the later onNpcLS endTutorialMode. (Garlemald-
-		-- Server #46 live test round 4 — Baderon breaks the menu.)
-		endTutorialMode(player);
+		-- verified by disassembling the shipped Man0l1.lpb. The ONLY thing
+		-- that cancels mode 16 for the Limsa opener is the client-side
+		-- `processEventTu_001` (the NPC-linkshell tutorial: it calls
+		-- cancelDesktopWidgetMode(16) + setTutorialMask + openTutorialWidget
+		-- for the Path-Companion linkpearl). It is invoked server-driven via
+		-- callClientFunction here — onNotice fires from the
+		-- AfterQuestWarpDirector noticeEvent kick AFTER the warp + cutscene.
+		-- endTutorialMode = SendDataPacket(7) does NOT clear mode 16 (it
+		-- cancels mode 120 / tutorialFlag only); the final endTutorialMode
+		-- runs from onNpcLS once the player clicks the now-clickable pearl.
+		-- This mirrors the working Gridania man0g1 onNotice. (Garlemald-
+		-- Server #46 — Baderon menu-lock root cause.)
+		callClientFunction(player, "delegateEvent", player, quest, "processEventTu_001");
 		player:EndEvent();
 	end
 
@@ -745,6 +746,15 @@ function onNpcLS(player, quest, from, msgStep)
 		
 		-- Handle anything else
 		if (sequence == SEQ_003) then
+			-- Player clicked the now-clickable Path-Companion linkpearl:
+			-- show the success widget, close the NPC-linkshell tutorial that
+			-- onNotice's processEventTu_001 opened, then end tutorial mode
+			-- (final cleanup, cancels mode 120 / clears tutorialFlag → full
+			-- menu). Mirrors man0g1; the wait(3) the Gridania script uses to
+			-- pace the success animation is omitted here to keep onNpcLS a
+			-- non-parking, run-to-completion hook.
+			showTutorialSuccessWidget(player, 9080);
+			closeTutorialWidget(player);
 			endTutorialMode(player);
 		elseif (sequence == SEQ_007) then
 			quest:StartSequenceForNpcLs(SEQ_035);

@@ -1455,6 +1455,7 @@ pub struct PartialLuaCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lua::command::LuaCommandArg;
 
     fn tmpdir() -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1677,13 +1678,15 @@ mod tests {
 
     /// Garlemald-Server #46 live test round 4 — the man0l1 SEQ_003
     /// `onNotice` hook (fired server-driven by the AfterQuestWarpDirector
-    /// kick after the Baderon talk) must push `endTutorialMode` =
-    /// SendDataPacket(7) to lift the desktopWidgetMode-16 mask
-    /// processEvent020 leaves the client in (dead menu / linkpearl /
-    /// aetheryte). Without it the only un-mask is a linkpearl click that
-    /// mode 16 itself blocks — a deadlock.
+    /// kick after the Baderon talk) must drive the client-side
+    /// `processEventTu_001` (via `callClientFunction`/`RunEventFunction`) to
+    /// lift the desktopWidgetMode-16 mask processEvent020 leaves the client
+    /// in (dead menu / linkpearl / aetheryte). Only `processEventTu_001`
+    /// calls `cancelDesktopWidgetMode(16)`; `endTutorialMode` =
+    /// SendDataPacket(7) cancels mode 120 / tutorialFlag, NOT 16 — so the
+    /// round-4 SendDataPacket approach left the menu dead. Mirrors man0g1.
     #[test]
-    fn real_man0l1_on_notice_seq003_ends_tutorial() {
+    fn real_man0l1_on_notice_seq003_unmasks_menu() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
         let script_path = root.join("quests/man/man0l1.lua");
         let engine = LuaEngine::new(root);
@@ -1712,11 +1715,17 @@ mod tests {
             result.error
         );
         assert!(
-            result
-                .commands
-                .iter()
-                .any(|c| matches!(c, LuaCommand::SendDataPacket { .. })),
-            "man0l1 onNotice(SEQ_003) must push endTutorialMode (SendDataPacket); got {:?}",
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::RunEventFunction { function_name, args, .. }
+                    if function_name == "delegateEvent"
+                        && args.iter().any(|a| matches!(
+                            a,
+                            LuaCommandArg::String(s) if s == "processEventTu_001"
+                        ))
+            )),
+            "man0l1 onNotice(SEQ_003) must drive processEventTu_001 (RunEventFunction) \
+             to cancel desktopWidgetMode 16; got {:?}",
             result.commands,
         );
     }
