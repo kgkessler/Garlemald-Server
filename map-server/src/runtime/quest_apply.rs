@@ -4303,7 +4303,12 @@ pub(crate) async fn apply_player_set_npc_ls(
     world: &WorldManager,
 ) {
     if !(1..=40).contains(&npc_ls_id) {
-        tracing::debug!(player = player_id, npc_ls_id, state, "SetNpcLs: id out of range");
+        tracing::debug!(
+            player = player_id,
+            npc_ls_id,
+            state,
+            "SetNpcLs: id out of range"
+        );
         return;
     }
     let (is_calling, is_extra) = match state {
@@ -4312,7 +4317,12 @@ pub(crate) async fn apply_player_set_npc_ls(
         2 => (true, false),
         3 => (true, true),
         _ => {
-            tracing::debug!(player = player_id, npc_ls_id, state, "SetNpcLs: unknown state");
+            tracing::debug!(
+                player = player_id,
+                npc_ls_id,
+                state,
+                "SetNpcLs: unknown state"
+            );
             return;
         }
     };

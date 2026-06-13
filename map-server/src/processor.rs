@@ -8415,7 +8415,10 @@ impl PacketProcessor {
         let Some(owner_handle) = self.registry.get(owner_actor_id).await else {
             return;
         };
-        if !matches!(owner_handle.kind, crate::runtime::actor_registry::ActorKindTag::Npc) {
+        if !matches!(
+            owner_handle.kind,
+            crate::runtime::actor_registry::ActorKindTag::Npc
+        ) {
             return;
         }
 
