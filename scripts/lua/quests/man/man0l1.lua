@@ -697,23 +697,31 @@ function onNotice(player, quest, target)
 	local sequence = quest:getSequence();
 
 	if (sequence == SEQ_003) then
-		-- Lift the tutorial desktop-widget mask the client entered during
-		-- the Baderon talk. processEvent020 deliberately leaves the client
-		-- in desktopWidgetMode 16 (HUD hidden, Map/menu/linkpearl/NPC/
-		-- aetheryte interaction all disabled — movement still works),
-		-- verified by disassembling the shipped Man0l1.lpb. The ONLY thing
-		-- that cancels mode 16 for the Limsa opener is the client-side
-		-- `processEventTu_001` (the NPC-linkshell tutorial: it calls
-		-- cancelDesktopWidgetMode(16) + setTutorialMask + openTutorialWidget
-		-- for the Path-Companion linkpearl). It is invoked server-driven via
-		-- callClientFunction here — onNotice fires from the
-		-- AfterQuestWarpDirector noticeEvent kick AFTER the warp + cutscene.
-		-- endTutorialMode = SendDataPacket(7) does NOT clear mode 16 (it
-		-- cancels mode 120 / tutorialFlag only); the final endTutorialMode
-		-- runs from onNpcLS once the player clicks the now-clickable pearl.
-		-- This mirrors the working Gridania man0g1 onNotice. (Garlemald-
-		-- Server #46 — Baderon menu-lock root cause.)
-		callClientFunction(player, "delegateEvent", player, quest, "processEventTu_001");
+		-- Lift the tutorial desktop-widget mask the client entered during the
+		-- Baderon talk. processEvent020 deliberately leaves the client in
+		-- desktopWidgetMode 16 (HUD hidden, Map/menu/linkpearl/NPC/aetheryte
+		-- all disabled), verified by disassembling the shipped Man0l1.lpb. The
+		-- ONLY thing that cancels mode 16 for the Limsa opener is the
+		-- client-side `processEventTu_001` (the NPC-linkshell tutorial: it
+		-- calls cancelDesktopWidgetMode(16) → desktopWidgetMode 120 — which
+		-- the menu gate processCommandMap ALLOWS — plus setTutorialMask +
+		-- openTutorialWidget(15) for the Path-Companion linkpearl).
+		--
+		-- IMPORTANT: drive it with the RAW (non-parking) RunEventFunction, NOT
+		-- callClientFunction. callClientFunction does RunEventFunction THEN
+		-- coroutine.yield("_WAIT_EVENT") and PARKS until the client replies
+		-- with a 0x012E EventUpdate. processEventTu_001 is a synchronous UI
+		-- mask (no _wait/cutscene/finishEvent) so it sends NO EventUpdate — so
+		-- callClientFunction here parks forever, the trailing EndEvent never
+		-- runs, the noticeEvent stays OPEN, and the client is event-locked
+		-- (movement locked + every menu/pearl click suppressed → softlock).
+		-- The raw RunEventFunction does not park, so the EndEvent below runs,
+		-- closing the noticeEvent; the wire order is the proven
+		-- RunEventFunction-then-EndEvent. After this the menu works (mode 120)
+		-- and the now-flashing linkpearl is clickable → onNpcLS →
+		-- endTutorialMode → full unlock (mode 8, free movement).
+		-- (Garlemald-Server #46 — Baderon menu/softlock root cause.)
+		player:RunEventFunction("delegateEvent", player, quest, "processEventTu_001");
 		player:EndEvent();
 	end
 

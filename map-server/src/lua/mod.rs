@@ -1676,15 +1676,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Garlemald-Server #46 live test round 4 — the man0l1 SEQ_003
-    /// `onNotice` hook (fired server-driven by the AfterQuestWarpDirector
-    /// kick after the Baderon talk) must drive the client-side
-    /// `processEventTu_001` (via `callClientFunction`/`RunEventFunction`) to
-    /// lift the desktopWidgetMode-16 mask processEvent020 leaves the client
-    /// in (dead menu / linkpearl / aetheryte). Only `processEventTu_001`
-    /// calls `cancelDesktopWidgetMode(16)`; `endTutorialMode` =
-    /// SendDataPacket(7) cancels mode 120 / tutorialFlag, NOT 16 — so the
-    /// round-4 SendDataPacket approach left the menu dead. Mirrors man0g1.
+    /// Garlemald-Server #46 — the man0l1 SEQ_003 `onNotice` hook (fired
+    /// server-driven by the AfterQuestWarpDirector kick after the Baderon
+    /// talk) must drive the client-side `processEventTu_001` (the NPC-linkshell
+    /// tutorial) to lift the desktopWidgetMode-16 mask processEvent020 leaves
+    /// the client in. Only `processEventTu_001` calls
+    /// `cancelDesktopWidgetMode(16)` (→ mode 120, which the menu gate allows);
+    /// `endTutorialMode` = SendDataPacket(7) cancels mode 120, NOT 16.
+    ///
+    /// CRUCIAL ordering invariant (the round-5 softlock regression): the hook
+    /// must emit it with the RAW non-parking `player:RunEventFunction`, NOT
+    /// `callClientFunction`. `callClientFunction` parks on
+    /// `coroutine.yield("_WAIT_EVENT")` waiting for a client EventUpdate that
+    /// `processEventTu_001` (a synchronous UI mask) never sends — so the
+    /// trailing `player:EndEvent()` would never run, the noticeEvent would
+    /// stay open, and the client would be event-locked (softlock). This test
+    /// asserts BOTH the RunEventFunction AND the EndEvent are emitted in the
+    /// same (non-parking) drain — if a future edit reintroduces
+    /// `callClientFunction` here, the hook parks and the EndEvent vanishes,
+    /// failing this test.
     #[test]
     fn real_man0l1_on_notice_seq003_unmasks_menu() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
@@ -1726,6 +1736,18 @@ mod tests {
             )),
             "man0l1 onNotice(SEQ_003) must drive processEventTu_001 (RunEventFunction) \
              to cancel desktopWidgetMode 16; got {:?}",
+            result.commands,
+        );
+        // Non-parking invariant: the EndEvent MUST be emitted in the same
+        // drain. If onNotice parks on `callClientFunction` (the round-5
+        // softlock), the hook yields before reaching EndEvent and this fails.
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            "man0l1 onNotice(SEQ_003) must also emit EndEvent in the same drain \
+             (proves it did NOT park on callClientFunction); got {:?}",
             result.commands,
         );
     }
