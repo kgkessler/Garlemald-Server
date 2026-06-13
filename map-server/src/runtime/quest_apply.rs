@@ -272,6 +272,43 @@ pub async fn apply_runtime_lua_command(
             apply_add_gil(actor_id, amount, registry, Some(world), db).await;
             true
         }
+        // NPC-linkshell scratchpad writes — these ride quest hooks that
+        // often park on a callClientFunction coroutine (man0l1 Baderon
+        // talk), so the NewNpcLsMsg / ReadNpcLsMsg / EndOfNpcLsMsgs burst
+        // is drained HERE on the EventUpdate resume. Without these arms
+        // the flashing-pearl glow (PlayerSetNpcLs) was dropped → onNpcLS
+        // unreachable → endTutorialMode never fired. (Garlemald-Server
+        // #46 live test round 2.)
+        LC::PlayerSetNpcLs {
+            player_id,
+            npc_ls_id,
+            state,
+        } => {
+            apply_player_set_npc_ls(player_id, npc_ls_id, state, registry, db, world).await;
+            true
+        }
+        LC::QuestSetNpcLsFrom {
+            player_id,
+            quest_id,
+            from,
+        } => {
+            apply_quest_set_npc_ls_from(player_id, quest_id, from, registry, db, world).await;
+            true
+        }
+        LC::QuestIncrementNpcLsMsgStep {
+            player_id,
+            quest_id,
+        } => {
+            apply_quest_increment_npc_ls_msg_step(player_id, quest_id, registry, db).await;
+            true
+        }
+        LC::QuestClearNpcLs {
+            player_id,
+            quest_id,
+        } => {
+            apply_quest_clear_npc_ls(player_id, quest_id, registry, db).await;
+            true
+        }
         LC::AddItem {
             actor_id,
             item_package,
@@ -4240,6 +4277,189 @@ pub(crate) async fn apply_send_game_message_localized_display_name(
         log = format!("0x{log_type:02X}"),
         "SendGameMessageLocalizedDisplayName emitted (0x0161 DispId family)",
     );
+}
+
+// ---------------------------------------------------------------------------
+// NPC-linkshell scratchpad appliers (shared by the processor's login drain
+// AND the runtime drain). The flashing-pearl chain (quest:NewNpcLsMsg →
+// PlayerSetNpcLs + QuestSetNpcLsFrom) is emitted from quest hooks that often
+// PARK on a callClientFunction coroutine (man0l1's Baderon talk), so the
+// burst is drained on the EventUpdate-resume path → apply_runtime_lua_command.
+// Before these free-fns existed the runtime drain had no NpcLs arms and
+// silently dropped them, so the pearl never glowed → onNpcLS unreachable →
+// endTutorialMode never fired. (Garlemald-Server #46 live test round 2.)
+// ---------------------------------------------------------------------------
+
+/// `player:SetNpcLs(id, state)` / `AddNpcLs` / the NewNpcLsMsg ALERT glow.
+/// Persists the row + emits the `playerWork.npcLinkshellChat{Extra,Calling}`
+/// pearl-glow property and the 25118 first-add toast. Canonical impl;
+/// the processor method delegates here.
+pub(crate) async fn apply_player_set_npc_ls(
+    player_id: u32,
+    npc_ls_id: u32,
+    state: u8,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    if !(1..=40).contains(&npc_ls_id) {
+        tracing::debug!(player = player_id, npc_ls_id, state, "SetNpcLs: id out of range");
+        return;
+    }
+    let (is_calling, is_extra) = match state {
+        0 => (false, false),
+        1 => (false, true),
+        2 => (true, false),
+        3 => (true, true),
+        _ => {
+            tracing::debug!(player = player_id, npc_ls_id, state, "SetNpcLs: unknown state");
+            return;
+        }
+    };
+    let zero_based = npc_ls_id - 1;
+    let was_owned = match db.load_npc_ls_state(player_id, zero_based).await {
+        Ok(Some((c, e))) => c || e,
+        _ => false,
+    };
+    if let Err(e) = db
+        .save_npc_ls(player_id, zero_based, is_calling, is_extra)
+        .await
+    {
+        tracing::warn!(player = player_id, npc_ls_id, err = %e, "SetNpcLs: DB persist failed");
+        return;
+    }
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let Some(client) = world.client(handle.session_id).await else {
+        return;
+    };
+    // Pearl glow — EXTRA-then-CALLING (C# Player.cs:2042-2045).
+    let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
+        player_id,
+        "playerWork/npcLinkshellChat",
+    );
+    b.add_byte(
+        &format!("playerWork.npcLinkshellChatExtra[{zero_based}]"),
+        is_extra as u8,
+    );
+    b.add_byte(
+        &format!("playerWork.npcLinkshellChatCalling[{zero_based}]"),
+        is_calling as u8,
+    );
+    for mut sub in b.done() {
+        sub.set_target_id(handle.session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+    // First-add "linkpearl obtained" toast.
+    if !was_owned && (is_calling || is_extra) {
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            25118,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
+            false,
+        );
+        pkt.set_target_id(handle.session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+}
+
+/// `quest:NewNpcLsMsg(from)` → set the quest's npc-ls scratchpad (from +
+/// msg_step=1) + persist + the 25119 "new message" toast.
+pub(crate) async fn apply_quest_set_npc_ls_from(
+    player_id: u32,
+    quest_id: u32,
+    from: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let (slot, step) = {
+        let mut c = handle.character.write().await;
+        let Some(slot) = c.quest_journal.slot_of(quest_id) else {
+            return;
+        };
+        let step = if let Some(q) = c.quest_journal.slots[slot].as_mut() {
+            q.set_npc_ls_from(from);
+            q.get_npc_ls_msg_step()
+        } else {
+            return;
+        };
+        (slot as i32, step)
+    };
+    if let Err(e) = db.save_quest_npc_ls(player_id, slot, from, step).await {
+        tracing::warn!(player = player_id, quest = quest_id, from, err = %e, "QuestSetNpcLsFrom: DB persist failed");
+    }
+    if let Some(client) = world.client(handle.session_id).await {
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            25119,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[common::luaparam::LuaParam::UInt32(from)],
+            false,
+        );
+        pkt.set_target_id(handle.session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+}
+
+/// `quest:ReadNpcLsMsg()` — bump the message step + persist.
+pub(crate) async fn apply_quest_increment_npc_ls_msg_step(
+    player_id: u32,
+    quest_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let (slot, from, step) = {
+        let mut c = handle.character.write().await;
+        let Some(slot) = c.quest_journal.slot_of(quest_id) else {
+            return;
+        };
+        let (from, step) = if let Some(q) = c.quest_journal.slots[slot].as_mut() {
+            let step = q.inc_npc_ls_msg_step();
+            (q.get_npc_ls_from(), step)
+        } else {
+            return;
+        };
+        (slot as i32, from, step)
+    };
+    if let Err(e) = db.save_quest_npc_ls(player_id, slot, from, step).await {
+        tracing::warn!(player = player_id, quest = quest_id, err = %e, "QuestIncrementNpcLsMsgStep: DB persist failed");
+    }
+}
+
+/// `quest:EndOfNpcLsMsgs()` — clear the npc-ls scratchpad + persist.
+pub(crate) async fn apply_quest_clear_npc_ls(
+    player_id: u32,
+    quest_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let slot = {
+        let mut c = handle.character.write().await;
+        let Some(slot) = c.quest_journal.slot_of(quest_id) else {
+            return;
+        };
+        if let Some(q) = c.quest_journal.slots[slot].as_mut() {
+            q.clear_npc_ls();
+        }
+        slot as i32
+    };
+    if let Err(e) = db.save_quest_npc_ls(player_id, slot, 0, 0).await {
+        tracing::warn!(player = player_id, quest = quest_id, err = %e, "QuestClearNpcLs: DB persist failed");
+    }
 }
 
 /// Used by the `LC::WarpToPosition` arm above — quest `onPush` bounce

@@ -4759,123 +4759,18 @@ impl PacketProcessor {
     /// registry yet, so the client won't see the icon flip until
     /// they're plumbed through.
     async fn apply_player_set_npc_ls(&self, player_id: u32, npc_ls_id: u32, state: u8) {
-        if !(1..=40).contains(&npc_ls_id) {
-            tracing::debug!(
-                player = player_id,
-                npc_ls_id,
-                state,
-                "SetNpcLs: id out of valid range (1..=40)",
-            );
-            return;
-        }
-        let (is_calling, is_extra) = match state {
-            0 => (false, false), // NPCLS_GONE
-            1 => (false, true),  // NPCLS_INACTIVE
-            2 => (true, false),  // NPCLS_ACTIVE
-            3 => (true, true),   // NPCLS_ALERT
-            _ => {
-                tracing::debug!(
-                    player = player_id,
-                    npc_ls_id,
-                    state,
-                    "SetNpcLs: unknown state code",
-                );
-                return;
-            }
-        };
-        let zero_based = npc_ls_id - 1;
-
-        // C# `Player.AddNpcLs` first-add gate: if the player didn't
-        // own this NpcLs (both flags false OR the row didn't exist),
-        // fire the canonical "<NpcLs> linkpearl obtained." toast on
-        // the GONE → owned transition. We probe BEFORE the upsert so
-        // a re-add of an already-owned LS doesn't double-fire.
-        let was_owned: bool = match self.db.load_npc_ls_state(player_id, zero_based).await {
-            Ok(Some((c, e))) => c || e, // any flag true = owned
-            Ok(None) | Err(_) => false, // missing row OR error → treat as not-owned
-        };
-
-        if let Err(e) = self
-            .db
-            .save_npc_ls(player_id, zero_based, is_calling, is_extra)
-            .await
-        {
-            tracing::warn!(
-                player = player_id,
-                npc_ls_id,
-                state,
-                err = %e,
-                "SetNpcLs: DB persist failed",
-            );
-            return;
-        }
-        tracing::debug!(
-            player = player_id,
+        // Delegate to the shared free-fn so the flashing-pearl flow is
+        // identical on the login drain and the runtime/resume drain.
+        // (Garlemald-Server #46 live test round 2.)
+        crate::runtime::quest_apply::apply_player_set_npc_ls(
+            player_id,
             npc_ls_id,
             state,
-            is_calling,
-            is_extra,
-            "SetNpcLs persisted",
-        );
-
-        // Flashing-pearl delta — mirror C# `Player.SetNpcLs`
-        // (Player.cs:2042-2045): push the `playerWork.npcLinkshellChat
-        // {Extra,Calling}[N]` property pair to the owning client so the
-        // main-menu linkpearl glows (ALERT) / clears. Without this the
-        // client never shows a pending NPC-linkshell message and the
-        // player never opens the chat that drives onNpcLS. EXTRA-then-
-        // CALLING order matches the C# delta. (Garlemald-Server #46.)
-        if let Some(handle) = self.registry.get(player_id).await
-            && let Some(client) = self.world.client(handle.session_id).await
-        {
-            let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
-                player_id,
-                "playerWork/npcLinkshellChat",
-            );
-            b.add_byte(
-                &format!("playerWork.npcLinkshellChatExtra[{zero_based}]"),
-                is_extra as u8,
-            );
-            b.add_byte(
-                &format!("playerWork.npcLinkshellChatCalling[{zero_based}]"),
-                is_calling as u8,
-            );
-            for mut sub in b.done() {
-                sub.set_target_id(handle.session_id);
-                client.send_bytes(sub.to_bytes()).await;
-            }
-        }
-
-        // First-add toast — fire only when transitioning from "not
-        // owned" to "owned". State 0 (GONE) is not an "ownership"
-        // state itself, so we also gate on the new state being
-        // anything-but-GONE (otherwise SetNpcLs(id, GONE) on a
-        // never-owned LS would fire spuriously).
-        let now_owned = is_calling || is_extra;
-        if !was_owned
-            && now_owned
-            && let Some(handle) = self.registry.get(player_id).await
-            && let Some(client) = self.world.client(handle.session_id).await
-        {
-            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                // Header source = WorldMaster (the client dispatches by
-                // header source; it must be an always-present static
-                // actor, never the player — Garlemald-Server #28 crash RCA).
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                /* text_id */ 25118,
-                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
-                /* prefer_alt */ false,
-            );
-            pkt.set_target_id(handle.session_id);
-            client.send_bytes(pkt.to_bytes()).await;
-            tracing::debug!(
-                player = player_id,
-                npc_ls_id,
-                "SetNpcLs first-add: 25118 'linkpearl obtained' toast fired",
-            );
-        }
+            &self.registry,
+            &self.db,
+            &self.world,
+        )
+        .await;
     }
 
     /// `player:EquipAbility(classId, commandId, hotbarSlot, _)` —
@@ -5777,110 +5672,39 @@ impl PacketProcessor {
     /// the migration-050 column. Silently no-ops if the player isn't
     /// in the registry or the quest isn't in their journal.
     async fn apply_quest_set_npc_ls_from(&self, player_id: u32, quest_id: u32, from: u32) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let slot = {
-            let mut c = handle.character.write().await;
-            let Some(slot) = c.quest_journal.slot_of(quest_id) else {
-                return;
-            };
-            if let Some(q) = c.quest_journal.slots[slot].as_mut() {
-                q.set_npc_ls_from(from);
-            }
-            slot as i32
-        };
-        if let Err(e) = self
-            .db
-            .save_quest_npc_ls(player_id, slot, from, /* msg_step now 1 */ {
-                let c = handle.character.read().await;
-                c.quest_journal
-                    .get(quest_id)
-                    .map(|q| q.get_npc_ls_msg_step())
-                    .unwrap_or(0)
-            })
-            .await
-        {
-            tracing::warn!(
-                player = player_id, quest = quest_id, from, err = %e,
-                "QuestSetNpcLsFrom: DB persist failed",
-            );
-        }
-
-        // The "new NPC linkshell message" toast — C# `Quest.NewNpcLsMsg`
-        // (Quest.cs:142-150) fires `SendGameMessage(25119, 0x20)` after
-        // SetNpcLsFrom + SetNpcLs(ALERT). Same WorldMaster-owned system-
-        // toast shape as the 25118 "linkpearl obtained" line. The
-        // SetNpcLs(ALERT) glow itself is emitted by apply_player_set_npc_ls
-        // (the PlayerSetNpcLs command NewNpcLsMsg also enqueues).
-        // (Garlemald-Server #46.)
-        if let Some(client) = self.world.client(handle.session_id).await {
-            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                25119,
-                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                &[common::luaparam::LuaParam::UInt32(from)],
-                false,
-            );
-            pkt.set_target_id(handle.session_id);
-            client.send_bytes(pkt.to_bytes()).await;
-        }
+        crate::runtime::quest_apply::apply_quest_set_npc_ls_from(
+            player_id,
+            quest_id,
+            from,
+            &self.registry,
+            &self.db,
+            &self.world,
+        )
+        .await;
     }
 
     /// `quest:GetData():IncrementNpcLsMsgStep()` and the
     /// `LuaQuestHandle::ReadNpcLsMsg` first step.
     async fn apply_quest_increment_npc_ls_msg_step(&self, player_id: u32, quest_id: u32) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let (slot, npc_ls_from, new_step) = {
-            let mut c = handle.character.write().await;
-            let Some(slot) = c.quest_journal.slot_of(quest_id) else {
-                return;
-            };
-            let (from, step) = if let Some(q) = c.quest_journal.slots[slot].as_mut() {
-                let step = q.inc_npc_ls_msg_step();
-                (q.get_npc_ls_from(), step)
-            } else {
-                return;
-            };
-            (slot as i32, from, step)
-        };
-        if let Err(e) = self
-            .db
-            .save_quest_npc_ls(player_id, slot, npc_ls_from, new_step)
-            .await
-        {
-            tracing::warn!(
-                player = player_id, quest = quest_id, err = %e,
-                "QuestIncrementNpcLsMsgStep: DB persist failed",
-            );
-        }
+        crate::runtime::quest_apply::apply_quest_increment_npc_ls_msg_step(
+            player_id,
+            quest_id,
+            &self.registry,
+            &self.db,
+        )
+        .await;
     }
 
     /// `quest:GetData():ClearNpcLs()` and the
     /// `LuaQuestHandle::EndOfNpcLsMsgs` last step.
     async fn apply_quest_clear_npc_ls(&self, player_id: u32, quest_id: u32) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let slot = {
-            let mut c = handle.character.write().await;
-            let Some(slot) = c.quest_journal.slot_of(quest_id) else {
-                return;
-            };
-            if let Some(q) = c.quest_journal.slots[slot].as_mut() {
-                q.clear_npc_ls();
-            }
-            slot as i32
-        };
-        if let Err(e) = self.db.save_quest_npc_ls(player_id, slot, 0, 0).await {
-            tracing::warn!(
-                player = player_id, quest = quest_id, err = %e,
-                "QuestClearNpcLs: DB persist failed",
-            );
-        }
+        crate::runtime::quest_apply::apply_quest_clear_npc_ls(
+            player_id,
+            quest_id,
+            &self.registry,
+            &self.db,
+        )
+        .await;
     }
 
     async fn apply_add_seals(&self, player_id: u32, gc: u8, amount: i32) {

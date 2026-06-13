@@ -14966,6 +14966,78 @@ async fn send_instance_update_enables_talk_condition() {
     );
 }
 
+/// Garlemald-Server #46 live test round 2 — the runtime/resume drain
+/// (apply_runtime_lua_command) must APPLY PlayerSetNpcLs, not drop it.
+/// man0l1's Baderon talk parks on a coroutine, so NewNpcLsMsg's
+/// PlayerSetNpcLs(ALERT) glow is drained here on the EventUpdate
+/// resume; before FIX B the runtime drain had no arm and dropped it, so
+/// the linkpearl never glowed. Asserts the pearl-glow SetActorProperty
+/// (0x0137) reaches the client.
+#[tokio::test]
+async fn runtime_drain_applies_player_set_npc_ls_glow() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LC;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.unwrap());
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (1, 0, 0, 0, 'Pearl Tester')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let chara = Character::new(1);
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 133, 1, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    world.upsert_session(MapSession::new(1)).await;
+
+    let handled = crate::runtime::quest_apply::apply_runtime_lua_command(
+        LC::PlayerSetNpcLs {
+            player_id: 1,
+            npc_ls_id: 1,
+            state: 3, // NPCLS_ALERT — glow
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(handled, "runtime drain must handle PlayerSetNpcLs");
+
+    let mut saw_property = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_SET_ACTOR_PROPERTY {
+                saw_property = true;
+            }
+        }
+    }
+    assert!(
+        saw_property,
+        "PlayerSetNpcLs(ALERT) must emit the playerWork.npcLinkshellChat pearl-glow property",
+    );
+}
+
 /// Garlemald-Server #46 live test round 2 — drive the REAL
 /// `AetheryteParent.lua` through `call_npc_on_event_started` (FIX A's
 /// helper). It must load, run onEventStarted -> doNormalMenu, and emit
