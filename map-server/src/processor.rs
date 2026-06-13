@@ -7476,6 +7476,19 @@ impl PacketProcessor {
         // commands/NpcLinkshellChatCommand.lua is a stale revision and is
         // deliberately bypassed. (Garlemald-Server #46 live test.)
         if owner_actor_id == Self::NPC_LINKSHELL_CHAT_COMMAND {
+            // Diagnostic (Garlemald-Server #46): the NPC-linkshell read
+            // reaches here but `handle_npc_ls_chat` couldn't find the
+            // npcLsId param. Dump the raw EventStart payload + the parsed
+            // params so the exact wire encoding of the clicked linkshell id
+            // is visible in one live test.
+            tracing::info!(
+                owner = format_args!("{owner_actor_id:#010x}"),
+                event = %event_name_for_cmd,
+                event_type = event_type_for_cmd,
+                raw = %data.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                params = ?lua_params_for_cmd,
+                "NpcLs chat EventStart received (diagnostic)",
+            );
             self.handle_npc_ls_chat(&handle, &lua_params_for_cmd).await;
             return Ok(());
         }
@@ -8146,14 +8159,24 @@ impl PacketProcessor {
         lua_params: &[common::luaparam::LuaParam],
     ) {
         use common::luaparam::LuaParam;
+        // The clicked linkshell id is the first numeric param. The 1.x
+        // client may encode a small id as any of the integer LuaParam
+        // types (Int32 0x0 / UInt32 0x1 / Byte 0xC / Short 0x1B) — match
+        // them all, not just Int32/UInt32, or the read silently no-ops and
+        // the player softlocks in the linkshell window. (Garlemald-Server
+        // #46 — the read EventStart arrives but its param wasn't Int32.)
         let npc_ls_id = lua_params.iter().find_map(|p| match p {
             LuaParam::Int32(v) => u32::try_from(*v).ok(),
             LuaParam::UInt32(v) => Some(*v),
+            LuaParam::Byte(v) => Some(*v as u32),
+            LuaParam::Short(v) => Some(*v as u32),
+            LuaParam::Actor(v) => Some(*v),
             _ => None,
         });
         let Some(npc_ls_id) = npc_ls_id else {
-            tracing::debug!(
+            tracing::info!(
                 player = handle.actor_id,
+                params = ?lua_params,
                 "NpcLs chat: no npcLsId param — closing event",
             );
             self.end_command_event(handle).await;
