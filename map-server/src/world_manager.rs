@@ -2207,6 +2207,17 @@ impl WorldManager {
                 client.send_bytes(sub.to_bytes()).await;
             }
         }
+        // Seed the session's actor-instance list with everything this
+        // bundle just spawned, so the continuous `send_instance_update`
+        // (per-movement streaming) doesn't re-AddActor them on the first
+        // walk-tick. Reset to exactly the bundle's set: a fresh zone-in
+        // is the client's new ground truth. (Garlemald-Server #46.)
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                s.actor_instance_list = spawned_npc_ids.iter().copied().collect();
+            }
+        }
 
         // Solo-party group sync. Decompiled
         // `CharaBaseClass:getPlayerParty` (proto[2] of
@@ -2578,11 +2589,24 @@ impl WorldManager {
             );
         }
 
-        // Update session bookkeeping.
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&session_id) {
-            session.current_zone_id = destination_zone_id;
+        // Update session bookkeeping. Clear the merged-zone latch and
+        // the instance list: the destination zone has a different actor
+        // set, so the next `send_instance_update` must stream it fresh.
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.current_zone_id = destination_zone_id;
+                session.merged_zone_id = None;
+                session.actor_instance_list.clear();
+            }
         }
+        tracing::info!(
+            actor = format!("0x{actor_id:08X}"),
+            session = session_id,
+            from = old_zone_id,
+            to = destination_zone_id,
+            "seamless zone change",
+        );
         Ok(())
     }
 
@@ -2593,7 +2617,7 @@ impl WorldManager {
     pub async fn merge_zones(
         &self,
         actor_id: u32,
-        _session_id: u32,
+        session_id: u32,
         merged_zone_id: u32,
         position: Vector3,
     ) -> Result<()> {
@@ -2613,6 +2637,20 @@ impl WorldManager {
             },
             &mut ob,
         );
+        // Record the merge so `seamless_check` doesn't re-fire it every
+        // position tick (C# `player.zone2` / the `zoneId2 != 0` guard).
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.merged_zone_id = Some(merged_zone_id);
+            }
+        }
+        tracing::info!(
+            actor = format!("0x{actor_id:08X}"),
+            session = session_id,
+            merged = merged_zone_id,
+            "seamless zone merge",
+        );
         Ok(())
     }
 
@@ -2629,15 +2667,19 @@ impl WorldManager {
         session_id: u32,
         position: Vector3,
     ) -> SeamlessResult {
-        // Which region is this player in?
-        let (region_id, current_zone_id) = match self.session(session_id).await {
+        // Which region is this player in? Also read the merged-zone
+        // latch so the per-tick check has an "already there" early-out
+        // (mirror C# `WorldManager.SeamlessCheck`'s `zoneId2 == 0` /
+        // `zoneId2 == merged` guards — without them every position
+        // packet in a boundary box re-fires the change/merge).
+        let (region_id, current_zone_id, merged_zone_id) = match self.session(session_id).await {
             Some(s) => {
                 let zone = self.zone(s.current_zone_id).await;
                 let region = match zone {
                     Some(z) => z.read().await.core.region_id as u32,
                     None => return SeamlessResult::None,
                 };
-                (region, s.current_zone_id)
+                (region, s.current_zone_id, s.merged_zone_id)
             }
             None => return SeamlessResult::None,
         };
@@ -2647,7 +2689,16 @@ impl WorldManager {
             if check_pos_in_bounds(
                 position.x, position.z, b.zone1_x1, b.zone1_y1, b.zone1_x2, b.zone1_y2,
             ) {
+                if current_zone_id == b.zone_id_1 && merged_zone_id.is_none() {
+                    return SeamlessResult::InsideZoneOne;
+                }
                 if current_zone_id == b.zone_id_1 {
+                    // Primary already correct; just drop the merge latch
+                    // (we walked from the strip back into our own box).
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.merged_zone_id = None;
+                    }
                     return SeamlessResult::InsideZoneOne;
                 }
                 let _ = self
@@ -2658,7 +2709,14 @@ impl WorldManager {
             if check_pos_in_bounds(
                 position.x, position.z, b.zone2_x1, b.zone2_y1, b.zone2_x2, b.zone2_y2,
             ) {
+                if current_zone_id == b.zone_id_2 && merged_zone_id.is_none() {
+                    return SeamlessResult::InsideZoneTwo;
+                }
                 if current_zone_id == b.zone_id_2 {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.merged_zone_id = None;
+                    }
                     return SeamlessResult::InsideZoneTwo;
                 }
                 let _ = self
@@ -2674,6 +2732,10 @@ impl WorldManager {
                 } else {
                     b.zone_id_1
                 };
+                // Already merged with this neighbour — don't re-fire.
+                if merged_zone_id == Some(merged) {
+                    return SeamlessResult::ZoneMerged(merged);
+                }
                 let _ = self
                     .merge_zones(actor_id, session_id, merged, position)
                     .await;
@@ -2681,6 +2743,125 @@ impl WorldManager {
             }
         }
         SeamlessResult::None
+    }
+
+    /// Continuous actor-instance update — the per-movement spawn stream
+    /// (port of C# `Session.UpdateInstance` / `Player.SendInstanceUpdate`,
+    /// PacketProcessor.cs:163). garlemald previously emitted populace
+    /// spawns ONLY once, in `send_zone_in_bundle`'s warp-time
+    /// `actors_around(50)` scan — so any actor more than 50y from a warp
+    /// point (the whole Camp Bearded Rock approach after the Zephyr Gate
+    /// seamless crossing) never reached the client. This fans in the
+    /// actors that have walked into range since the last update.
+    ///
+    /// ADD-ONLY first cut: it spawns newly-in-range actors and records
+    /// them in `session.actor_instance_list`, but does NOT despawn
+    /// actors the player walks away from (pmeteor sends RemoveActor on
+    /// the diff). Add-only deliberately avoids fighting the warp-time
+    /// mass-delete keep-list and quest `SetENpc` broadcasts that assume
+    /// an NPC stays in the client's table; the cost is that distant
+    /// actors linger client-side, which is benign at 1.x zone scale.
+    /// Despawn-on-distance is a follow-up.
+    ///
+    /// Scoped to ROOT-zone walking: private-area instances get their
+    /// full population at zone-in (no radius scan) and content instances
+    /// are bounded + AI-managed, so both are skipped here.
+    pub async fn send_instance_update(
+        &self,
+        registry: &crate::runtime::actor_registry::ActorRegistry,
+        lua: Option<&std::sync::Arc<crate::lua::LuaEngine>>,
+        actor_id: u32,
+        session_id: u32,
+    ) {
+        let Some(session) = self.session(session_id).await else {
+            return;
+        };
+        // Skip private-area + content-instance routing (full / bounded
+        // populations handled elsewhere).
+        if session.current_private_area_name.is_some() {
+            return;
+        }
+        if session
+            .active_content_script
+            .as_ref()
+            .is_some_and(|a| session.current_zone_id == a.parent_zone_id)
+        {
+            return;
+        }
+        let Some(zone_arc) = self.zone(session.current_zone_id).await else {
+            return;
+        };
+        let Some(client) = self.client(session_id).await else {
+            return;
+        };
+
+        // Collect in-range NPC/Ally/BattleNpc neighbours the client does
+        // NOT already have, holding the zone read-lock only for the scan.
+        let new_ids: Vec<u32> = {
+            let z = zone_arc.read().await;
+            z.core
+                .actors_around(actor_id, 50.0)
+                .into_iter()
+                .filter(|a| a.actor_id != actor_id)
+                .filter(|a| {
+                    matches!(
+                        a.kind,
+                        crate::zone::area::ActorKind::Npc
+                            | crate::zone::area::ActorKind::BattleNpc
+                            | crate::zone::area::ActorKind::Ally
+                    )
+                })
+                .map(|a| a.actor_id)
+                .filter(|id| !session.actor_instance_list.contains(id))
+                .collect()
+        };
+        if new_ids.is_empty() {
+            return;
+        }
+
+        let zone_name = { zone_arc.read().await.core.zone_name.clone() };
+        let mut added: Vec<u32> = Vec::new();
+        for neighbour_id in new_ids {
+            let Some(handle) = registry.get(neighbour_id).await else {
+                continue;
+            };
+            let character = handle.character.read().await;
+            let mut npc_bundle = Vec::new();
+            push_npc_spawn(
+                &mut npc_bundle,
+                &character,
+                &zone_name,
+                0,     // root zone: no private-area level suffix
+                false, // root zone: not a private-area bind
+                lua,
+                Some(handle.kind),
+            );
+            drop(character);
+            for mut sub in npc_bundle {
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+            added.push(neighbour_id);
+        }
+        if added.is_empty() {
+            return;
+        }
+        // Record the newly-streamed actors so the next tick skips them.
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                for id in &added {
+                    s.actor_instance_list.insert(*id);
+                }
+            }
+        }
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            session = session_id,
+            zone = session.current_zone_id,
+            streamed = added.len(),
+            "send_instance_update: streamed newly-in-range actors",
+        );
     }
 
     /// Move an actor *within* its current zone — updates the spatial

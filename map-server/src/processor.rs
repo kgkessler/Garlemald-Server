@@ -8752,9 +8752,46 @@ impl PacketProcessor {
 
         // 3. Seamless-boundary check — may trigger a zone change or
         //    a zone merge behind the scenes.
-        let _ = self
+        let seamless = self
             .world
             .seamless_check(actor_id, session_id, Vector3::new(pkt.x, pkt.y, pkt.z))
+            .await;
+        // 3a. On a seamless zone CHANGE the registry handle's zone_id
+        //     must follow (actors_in_zone / broadcast fan-out filter on
+        //     it) and the new position persisted so a relog lands in the
+        //     destination zone, not back at the old warp point. Mirrors
+        //     the warp path (quest_apply::apply_do_zone_change). The
+        //     instance list was already cleared by
+        //     do_seamless_zone_change, so step 3b streams the new zone.
+        if let crate::world_manager::SeamlessResult::ZoneChanged(dest) = seamless {
+            self.registry.reassign_zone(actor_id, dest).await;
+            {
+                let mut c = handle.character.write().await;
+                c.base.zone_id = dest;
+            }
+            let pa = self.world.session(session_id).await.and_then(|s| {
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level))
+            });
+            let (pa_name, pa_level) = pa.unwrap_or((String::new(), 0));
+            if let Err(e) = self
+                .db
+                .save_player_position(
+                    actor_id, dest, &pa_name, pa_level, 0, 0x10, pkt.x, pkt.y, pkt.z, pkt.rot,
+                )
+                .await
+            {
+                tracing::warn!(actor = actor_id, dest, err = %e, "seamless: position persist failed");
+            }
+        }
+
+        // 3b. Continuous instance update — stream in any NPC/Ally/
+        //     BattleNpc that has walked within 50y since the last update
+        //     (the fix for "no NPCs at Camp Bearded Rock" — they sit far
+        //     past the Zephyr Gate warp point's one-shot scan).
+        self.world
+            .send_instance_update(&self.registry, self.lua.as_ref(), actor_id, session_id)
             .await;
 
         // 4. Proximity-push dispatch is now CLIENT-SIDE. The

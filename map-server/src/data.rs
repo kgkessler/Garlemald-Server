@@ -140,6 +140,21 @@ pub struct Session {
     /// periodically — that's what drives ally engagement AI in the
     /// combat tutorial. B6 of the SEQ_005 unblock plan.
     pub active_content_script: Option<ActiveContentScript>,
+    /// Secondary zone the player is currently *merged* with at a
+    /// seamless boundary strip (C# `Player.zone2`). `Some(z)` while
+    /// straddling the merge box of the `current_zone_id`↔`z` boundary;
+    /// the seamless check uses it as the "already merged" early-out so
+    /// `merge_zones` doesn't re-fire every position tick. (Garlemald-
+    /// Server #46 live test.)
+    pub merged_zone_id: Option<u32>,
+    /// Actor ids the client currently holds in its instance view (C#
+    /// `Session.actorInstanceList`). Seeded by `send_zone_in_bundle`
+    /// from the zone-in spawn set; grown by `send_instance_update` as
+    /// the player walks new actors into range. Lets the continuous
+    /// instance update avoid re-AddActor'ing actors the client already
+    /// has — the fix for "NPCs only appear within 50y of a warp point".
+    /// (Garlemald-Server #46 live test.)
+    pub actor_instance_list: std::collections::HashSet<u32>,
 }
 
 /// Snapshot of a player's currently-active scripted content area.

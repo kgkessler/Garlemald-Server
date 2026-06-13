@@ -14727,3 +14727,126 @@ async fn man0u0_seq000_tutorial_flags_and_exit_gate() {
         "pushing the armed exit door must advance Man0u0 to SEQ_005",
     );
 }
+
+/// Garlemald-Server #46 live test — `send_instance_update` streams an
+/// NPC that has walked into range since zone-in. A camp NPC sits in the
+/// zone core but is NOT in the session's `actor_instance_list` (the
+/// zone-in bundle only spawned actors near the warp point); after the
+/// player walks up to it, the continuous instance update must AddActor
+/// it to the client and record it in the list. This is the fix for "no
+/// NPCs at Camp Bearded Rock" after the Zephyr Gate seamless crossing.
+#[tokio::test]
+async fn send_instance_update_streams_walked_in_npc() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let zone = Zone::new(
+        128,
+        "sea0Field01".to_string(),
+        101,
+        String::new(),
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(128).await.unwrap();
+
+    // Player at the gate.
+    let mut player = Character::new(1);
+    player.base.zone_id = 128;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 128, 1, player))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    let mut session = MapSession::new(1);
+    session.current_zone_id = 128;
+    world.upsert_session(session).await;
+
+    // A camp NPC near the player, present in the zone core but NOT yet
+    // in the client's instance list (it spawned far from the warp).
+    let mut npc = Character::new(0x4000_0010);
+    npc.base.zone_id = 128;
+    npc.chara.actor_class_id = 1_500_013; // bearded_rock_battlewarden
+    npc.base.actor_name = "battlewarden".to_string();
+    registry
+        .insert(ActorHandle::new(
+            0x4000_0010,
+            ActorKindTag::Npc,
+            128,
+            0,
+            npc,
+        ))
+        .await;
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 0x4000_0010,
+                kind: ActorKind::Npc,
+                position: Vector3::new(3.0, 0.0, 3.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world
+        .send_instance_update(&registry, None, 1, 1)
+        .await;
+
+    // The client received the NPC's AddActor (push_npc_spawn's first
+    // packet is the 0x00CA AddActor).
+    let mut saw_add_actor = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR {
+                saw_add_actor = true;
+            }
+        }
+    }
+    assert!(
+        saw_add_actor,
+        "send_instance_update must AddActor the walked-in NPC",
+    );
+
+    // And it's now recorded so the next tick won't re-spawn it.
+    let session = world.session(1).await.unwrap();
+    assert!(
+        session.actor_instance_list.contains(&0x4000_0010),
+        "the streamed NPC must be recorded in actor_instance_list",
+    );
+}
