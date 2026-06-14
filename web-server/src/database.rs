@@ -55,25 +55,18 @@ impl Database {
     /// Insert a new account row. Returns the new user's `id`, or `None` if
     /// the username is already taken (SQLite `UNIQUE` violation). All other
     /// errors propagate.
-    pub async fn create_user(
-        &self,
-        username: &str,
-        password_hash: &str,
-        email: Option<&str>,
-    ) -> Result<Option<i64>> {
+    pub async fn create_user(&self, username: &str, password_hash: &str) -> Result<Option<i64>> {
         let username = username.to_owned();
         let password_hash = password_hash.to_owned();
-        let email = email.map(str::to_owned);
         let id = self
             .conn
             .call_db(move |c| {
                 let res = c.execute(
-                    r"INSERT INTO users(username, passwordHash, email)
-                      VALUES(:u, :p, :e)",
+                    r"INSERT INTO users(username, passwordHash)
+                      VALUES(:u, :p)",
                     named_params! {
                         ":u": username,
                         ":p": password_hash,
-                        ":e": email,
                     },
                 );
                 match res {
