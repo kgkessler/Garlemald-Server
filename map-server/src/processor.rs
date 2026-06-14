@@ -8550,6 +8550,20 @@ impl PacketProcessor {
                     .any(|e| e.actor_class_id == owner_class_id)
             })
         };
+        // DIAGNOSTIC (Garlemald-Server #46 walk-up): this non-quest NPC
+        // dispatch is the ONLY new server code in the push path this session
+        // (chained after the quest-hook fan-out in 9ff8a5c). For a quest ENPC
+        // like Rostnsthal the guard MUST skip here — otherwise the
+        // `fire_player_event_and_drain` below would prematurely resume the
+        // just-parked `onPush` coroutine (~1s EndEvent, tooltip torn down).
+        // Log the decision so a live test can prove the guard holds.
+        tracing::debug!(
+            owner = format!("0x{owner_actor_id:08X}"),
+            class = owner_class_id,
+            is_quest_enpc,
+            event = %event_name,
+            "dispatch_event_start_to_npc: quest-ENPC guard decision",
+        );
         if is_quest_enpc {
             return;
         }
