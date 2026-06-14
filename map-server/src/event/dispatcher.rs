@@ -482,7 +482,9 @@ async fn dispatch_npc_event_started(
     let npc_actor_id = owner_actor_id;
     let npc_zone_id = owner_handle.zone_id;
     let lua_params_owned: Vec<LuaParam> = lua_params.to_vec();
-    let _ = event_type; // Meteor's NPC dispatch ignores event_type for onEventStarted — eventName is what scripts branch on.
+    // NOTE: event_type is NOT passed to the NPC `onEventStarted` (Meteor's
+    // NPC dispatch omits it — scripts branch on eventName); it is only used
+    // for the inert-release EndEvent below.
 
     // Run the NPC's `onEventStarted` INSIDE A COROUTINE (via the engine's
     // director-hook helper), NOT a bare `f.call`. Conversational NPC scripts
@@ -624,6 +626,27 @@ async fn dispatch_npc_event_started(
             Some(lua),
         )
         .await;
+    } else {
+        // Inert: the NPC/object script defined no handler for this event
+        // (empty command list, nothing parked) — e.g. an object push trigger
+        // whose `pushDefault` no quest claims at the current sequence. The
+        // client opened a modal event; without an EndEvent it stays modal and
+        // every further interaction is dropped → softlock. Release it,
+        // mirroring the owner-missing release above and the processor
+        // NPC-dispatch path. (Garlemald-Server #46.)
+        if let Some(player_handle) = registry.get(player_actor_id).await
+            && player_handle.session_id != 0
+            && let Some(client) = world.client(player_handle.session_id).await
+        {
+            let mut sub = crate::packets::send::events::build_end_event(
+                player_actor_id,
+                owner_actor_id,
+                event_name,
+                event_type,
+            );
+            sub.set_target_id(player_handle.session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
     }
 }
 

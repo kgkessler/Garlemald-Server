@@ -8553,8 +8553,16 @@ impl PacketProcessor {
                 owner = format!("0x{owner_actor_id:08X}"),
                 class = owner_class_id,
                 script = %script_path.display(),
-                "NPC onEventStarted: no script on disk — skipping",
+                "NPC onEventStarted: no script on disk — releasing client with EndEvent",
             );
+            // A live owner with no script still opened a modal event on the
+            // client (e.g. an object push trigger like the La Noscea→Limsa
+            // `seafld0_push_limsa_entrance`, classId 1090004, whose push
+            // fires whenever the player walks into it — only man0l1 SEQ_048
+            // actually claims it). Without an EndEvent the client stays modal
+            // and every further interaction is dropped → softlock. Release
+            // it. (Garlemald-Server #46 — Limsa-entrance push softlock.)
+            self.end_command_event(handle).await;
             return;
         }
 
@@ -8589,6 +8597,21 @@ impl PacketProcessor {
                 error = %e,
                 "NPC onEventStarted errored; applying partial commands",
             );
+        }
+        // If the script defined no handler for this eventName it emits NO
+        // commands (and parks nothing — a parked callClientFunction would
+        // have queued a RunEventFunction). That's an inert trigger — e.g. an
+        // object push trigger whose `pushDefault` no quest claims at the
+        // current sequence. The client is sitting modal on the event; release
+        // it with EndEvent or it softlocks. (Garlemald-Server #46.)
+        if partial.commands.is_empty() {
+            tracing::debug!(
+                owner = format!("0x{owner_actor_id:08X}"),
+                event = %event_name,
+                "NPC onEventStarted: script emitted nothing — releasing client with EndEvent",
+            );
+            self.end_command_event(handle).await;
+            return;
         }
         Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
     }
