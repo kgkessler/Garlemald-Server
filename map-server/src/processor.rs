@@ -7481,13 +7481,12 @@ impl PacketProcessor {
             // npcLsId param. Dump the raw EventStart payload + the parsed
             // params so the exact wire encoding of the clicked linkshell id
             // is visible in one live test.
-            tracing::info!(
+            tracing::debug!(
                 owner = format_args!("{owner_actor_id:#010x}"),
                 event = %event_name_for_cmd,
                 event_type = event_type_for_cmd,
-                raw = %data.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 params = ?lua_params_for_cmd,
-                "NpcLs chat EventStart received (diagnostic)",
+                "NpcLs chat EventStart received",
             );
             self.handle_npc_ls_chat(&handle, &lua_params_for_cmd).await;
             return Ok(());
@@ -8174,7 +8173,7 @@ impl PacketProcessor {
             _ => None,
         });
         let Some(npc_ls_id) = npc_ls_id else {
-            tracing::info!(
+            tracing::debug!(
                 player = handle.actor_id,
                 params = ?lua_params,
                 "NpcLs chat: no npcLsId param — closing event",
@@ -8183,13 +8182,23 @@ impl PacketProcessor {
             return;
         };
         // Find the active quest with a matching pending NpcLs chain.
+        //
+        // The client sends the ZERO-BASED linkshell id: it mirrors the
+        // `playerWork.npcLinkshellChatCalling[N]` index, which SetNpcLs stores
+        // zero-based (NewNpcLsMsg(1) → SetNpcLs(1,ALERT) → Calling[0]). The
+        // quest's `npcLsFrom`, however, is the RAW 1-based value passed to
+        // NewNpcLsMsg(from) — and that raw value is what onNpcLS expects
+        // (man0l1 onNpcLS branches on `from == 1`). Reconcile the two:
+        // stored(raw) == clicked(zero-based) + 1. (Garlemald-Server #46 — the
+        // read EventStart diagnostic showed npcLsId=0 for the Adventurers'
+        // Guild pearl that NewNpcLsMsg(1) set as Calling[0].)
         let matched = {
             let c = handle.character.read().await;
             c.quest_journal
                 .slots
                 .iter()
                 .flatten()
-                .find(|q| q.get_npc_ls_from() == npc_ls_id)
+                .find(|q| q.get_npc_ls_from() == npc_ls_id + 1)
                 .map(|q| (q.quest_id(), q.get_npc_ls_from(), q.get_npc_ls_msg_step()))
         };
         let Some((quest_id, from, msg_step)) = matched else {
