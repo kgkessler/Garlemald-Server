@@ -7305,6 +7305,22 @@ impl PacketProcessor {
             return Ok(());
         }
 
+        // DIAGNOSTIC (Garlemald-Server #46 walk-up): log EVERY inbound
+        // EventStart the client sends, BEFORE any dispatch/early-return, so a
+        // live test definitively shows whether the client emits a `talkDefault`
+        // (event_type=1) for an NPC the player is trying to talk to — vs. only
+        // emitting `pushDefault` (type=2) / `noticeEvent` (type=5). If no
+        // type=1 ever appears for the target, the block is the client not
+        // sending the talk (modal / non-talkable); if it appears but nothing
+        // happens, the block is server-side dispatch.
+        tracing::info!(
+            session = session_id,
+            owner = format!("0x{:08X}", pkt.owner_actor_id),
+            event_type = pkt.event_type,
+            event_name = %pkt.event_name,
+            "RX EventStart (inbound, pre-dispatch)",
+        );
+
         let Some(handle) = self.registry.by_session(session_id).await else {
             return Ok(());
         };
