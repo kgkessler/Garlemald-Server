@@ -6925,7 +6925,30 @@ impl PacketProcessor {
         }
         // Drain non-event commands through the login-command pipeline
         // (quest-flag mutates, AddExp, UpdateENPCs, etc.).
+        //
+        // `RunEventFunction` / `EndEvent` are ALREADY on the wire from the
+        // EventOutbox bridge immediately above (`translate_lua_commands_into
+        // _outbox` matches exactly those two variants and `dispatch_event_
+        // event` sends them). `apply_login_lua_command`'s own RunEventFunction
+        // /EndEvent arm (processor.rs ~1847) re-runs the IDENTICAL translate+
+        // dispatch, so draining them here a second time double-emits the
+        // cutscene RPC: the 1.x client plays the cinematic twice and posts two
+        // EventUpdates, which corrupts its modal event layer — the man0l0
+        // Rostnsthal walk-up softlock (each `onPush` sent `processTtrNomal002`
+        // twice; after a couple of approaches the client went modal-silent).
+        // Skip those two here; the bridge owns them. This mirrors the existing
+        // KickEvent dedup (KickEvent is INTENTIONALLY excluded from the bridge
+        // — see lua_bridge.rs — and owned by the login arm; here the ownership
+        // is the reverse). Every other command (flag mutates, UpdateENPCs,
+        // SendMessage, …) still needs the login applier. (Garlemald-Server #46.)
         for cmd in result.commands {
+            if matches!(
+                cmd,
+                crate::lua::command::LuaCommand::RunEventFunction { .. }
+                    | crate::lua::command::LuaCommand::EndEvent { .. }
+            ) {
+                continue;
+            }
             Box::pin(self.apply_login_lua_command(handle, cmd)).await;
         }
 
