@@ -634,7 +634,42 @@ async fn dispatch_npc_event_started(
         // every further interaction is dropped → softlock. Release it,
         // mirroring the owner-missing release above and the processor
         // NPC-dispatch path. (Garlemald-Server #46.)
-        if let Some(player_handle) = registry.get(player_actor_id).await
+        //
+        // BUT NOT for a CURRENT QUEST ENPC. `start_event` ALWAYS emits an
+        // `EventStarted` (even for a client-initiated push), which routes here
+        // and runs the owner's BASE populace `onEventStarted`. For a
+        // quest-claimed ENPC that base script has no handler for the event
+        // name (the quest owns it via `onTalk`/`onPush`/`onEmote`, fired
+        // separately in `handle_event_start`), so it emits empty commands and
+        // lands in this branch — but the quest hook is about to park a
+        // cutscene the client MUST keep open. man0l0 Rostnsthal's `pushDefault`
+        // is exactly this: the base `PopulaceStandard.onEventStarted` returns
+        // nothing while `quest:OnPush` drives the `processTtrNomal002`
+        // targeting tutorial. Releasing here closes the event out from under
+        // the tutorial → controls re-lock → softlock (the regression the
+        // entrance-push fix introduced). Only GENUINELY UNCLAIMED owners — the
+        // La Noscea→Limsa entrance push `1090004`, claimed by no quest at
+        // SEQ_005 — get the inert release. Mirrors the `is_quest_enpc` guard in
+        // `processor::dispatch_event_start_to_npc`, so the dispatcher and
+        // processor NPC paths treat quest ENPCs identically. (Garlemald-Server
+        // #46 — the entrance-push fix must NOT comingle with quest pushes.)
+        let is_quest_enpc = if let (Some(owner_h), Some(player_h)) = (
+            registry.get(owner_actor_id).await,
+            registry.get(player_actor_id).await,
+        ) {
+            let owner_class_id = owner_h.character.read().await.chara.actor_class_id;
+            let c = player_h.character.read().await;
+            c.quest_journal.slots.iter().flatten().any(|q| {
+                q.state
+                    .current
+                    .values()
+                    .any(|e| e.actor_class_id == owner_class_id)
+            })
+        } else {
+            false
+        };
+        if !is_quest_enpc
+            && let Some(player_handle) = registry.get(player_actor_id).await
             && player_handle.session_id != 0
             && let Some(client) = world.client(player_handle.session_id).await
         {
