@@ -2244,6 +2244,11 @@ impl UserData for LuaPlayer {
             let mut text_owner: u32 = crate::packets::send::WORLD_MASTER_ACTOR_ID;
             let mut text_id: Option<i64> = None;
             let mut log_type: Option<i64> = None;
+            // Numeric args AFTER text_id + log_type are message params (e.g.
+            // the item id for the "You obtain <item>" toast, text 25117).
+            // Without forwarding them the client renders "You obtain a ."
+            // (blank). (Garlemald-Server #46.)
+            let mut params: Vec<i64> = Vec::new();
             for v in args.iter() {
                 match v {
                     Value::UserData(ud) if text_id.is_none() => {
@@ -2269,6 +2274,8 @@ impl UserData for LuaPlayer {
                             text_id = Some(i);
                         } else if log_type.is_none() {
                             log_type = Some(i);
+                        } else {
+                            params.push(i);
                         }
                     }
                     Value::Number(n) => {
@@ -2279,6 +2286,8 @@ impl UserData for LuaPlayer {
                             text_id = Some(i);
                         } else if log_type.is_none() {
                             log_type = Some(i);
+                        } else {
+                            params.push(i);
                         }
                     }
                     _ => {}
@@ -2295,6 +2304,7 @@ impl UserData for LuaPlayer {
                     text_owner_id: text_owner,
                     text_id: text_id.max(0) as u32,
                     log_type,
+                    params,
                 },
             );
             Ok(())

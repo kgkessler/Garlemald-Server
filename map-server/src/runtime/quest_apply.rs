@@ -232,9 +232,18 @@ pub async fn apply_runtime_lua_command(
             text_owner_id,
             text_id,
             log_type,
+            params,
         } => {
-            apply_send_game_message(actor_id, text_owner_id, text_id, log_type, registry, world)
-                .await;
+            apply_send_game_message(
+                actor_id,
+                text_owner_id,
+                text_id,
+                log_type,
+                &params,
+                registry,
+                world,
+            )
+            .await;
             true
         }
         // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
@@ -4196,6 +4205,7 @@ pub(crate) async fn apply_send_game_message(
     text_owner_id: u32,
     text_id: u32,
     log_type: u8,
+    params: &[i64],
     registry: &ActorRegistry,
     world: &WorldManager,
 ) {
@@ -4211,19 +4221,46 @@ pub(crate) async fn apply_send_game_message(
     // owner made quest-sheet ids (man0l1's 320/321 on static actor
     // 0xA0F1ADB2) resolve as garbage and crashed the client at the
     // Hob handoff — 8-for-8 across the packet logs.
-    let mut sub = crate::packets::send::build_game_message_actor1(
-        text_owner_id,
-        actor_id,
-        text_owner_id,
-        text_id.min(u16::MAX as u32) as u16,
-        log_type,
-    );
+    let text_id_u16 = text_id.min(u16::MAX as u32) as u16;
+    let mut sub = if params.is_empty() {
+        crate::packets::send::build_game_message_actor1(
+            text_owner_id,
+            actor_id,
+            text_owner_id,
+            text_id_u16,
+            log_type,
+        )
+    } else {
+        // Params present (e.g. "You obtain <item>", text 25117 + item id):
+        // use the WITH-params builder (GameMessageWithActor2..5) so the
+        // client resolves the item name instead of rendering it blank.
+        // (Garlemald-Server #46.)
+        let lua_params: Vec<common::luaparam::LuaParam> = params
+            .iter()
+            .map(|&v| {
+                if (0..=u32::MAX as i64).contains(&v) && v > i32::MAX as i64 {
+                    common::luaparam::LuaParam::UInt32(v as u32)
+                } else {
+                    common::luaparam::LuaParam::Int32(v as i32)
+                }
+            })
+            .collect();
+        crate::packets::send::build_game_message_actor1_with_params(
+            text_owner_id,
+            actor_id,
+            text_owner_id,
+            text_id_u16,
+            log_type,
+            &lua_params,
+        )
+    };
     sub.set_target_id(session_id);
     client.send_bytes(sub.to_bytes()).await;
     tracing::debug!(
         actor = actor_id,
         text_id,
         log = format!("0x{log_type:02X}"),
+        params = params.len(),
         "SendGameMessage emitted",
     );
 }

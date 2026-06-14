@@ -63,6 +63,11 @@ pub enum LuaCommand {
         text_owner_id: u32,
         text_id: u32,
         log_type: u8,
+        /// Trailing message params (e.g. the item id for the "You obtain
+        /// <item>" toast, text 25117). Empty for plain messages. Forwarded
+        /// to the WITH-params game-message builder so the client resolves
+        /// `<item>` instead of rendering it blank. (Garlemald-Server #46.)
+        params: Vec<i64>,
     },
     /// `player:SendGameMessageLocalizedDisplayName(textOwner, textId,
     /// log, displayId, ...)` — a text-sheet line whose SENDER is shown
