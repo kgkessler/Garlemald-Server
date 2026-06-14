@@ -8158,13 +8158,15 @@ impl PacketProcessor {
         lua_params: &[common::luaparam::LuaParam],
     ) {
         use common::luaparam::LuaParam;
-        // The clicked linkshell id is the first numeric param. The 1.x
-        // client may encode a small id as any of the integer LuaParam
-        // types (Int32 0x0 / UInt32 0x1 / Byte 0xC / Short 0x1B) — match
-        // them all, not just Int32/UInt32, or the read silently no-ops and
-        // the player softlocks in the linkshell window. (Garlemald-Server
-        // #46 — the read EventStart arrives but its param wasn't Int32.)
-        let npc_ls_id = lua_params.iter().find_map(|p| match p {
+        // The clicked linkshell id MAY arrive as the first integer LuaParam
+        // (Int32 0x0 / UInt32 0x1 / Byte 0xC / Short 0x1B / Actor 0x6), but
+        // the 1.x client's NpcLinkshellChatCommand EventStart param tail is
+        // UNRELIABLE: across live runs the same click produced
+        // [Int32(0), …] one time and an empty tail the next (the command is
+        // fired via executePlayerCommandLocal whose serialized args vary).
+        // So treat the id as a best-effort HINT for disambiguation only —
+        // never the sole key. (Garlemald-Server #46.)
+        let npc_ls_id_hint = lua_params.iter().find_map(|p| match p {
             LuaParam::Int32(v) => u32::try_from(*v).ok(),
             LuaParam::UInt32(v) => Some(*v),
             LuaParam::Byte(v) => Some(*v as u32),
@@ -8172,40 +8174,40 @@ impl PacketProcessor {
             LuaParam::Actor(v) => Some(*v),
             _ => None,
         });
-        let Some(npc_ls_id) = npc_ls_id else {
-            tracing::debug!(
-                player = handle.actor_id,
-                params = ?lua_params,
-                "NpcLs chat: no npcLsId param — closing event",
-            );
-            self.end_command_event(handle).await;
-            return;
-        };
-        // Find the active quest with a matching pending NpcLs chain.
-        //
-        // The client sends the ZERO-BASED linkshell id: it mirrors the
-        // `playerWork.npcLinkshellChatCalling[N]` index, which SetNpcLs stores
-        // zero-based (NewNpcLsMsg(1) → SetNpcLs(1,ALERT) → Calling[0]). The
-        // quest's `npcLsFrom`, however, is the RAW 1-based value passed to
-        // NewNpcLsMsg(from) — and that raw value is what onNpcLS expects
-        // (man0l1 onNpcLS branches on `from == 1`). Reconcile the two:
-        // stored(raw) == clicked(zero-based) + 1. (Garlemald-Server #46 — the
-        // read EventStart diagnostic showed npcLsId=0 for the Adventurers'
-        // Guild pearl that NewNpcLsMsg(1) set as Calling[0].)
+        // The linkshell window only lists pearls with a PENDING message, so a
+        // click means "read the pending one". Find the player's quest(s) with
+        // an active NpcLs (npcLsFrom != 0). Prefer one whose npcLsFrom matches
+        // the client hint — the client speaks ZERO-BASED (it mirrors the
+        // playerWork.npcLinkshellChatCalling[N] index that SetNpcLs stores
+        // zero-based: NewNpcLsMsg(1) → Calling[0]), while the quest stores the
+        // RAW 1-based value NewNpcLsMsg(from) was given (which onNpcLS needs:
+        // man0l1 branches on `from == 1`). So a hint H matches stored H+1 (or
+        // H raw, defensively). When the hint is absent/garbage, fall back to
+        // the sole pending NpcLs quest. (Garlemald-Server #46.)
         let matched = {
             let c = handle.character.read().await;
-            c.quest_journal
+            let pending: Vec<(u32, u32, u8)> = c
+                .quest_journal
                 .slots
                 .iter()
                 .flatten()
-                .find(|q| q.get_npc_ls_from() == npc_ls_id + 1)
+                .filter(|q| q.get_npc_ls_from() != 0)
                 .map(|q| (q.quest_id(), q.get_npc_ls_from(), q.get_npc_ls_msg_step()))
+                .collect();
+            npc_ls_id_hint
+                .and_then(|id| {
+                    pending
+                        .iter()
+                        .find(|(_, from, _)| *from == id + 1 || *from == id)
+                        .copied()
+                })
+                .or_else(|| pending.first().copied())
         };
         let Some((quest_id, from, msg_step)) = matched else {
             tracing::debug!(
                 player = handle.actor_id,
-                npc_ls_id,
-                "NpcLs chat: no active quest claims this id — closing event",
+                ?npc_ls_id_hint,
+                "NpcLs chat: no pending quest NpcLs — closing event",
             );
             self.end_command_event(handle).await;
             return;
