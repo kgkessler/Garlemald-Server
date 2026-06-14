@@ -484,103 +484,96 @@ async fn dispatch_npc_event_started(
     let lua_params_owned: Vec<LuaParam> = lua_params.to_vec();
     let _ = event_type; // Meteor's NPC dispatch ignores event_type for onEventStarted — eventName is what scripts branch on.
 
+    // Run the NPC's `onEventStarted` INSIDE A COROUTINE (via the engine's
+    // director-hook helper), NOT a bare `f.call`. Conversational NPC scripts
+    // (`onEventStarted(player, npc, triggerName)`) call
+    // `callClientFunction(...)`, which does `coroutine.yield("_WAIT_EVENT")`;
+    // a direct call raises "attempt to yield from outside a coroutine", the
+    // talk event never completes, and the client stays modal → softlock
+    // (Garlemald-Server #46 — talking to a camp NPC e.g. Rhyssfloh).
+    // `spawn_director_on_event_started` spawns the hook as a Lua thread and
+    // parks it on the scheduler so the yield resumes on the client's 0x012E
+    // EventUpdate. We keep the populace NPC arg convention
+    // [player, npc, eventName, ...lparams] (NO eventType — unlike commands,
+    // real Npc base scripts are `onEventStarted(player, npc, triggerName)`).
     let result = tokio::task::spawn_blocking(move || {
-        let (lua_vm, queue) = match lua_clone.load_script(&script_path) {
-            Ok(pair) => pair,
-            Err(e) => {
-                return Err(format!("load_script failed: {e}"));
-            }
-        };
-        let globals = lua_vm.globals();
-        let Some(f): Option<mlua::Function> = globals.get("onEventStarted").ok() else {
-            // Quiet no-op — many NPC scripts only define `init()` /
-            // `main()` and rely on the global hook absence to skip.
-            return Ok((Vec::new(), None));
-        };
-
-        let player = crate::lua::userdata::LuaPlayer {
-            snapshot,
-            queue: queue.clone(),
-        };
-        let player_ud = lua_vm
-            .create_userdata(player)
-            .map_err(|e| format!("create_userdata(LuaPlayer): {e}"))?;
-        let npc = crate::lua::userdata::LuaNpc {
-            base: crate::lua::userdata::LuaActor {
-                actor_id: npc_actor_id,
-                name: class_name_owned.clone(),
-                class_name: class_name_owned,
-                class_path: class_path_owned,
-                unique_id: unique_id_owned,
-                zone_id: npc_zone_id,
-                zone_name: zone_name_owned,
-                state: npc_state,
-                pos: npc_pos,
-                rotation: npc_rot,
-                queue: queue.clone(),
-                // Event-dispatched NPCs are conversational, not
-                // combat — engagement defaults are correct.
-                is_engaged: false,
-                speed: 5.0,
-                target_actor_id: 0,
-            },
-            actor_class_id,
-            quest_graphic: 0,
-        };
-        let npc_ud = lua_vm
-            .create_userdata(npc)
-            .map_err(|e| format!("create_userdata(LuaNpc): {e}"))?;
-
-        let mut mv = MultiValue::new();
-        mv.push_back(Value::UserData(player_ud));
-        mv.push_back(Value::UserData(npc_ud));
-        // Meteor inserts `eventName` ahead of the original lparams (see
-        // `LuaEngine.EventStarted` `lparams.Insert(0, ...)`). That's
-        // what surfaces as the third script arg — `triggerName` in
-        // most NPC scripts.
-        mv.push_back(Value::String(
-            lua_vm
-                .create_string(&event_name_owned)
-                .map_err(|e| format!("create_string(eventName): {e}"))?,
-        ));
-        for p in &lua_params_owned {
-            let v = match p {
-                LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
-                LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
-                LuaParam::String(s) => Value::String(
+        lua_clone.spawn_director_on_event_started(
+            &script_path,
+            player_actor_id,
+            move |lua_vm, queue| {
+                let player = crate::lua::userdata::LuaPlayer {
+                    snapshot,
+                    queue: queue.clone(),
+                };
+                let player_ud = lua_vm
+                    .create_userdata(player)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+                let npc = crate::lua::userdata::LuaNpc {
+                    base: crate::lua::userdata::LuaActor {
+                        actor_id: npc_actor_id,
+                        name: class_name_owned.clone(),
+                        class_name: class_name_owned,
+                        class_path: class_path_owned,
+                        unique_id: unique_id_owned,
+                        zone_id: npc_zone_id,
+                        zone_name: zone_name_owned,
+                        state: npc_state,
+                        pos: npc_pos,
+                        rotation: npc_rot,
+                        queue: queue.clone(),
+                        // Event-dispatched NPCs are conversational, not
+                        // combat — engagement defaults are correct.
+                        is_engaged: false,
+                        speed: 5.0,
+                        target_actor_id: 0,
+                    },
+                    actor_class_id,
+                    quest_graphic: 0,
+                };
+                let npc_ud = lua_vm
+                    .create_userdata(npc)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaNpc): {e}"))?;
+                let mut mv = MultiValue::new();
+                mv.push_back(Value::UserData(player_ud));
+                mv.push_back(Value::UserData(npc_ud));
+                // Meteor inserts `eventName` ahead of the original lparams
+                // (LuaEngine.EventStarted `lparams.Insert(0, ...)`) — the
+                // third script arg (`triggerName`).
+                mv.push_back(Value::String(
                     lua_vm
-                        .create_string(s)
-                        .map_err(|e| format!("create_string(lparam): {e}"))?,
-                ),
-                LuaParam::True => Value::Boolean(true),
-                LuaParam::False => Value::Boolean(false),
-                LuaParam::Nil => Value::Nil,
-                LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
-                LuaParam::Type7 { actor_id, .. } => Value::Integer(*actor_id as mlua::Integer),
-                LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
-                LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
-                LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
-            };
-            mv.push_back(v);
-        }
-
-        let call_err = f.call::<Value>(mv).err().map(|e| format!("{e}"));
-        let commands = crate::lua::command::CommandQueue::drain(&queue);
-        Ok((commands, call_err))
+                        .create_string(&event_name_owned)
+                        .map_err(|e| anyhow::anyhow!("create_string(eventName): {e}"))?,
+                ));
+                for p in &lua_params_owned {
+                    let v = match p {
+                        LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
+                        LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
+                        LuaParam::String(s) => Value::String(
+                            lua_vm
+                                .create_string(s)
+                                .map_err(|e| anyhow::anyhow!("create_string(lparam): {e}"))?,
+                        ),
+                        LuaParam::True => Value::Boolean(true),
+                        LuaParam::False => Value::Boolean(false),
+                        LuaParam::Nil => Value::Nil,
+                        LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
+                        LuaParam::Type7 { actor_id, .. } => {
+                            Value::Integer(*actor_id as mlua::Integer)
+                        }
+                        LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
+                        LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
+                        LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
+                    };
+                    mv.push_back(v);
+                }
+                Ok(mv)
+            },
+        )
     })
     .await;
 
     let (commands, hook_err) = match result {
-        Ok(Ok((cmds, err))) => (cmds, err),
-        Ok(Err(setup_err)) => {
-            tracing::debug!(
-                error = %setup_err,
-                owner = owner_actor_id,
-                event = %event_name,
-                "NPC onEventStarted setup failed",
-            );
-            return;
-        }
+        Ok(r) => (r.commands, r.error.map(|e| format!("{e}"))),
         Err(join_err) => {
             tracing::warn!(
                 error = %join_err,
