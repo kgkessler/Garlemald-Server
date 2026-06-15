@@ -1402,6 +1402,18 @@ impl LuaEngine {
         }
         let resume_result = parked.thread.resume::<MultiValue>(args);
         let commands = CommandQueue::drain(&parked.queue);
+        // DIAGNOSTIC (Garlemald-Server #46): show exactly which commands a
+        // resumed coroutine drained, so a live Isandorel-talk repro reveals
+        // whether `QuestIncCounter` is present (queue/apply bug) or absent
+        // (the coroutine carrying it was displaced before resume). Temporary.
+        if !commands.is_empty() {
+            tracing::debug!(
+                player = player_id,
+                count = commands.len(),
+                commands = ?commands,
+                "fire_player_event_and_drain: resumed coroutine drained these commands",
+            );
+        }
         match resume_result {
             Ok(value) => {
                 if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {

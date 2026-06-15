@@ -98,6 +98,22 @@ impl CoroutineScheduler {
     pub fn park_event(&mut self, player_id: u32, coroutine: ParkedCoroutine) {
         // If the player already has a parked coroutine, overwrite it; the
         // C# version explicitly dropped the old one on `_WAIT_EVENT`.
+        //
+        // DIAGNOSTIC (Garlemald-Server #46 — man0l1 SEQ_007 IncCounter drop):
+        // a re-park while one is ALREADY pending DROPS the displaced
+        // coroutine's not-yet-run continuation — including any `data:`/`quest:`
+        // mutation it would queue on resume (e.g. Isandorel's
+        // `data:IncCounter(CNTR_SEQ7_MSK)` queued AFTER the processEvent035
+        // park). If the MSK counter never advancing is caused by such a
+        // double-park, this warning fires during the Isandorel talk; if it
+        // never fires, the counter is lost elsewhere. Temporary triage.
+        if self.sleeping_on_player_event.contains_key(&player_id) {
+            tracing::warn!(
+                player = player_id,
+                "park_event DISPLACING an already-parked coroutine — its pending \
+                 continuation/mutations are dropped (Garlemald-Server #46 diagnostic)",
+            );
+        }
         self.sleeping_on_player_event.insert(player_id, coroutine);
     }
 
