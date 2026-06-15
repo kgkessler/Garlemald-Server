@@ -769,6 +769,35 @@ impl PacketProcessor {
             }
         }
 
+        // Arm quest ENPC state on login / relog. A continuous playthrough sets
+        // up each sequence's talk/push ENPC flags via StartSequence ->
+        // onStateChange (and quest:UpdateENPCs on talk). But a RELOG loads the
+        // quest at its saved sequence/counters WITHOUT a StartSequence, so
+        // onStateChange never re-runs: the ENPC flags (e.g. man0l1 SEQ_007's
+        // MSK_TRIGGER `pushDefault` + Isandorel-off at subseqMSK==1) are never
+        // armed, AND `state.current` stays empty — so the is_quest_enpc guard
+        // in dispatch_event_start_to_npc misfires and prematurely resumes the
+        // first talk's parked cutscene ("first talk did nothing"). Re-run
+        // onStateChange for every active quest now that the zone-in NPCs are
+        // spawned (find_npc_by_class_id can resolve them). apply_quest_update
+        // _enpcs is idempotent — begin_sequence_swap + onStateChange + diff
+        // broadcast + stale-clear — so a freshly-StartSequence'd opener (the
+        // man0l0 boat) just re-derives the same state (no spurious re-broadcast
+        // / clear). Mirrors Meteor re-establishing quest ENPC state per zone-in.
+        // (Garlemald-Server #46 — SEQ_007 relog soft-lock + premature resume.)
+        let active_quest_ids: Vec<u32> = {
+            let c = handle.character.read().await;
+            c.quest_journal
+                .slots
+                .iter()
+                .flatten()
+                .map(|q| q.quest_id())
+                .collect()
+        };
+        for quest_id in active_quest_ids {
+            self.apply_quest_update_enpcs(actor_id, quest_id).await;
+        }
+
         Ok(())
     }
 
