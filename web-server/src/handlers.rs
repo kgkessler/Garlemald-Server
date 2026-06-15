@@ -45,7 +45,6 @@ const USERNAME_MIN: usize = 3;
 const USERNAME_MAX: usize = 64;
 const PASSWORD_MIN: usize = 8;
 const PASSWORD_MAX: usize = 128;
-const EMAIL_MAX: usize = 254;
 
 // ---------------------------------------------------------------------------
 // GET /  — redirect to /login so the webview lands on a form either way.
@@ -134,16 +133,10 @@ pub struct SignupQuery {
     pub err: Option<String>,
     #[serde(default)]
     pub u: Option<String>,
-    #[serde(default)]
-    pub e: Option<String>,
 }
 
 pub async fn signup_form(Query(q): Query<SignupQuery>) -> Html<String> {
-    Html(signup_page(
-        q.err.as_deref(),
-        q.u.as_deref().unwrap_or(""),
-        q.e.as_deref().unwrap_or(""),
-    ))
+    Html(signup_page(q.err.as_deref(), q.u.as_deref().unwrap_or("")))
 }
 
 // ---------------------------------------------------------------------------
@@ -155,8 +148,6 @@ pub struct SignupForm {
     pub username: String,
     pub password: String,
     pub confirm: String,
-    #[serde(default)]
-    pub email: String,
 }
 
 pub async fn signup_submit(
@@ -164,45 +155,36 @@ pub async fn signup_submit(
     Form(form): Form<SignupForm>,
 ) -> Response {
     let username = form.username.trim().to_string();
-    let email = form.email.trim().to_string();
 
     if let Err(msg) = validate_username(&username) {
-        return redirect_signup(msg, &username, &email);
+        return redirect_signup(msg, &username);
     }
     if form.password.len() < PASSWORD_MIN {
-        return redirect_signup("Password must be at least 8 characters.", &username, &email);
+        return redirect_signup("Password must be at least 8 characters.", &username);
     }
     if form.password.len() > PASSWORD_MAX {
-        return redirect_signup("Password is too long.", &username, &email);
+        return redirect_signup("Password is too long.", &username);
     }
     if form.password != form.confirm {
-        return redirect_signup("Passwords do not match.", &username, &email);
-    }
-    if !email.is_empty() && (email.len() > EMAIL_MAX || !email.contains('@')) {
-        return redirect_signup("That email doesn't look valid.", &username, &email);
+        return redirect_signup("Passwords do not match.", &username);
     }
 
     let hash = match hash_password(&form.password) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "signup: argon2 hash failed");
-            return redirect_signup("Server error, please try again.", &username, &email);
+            return redirect_signup("Server error, please try again.", &username);
         }
     };
 
-    let email_opt = if email.is_empty() {
-        None
-    } else {
-        Some(email.as_str())
-    };
-    let user_id = match state.db.create_user(&username, &hash, email_opt).await {
+    let user_id = match state.db.create_user(&username, &hash).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            return redirect_signup("That username is already taken.", &username, &email);
+            return redirect_signup("That username is already taken.", &username);
         }
         Err(e) => {
             tracing::error!(error = %e, "signup: db insert failed");
-            return redirect_signup("Server error, please try again.", &username, &email);
+            return redirect_signup("Server error, please try again.", &username);
         }
     };
 
@@ -255,14 +237,8 @@ fn redirect_login(err: &str, username: &str) -> Response {
     Redirect::to(&format!("/login?u={}&err={}", pct(username), pct(err))).into_response()
 }
 
-fn redirect_signup(err: &str, username: &str, email: &str) -> Response {
-    Redirect::to(&format!(
-        "/signup?u={}&e={}&err={}",
-        pct(username),
-        pct(email),
-        pct(err),
-    ))
-    .into_response()
+fn redirect_signup(err: &str, username: &str) -> Response {
+    Redirect::to(&format!("/signup?u={}&err={}", pct(username), pct(err))).into_response()
 }
 
 fn validate_username(u: &str) -> Result<(), &'static str> {
