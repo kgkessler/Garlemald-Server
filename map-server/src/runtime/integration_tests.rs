@@ -9672,6 +9672,37 @@ async fn runtime_drain_handles_warp_commands() {
     );
 }
 
+/// Regression: the runtime drain must handle `DoEmote` — EmoteStandardCommand
+/// (a free emote from the menu) is dispatched through this path, so a missing
+/// arm dropped the emote animation outside scripted quest interactions.
+/// (Garlemald-Server #46.)
+#[tokio::test]
+async fn runtime_drain_handles_do_emote() {
+    use crate::lua::LuaCommandKind;
+    use crate::runtime::quest_apply::apply_runtime_lua_command;
+
+    let db = crate::database::Database::open(tempdb())
+        .await
+        .expect("db stub");
+    let registry = ActorRegistry::new();
+    let world = WorldManager::new();
+
+    let handled = apply_runtime_lua_command(
+        LuaCommandKind::DoEmote {
+            actor_id: 999,
+            target_actor_id: 0,
+            emote_id: 5,
+            message_id: 21041,
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(handled, "DoEmote must be handled by the runtime drain");
+}
+
 /// `retainer:AddBazaarItem(...)` on the `LuaRetainer` userdata pushes a
 /// `LuaCommand::AddRetainerBazaarItem` onto the queue with the right
 /// shape. Regression guard — mlua `add_method` is last-write-wins for

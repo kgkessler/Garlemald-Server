@@ -7823,6 +7823,15 @@ impl PacketProcessor {
     const LOGOUT_COMMAND: u32 = 0xA0F0_5E9B;
     const TELEPORT_COMMAND: u32 = 0xA0F0_5E9C;
 
+    /// `EmoteStandardCommand` static actor — the client fires an EventStart
+    /// against this (eventName "commandRequest") for every one-shot emote from
+    /// the emote menu / `/bow` etc., carrying the emote id (101=Surprised ..
+    /// 105=Bow ..) + a showText flag in the LuaParams. Without a dispatch arm
+    /// the press falls through `command_script_name` and the emote never plays
+    /// outside a quest's scripted `player:DoEmote`. Id observed in the live
+    /// EventStart log. (Garlemald-Server #46.)
+    const EMOTE_STANDARD_COMMAND: u32 = 0xA0F0_5E26;
+
     /// SetTarget's `attackTarget` "no attack target" sentinel — the value the
     /// 1.x client writes when the player has no locked combat target (pmeteor
     /// `SetTargetPacket.attackTarget` "Usually 0xE0000000"). Same constant as
@@ -7873,6 +7882,7 @@ impl PacketProcessor {
             Self::ACTIVATE_COMMAND_A | Self::ACTIVATE_COMMAND_B => Some("ActivateCommand"),
             Self::LOGOUT_COMMAND => Some("LogoutCommand"),
             Self::TELEPORT_COMMAND => Some("TeleportCommand"),
+            Self::EMOTE_STANDARD_COMMAND => Some("EmoteStandardCommand"),
             _ => None,
         }
     }

@@ -688,6 +688,41 @@ pub async fn apply_runtime_lua_command(
             apply_content_finished(parent_zone_id, &area_name, registry, world, lua).await;
             true
         }
+        // DoEmote reaches the runtime drain when a *command* script emits it —
+        // EmoteStandardCommand.lua's `player:doEmote(...)` for a free emote from
+        // the menu is dispatched via dispatch_command_script ->
+        // apply_event_script_commands -> here (NOT the login applier the quest
+        // onEmote hook uses). Without this arm the emote animation packet was
+        // dropped, so emotes only played inside a scripted quest interaction.
+        // Mirrors the processor's `apply_do_emote` fan-out. (Garlemald-Server #46.)
+        LC::DoEmote {
+            actor_id,
+            target_actor_id,
+            emote_id,
+            message_id,
+        } => {
+            if registry.get(actor_id).await.is_some() {
+                let bytes = crate::packets::send::actor::build_actor_do_emote(
+                    actor_id,
+                    emote_id,
+                    target_actor_id,
+                    message_id,
+                )
+                .to_bytes();
+                crate::runtime::dispatcher::send_to_self_if_player(
+                    registry,
+                    world,
+                    actor_id,
+                    bytes.clone(),
+                )
+                .await;
+                crate::runtime::dispatcher::broadcast_to_neighbours(
+                    world, registry, actor_id, bytes,
+                )
+                .await;
+            }
+            true
+        }
         // WarpToPublicArea / WarpToPrivateArea resolve the destination from
         // the player's CURRENT zone + position then funnel through the same
         // `apply_do_zone_change` helper as `DoZoneChange` (mirrors the
