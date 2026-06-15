@@ -784,13 +784,27 @@ function startMan0l1Content(player, quest)
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
 	player:EndEvent();
 
-	-- Content-start shape mirrors the live-proven man0l0 doExitDoor
-	-- flow (StartDirector(false) + explicit noticeEvent kick +
-	-- SetLoginDirector), not the upstream StartDirector(true) form. The
-	-- 4th arg is the CONTENT SCRIPT name: the upstream port passed
-	-- "SimpleContent30002", which in garlemald is the Limsa deck
-	-- tutorial's script (one VM per script path — reusing it would run
-	-- the tutorial's onCreate against the escort area).
+	-- Content-start shape: retail / pmeteor form — StartDirector(true), NO
+	-- noticeEvent KickEvent and NO SetLoginDirector. The 4th arg is the
+	-- CONTENT SCRIPT name: the upstream port passed "SimpleContent30002",
+	-- which in garlemald is the Limsa deck tutorial's script (one VM per
+	-- script path — reusing it would run the tutorial's onCreate against the
+	-- escort area).
+	--
+	-- Why no kick (Garlemald-Server #46): the man0l0 doExitDoor flow this
+	-- previously copied fires a noticeEvent kick, which ARMS the client's
+	-- "JustInArea" loading-overlay suppression (event_type 5). The overlay
+	-- then only clears if the noticeEvent script drives the client clearer
+	-- (MyPlayer:_fadeInNowLoadingForNoticeEventJustInArea, vtable slot 66) —
+	-- a path the deck tutorials reach through their entry CUTSCENE, but which
+	-- the no-cutscene escort cannot (RunEventFunction can't invoke that
+	-- MyPlayer method — confirmed live: the call shipped but the client
+	-- ignored it and stayed on "Now Loading"). Retail content/leve warps
+	-- send ZERO kicks (ffxiv_traces/*.pcapng) and clear the overlay from the
+	-- normal zone-in (0x0005 SetMyActor + 0x0007 ZoneIn) bundle, exactly like
+	-- a cross-zone warp; pmeteor's startMan0l1Content does the same with
+	-- StartDirector(true). Dropping the kick lets the overlay clear the
+	-- retail way.
 	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
 
 	if (contentArea == nil) then
@@ -799,10 +813,7 @@ function startMan0l1Content(player, quest)
 
 	local director = contentArea:GetContentDirector();
 	player:AddDirector(director);
-	director:StartDirector(false);
-
-	player:KickEvent(director, "noticeEvent", true);
-	player:SetLoginDirector(director);
+	director:StartDirector(true);
 
 	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
 end
