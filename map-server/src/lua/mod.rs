@@ -1401,15 +1401,19 @@ impl LuaEngine {
             }
         }
         let resume_result = parked.thread.resume::<MultiValue>(args);
+        let parked_queue_ptr = format!("{:p}", std::sync::Arc::as_ptr(&parked.queue));
         let commands = CommandQueue::drain(&parked.queue);
         // DIAGNOSTIC (Garlemald-Server #46): show exactly which commands a
-        // resumed coroutine drained, so a live Isandorel-talk repro reveals
-        // whether `QuestIncCounter` is present (queue/apply bug) or absent
-        // (the coroutine carrying it was displaced before resume). Temporary.
+        // resumed coroutine drained + the queue ptr it drained from, so a live
+        // Isandorel-talk repro reveals whether `QuestIncCounter` is present
+        // (queue/apply bug) or absent because the binding pushed to a DIFFERENT
+        // queue (compare against the IncCounter binding's logged queue_ptr).
+        // Temporary triage.
         if !commands.is_empty() {
             tracing::debug!(
                 player = player_id,
                 count = commands.len(),
+                drained_queue_ptr = %parked_queue_ptr,
                 commands = ?commands,
                 "fire_player_event_and_drain: resumed coroutine drained these commands",
             );

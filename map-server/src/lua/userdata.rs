@@ -5298,6 +5298,16 @@ impl UserData for LuaQuestDataHandle {
             Ok(())
         });
         methods.add_method("IncCounter", |_, this, idx: u32| {
+            // DIAGNOSTIC (Garlemald-Server #46): confirm the binding runs on
+            // resume AND log the queue Arc it pushes to, so we can compare it
+            // against the queue drained by fire_player_event_and_drain. If the
+            // ptrs differ, data:IncCounter is pushing to a stale queue. Temp.
+            tracing::debug!(
+                quest = this.quest_id,
+                idx,
+                queue_ptr = format!("{:p}", std::sync::Arc::as_ptr(&this.queue)),
+                "IncCounter binding invoked (Garlemald-Server #46 diag)",
+            );
             push(
                 &this.queue,
                 LuaCommand::QuestIncCounter {
