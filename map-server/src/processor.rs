@@ -250,6 +250,19 @@ impl PacketProcessor {
         self.world.register_client(session_id, client.clone()).await;
         let mut session = Session::new(session_id);
         session.current_zone_id = zone_id;
+        // Restore the saved private area (a quest Echo / PrivateAreaMasterPast
+        // instance) so a relog INSIDE one lands the player back in it rather
+        // than the public zone. Without this a player who saved in man0l1's
+        // Fisherman's-Guild echo (PrivateAreaMasterPast type 5, zone 230)
+        // reloads into public zone 230 — they see the public guild populace but
+        // the echo-only quest NPCs (e.g. Sisipu, class 1000155, which has no
+        // public spawn row) are absent and the quest can't advance. The login
+        // zone-change below threads this through. (Garlemald-Server #46.)
+        let login_private_area =
+            (!loaded.current_private_area.is_empty()).then(|| loaded.current_private_area.clone());
+        let login_private_area_type = loaded.current_private_area_type;
+        session.current_private_area_name = login_private_area.clone();
+        session.current_private_area_level = login_private_area_type;
         session.destination_x = spawn.x;
         session.destination_y = spawn.y;
         session.destination_z = spawn.z;
@@ -465,7 +478,15 @@ impl PacketProcessor {
         if !is_login {
             if let Err(e) = self
                 .world
-                .do_zone_change(actor_id, session_id, zone_id, spawn, rotation)
+                .do_zone_change_with_private_area(
+                    actor_id,
+                    session_id,
+                    zone_id,
+                    login_private_area.clone(),
+                    login_private_area_type,
+                    spawn,
+                    rotation,
+                )
                 .await
             {
                 tracing::error!(error = %e, actor = actor_id, "zone change failed");
@@ -629,18 +650,34 @@ impl PacketProcessor {
         // position with the cutscene-canonical coordinates, and the
         // zone change needs the updated values to stage the player at
         // the right spot before `send_zone_in_bundle` renders them.
-        let (spawn, rotation) = if let Some(snap) = self.world.session(session_id).await {
-            (
-                Vector3::new(snap.destination_x, snap.destination_y, snap.destination_z),
-                snap.destination_rot,
-            )
-        } else {
-            (Vector3::default(), 0.0)
-        };
+        let (spawn, rotation, login_private_area, login_private_area_type) =
+            if let Some(snap) = self.world.session(session_id).await {
+                (
+                    Vector3::new(snap.destination_x, snap.destination_y, snap.destination_z),
+                    snap.destination_rot,
+                    // Restored in handle_session_begin from the saved
+                    // currentPrivateArea — route the login zone-in into the
+                    // saved Echo / private-area instance so relogging inside
+                    // one (e.g. man0l1's FSH-guild echo) lands the player back
+                    // in it with its echo-only NPCs. (Garlemald-Server #46.)
+                    snap.current_private_area_name.clone(),
+                    snap.current_private_area_level,
+                )
+            } else {
+                (Vector3::default(), 0.0, None, 0)
+            };
 
         if let Err(e) = self
             .world
-            .do_zone_change(actor_id, session_id, zone, spawn, rotation)
+            .do_zone_change_with_private_area(
+                actor_id,
+                session_id,
+                zone,
+                login_private_area,
+                login_private_area_type,
+                spawn,
+                rotation,
+            )
             .await
         {
             tracing::error!(error = %e, actor = actor_id, "login zone change failed");
