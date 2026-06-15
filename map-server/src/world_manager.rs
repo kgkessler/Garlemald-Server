@@ -395,8 +395,27 @@ pub fn build_retainer_spawn_bundle(
     zone_name: &str,
 ) -> Vec<common::subpacket::SubPacket> {
     let mut out = Vec::new();
-    push_npc_spawn(&mut out, character, zone_name, 0, false, None, None);
+    push_npc_spawn(&mut out, character, zone_name, 0, false, None, None, None);
     out
+}
+
+/// Snapshot the receiving player's quest-driven push-trigger states:
+/// `actor_class_id → is_push_enabled` across every active quest's current
+/// ENPC set. A streamed actor whose class is in this map is a quest
+/// trigger the player's journal already has an explicit enable/disable for,
+/// so the spawn bundle should honour that state rather than the actor-class
+/// `isEnabled` default — this is what lets a trigger enabled by a far-away
+/// `onStateChange` still arrive enabled when the player finally walks into
+/// streaming range (e.g. man0l1's Zephyr Gate), and conversely keeps a
+/// quest-disabled trigger (man0l1's ECHO_EXIT before its sequence) silent.
+fn quest_push_overrides(character: &crate::actor::Character) -> HashMap<u32, bool> {
+    let mut map = HashMap::new();
+    for quest in character.quest_journal.slots.iter().flatten() {
+        for (class_id, enpc) in &quest.state.current {
+            map.insert(*class_id, enpc.is_push_enabled);
+        }
+    }
+    map
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -417,6 +436,13 @@ fn push_npc_spawn(
     // the legacy populace-pipeline behavior (bit-2 mask + hateType 0
     // for `/Monster/` class paths).
     battle_kind: Option<crate::runtime::actor_registry::ActorKindTag>,
+    // Per-actor push-trigger enable override for the receiving player.
+    // `Some(b)` when this actor is a current quest ENPC for the player
+    // (the owning quest's `quest:SetENpc(.., QFLAG_PUSH)` state) — that
+    // wins over the actor-class `isEnabled` default. `None` for plain
+    // populace / objects, leaving each push condition at its data default
+    // (disabled for quest triggers). See `build_actor_event_status_packets`.
+    push_enabled: Option<bool>,
 ) {
     let actor_id = character.base.actor_id;
     // Meteor's `Actor.CreateNamePacket` (Map Server/Actors/Actor.cs:153)
@@ -655,16 +681,20 @@ fn push_npc_spawn(
     // player walks into the circle, and proximity-driven cinematics like
     // `man0g0::onPush(YDA)` never reach the player.
     //
-    // Defaults match Meteor's signature `(talkEnabled=true, emoteEnabled=true,
-    // pushEnabled=null → unwrap_or(true), noticeEnabled=true)`. A subsequent
-    // `quest:SetENpc(...)` broadcast can flip `pushEnabled=false` if the
-    // current sequence wants the trigger silent.
+    // talk / emote / notice match Meteor's `(talkEnabled=true,
+    // emoteEnabled=true, noticeEnabled=true)`. Push is `push_enabled`:
+    // `Some(b)` from the caller when this actor is a current quest ENPC
+    // for the receiving player (so a stream-after-enable trigger arrives in
+    // the state the quest already chose), otherwise `None` so each push
+    // condition falls back to its actor-class `isEnabled` default (disabled
+    // for quest triggers). A later `quest:SetENpc(...)` broadcast still
+    // overrides for already-streamed actors.
     subpackets.extend(crate::packets::send::build_actor_event_status_packets(
         actor_id,
         &character.base.event_conditions,
         true,
         true,
-        None,
+        push_enabled,
         true,
     ));
 
@@ -2167,6 +2197,10 @@ impl WorldManager {
         // (opening_jelly, opening_yshtola, opening_stahlmann) go
         // through the same populace pipeline.
         let mut spawned_npc_ids: Vec<u32> = Vec::new();
+        // Snapshot the player's quest-driven push-trigger states once so
+        // each spawned trigger arrives in the state its owning quest chose
+        // (rather than the actor-class default). (Garlemald-Server #46.)
+        let quest_push = quest_push_overrides(&*actor_handle.character.read().await);
         for (neighbour_id, kind) in neighbours {
             use crate::zone::area::ActorKind;
             if !matches!(
@@ -2184,6 +2218,7 @@ impl WorldManager {
             }
             emitted += 1;
             spawned_npc_ids.push(neighbour_id);
+            let push_enabled = quest_push.get(&character.chara.actor_class_id).copied();
             let mut npc_bundle = Vec::new();
             push_npc_spawn(
                 &mut npc_bundle,
@@ -2199,6 +2234,7 @@ impl WorldManager {
                 private_area_bind.is_some(),
                 lua,
                 Some(handle.kind),
+                push_enabled,
             );
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
@@ -2818,13 +2854,33 @@ impl WorldManager {
         }
 
         let zone_name = { zone_arc.read().await.core.zone_name.clone() };
+        // Snapshot the player's quest-driven push-trigger states so a
+        // trigger that streams in AFTER its owning quest enabled it (the
+        // player walked into range from afar — e.g. man0l1's Zephyr Gate)
+        // still arrives enabled, and a quest-disabled trigger near the
+        // player (man0l1's ECHO_EXIT before its sequence) stays silent.
+        // (Garlemald-Server #46.)
+        let quest_push = match registry.get(actor_id).await {
+            Some(h) => quest_push_overrides(&*h.character.read().await),
+            None => HashMap::new(),
+        };
         let mut added: Vec<u32> = Vec::new();
         for neighbour_id in new_ids {
             let Some(handle) = registry.get(neighbour_id).await else {
                 continue;
             };
             let character = handle.character.read().await;
+            let push_enabled = quest_push.get(&character.chara.actor_class_id).copied();
             let mut npc_bundle = Vec::new();
+            // push_npc_spawn registers every event condition AND emits the
+            // SetEventStatus enable-flags (talk/emote/notice = true; push =
+            // `push_enabled` ?? the condition's actor-class `isEnabled`).
+            // pmeteor's Session.UpdateInstance does the same right after the
+            // spawn bundle (Session.cs:139/161); without the enable the 1.x
+            // client treats the NPC as non-talkable and never fires an
+            // EventStart. Quest push triggers in the root zone are the one
+            // case where the enable must NOT be unconditional — hence the
+            // per-player `push_enabled` override above.
             push_npc_spawn(
                 &mut npc_bundle,
                 &character,
@@ -2833,28 +2889,8 @@ impl WorldManager {
                 false, // root zone: not a private-area bind
                 lua,
                 Some(handle.kind),
+                push_enabled,
             );
-            // Enable the actor's event conditions — pmeteor's
-            // Session.UpdateInstance fires GetSetEventStatusPackets() for
-            // EVERY streamed actor (Session.cs:139/161) right after the
-            // spawn bundle. push_npc_spawn only REGISTERS the conditions
-            // (SetTalkEventCondition); without the SetEventStatus ENABLE
-            // the 1.x client treats the NPC as non-talkable and never
-            // sends a talk EventStart — the live-test "NPCs/aetheryte
-            // show up but interacting does nothing". Defaults mirror C#
-            // (talk/emote/notice enabled, push per-condition). Streamed
-            // root-zone actors are plain populace / objects (the camp +
-            // aetheryte), never quest ENPCs — those are managed by
-            // broadcast_quest_enpc_update — so unconditional enable here
-            // is safe. (Garlemald-Server #46 live test round 2.)
-            npc_bundle.extend(tx::actor::build_actor_event_status_packets(
-                neighbour_id,
-                &character.base.event_conditions,
-                true,
-                true,
-                None,
-                true,
-            ));
             drop(character);
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
