@@ -9616,6 +9616,61 @@ async fn add_retainer_bazaar_item_command_drains_to_db() {
     assert_eq!(rows[0].price_gil, 200);
 }
 
+/// Regression: the runtime drain (`apply_runtime_lua_command`) MUST handle
+/// `WarpToPrivateArea` / `WarpToPublicArea` rather than drop them into its
+/// `_ => false` catch-all. A quest-talk coroutine that parks on
+/// `callClientFunction` and emits the warp on resume is drained through this
+/// path (man0l1 SEQ_007 — Isandorel's second cutscene ends with
+/// `WarpToPrivateArea("PrivateAreaMasterPast", 3)`); the dropped warp left the
+/// client on "Now Loading" forever. With no registered actor the arm
+/// short-circuits, but must still report handled = true (pre-fix it was false).
+/// (Garlemald-Server #46.)
+#[tokio::test]
+async fn runtime_drain_handles_warp_commands() {
+    use crate::lua::LuaCommandKind;
+    use crate::runtime::quest_apply::apply_runtime_lua_command;
+
+    let db = crate::database::Database::open(tempdb())
+        .await
+        .expect("db stub");
+    let registry = ActorRegistry::new();
+    let world = WorldManager::new();
+
+    let priv_handled = apply_runtime_lua_command(
+        LuaCommandKind::WarpToPrivateArea {
+            player_id: 999,
+            area_class: "PrivateAreaMasterPast".to_string(),
+            area_index: 3,
+            target: None,
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(
+        priv_handled,
+        "WarpToPrivateArea must be handled by the runtime drain"
+    );
+
+    let pub_handled = apply_runtime_lua_command(
+        LuaCommandKind::WarpToPublicArea {
+            player_id: 999,
+            target: None,
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(
+        pub_handled,
+        "WarpToPublicArea must be handled by the runtime drain"
+    );
+}
+
 /// `retainer:AddBazaarItem(...)` on the `LuaRetainer` userdata pushes a
 /// `LuaCommand::AddRetainerBazaarItem` onto the queue with the right
 /// shape. Regression guard — mlua `add_method` is last-write-wins for

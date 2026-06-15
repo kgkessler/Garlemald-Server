@@ -688,8 +688,84 @@ pub async fn apply_runtime_lua_command(
             apply_content_finished(parent_zone_id, &area_name, registry, world, lua).await;
             true
         }
+        // WarpToPublicArea / WarpToPrivateArea resolve the destination from
+        // the player's CURRENT zone + position then funnel through the same
+        // `apply_do_zone_change` helper as `DoZoneChange` (mirrors the
+        // processor's `apply_warp_to_{public,private}_area`). These MUST live
+        // here too: a quest-talk coroutine that parks on `callClientFunction`
+        // and emits the warp on resume (man0l1 SEQ_007 — Isandorel's second
+        // cutscene ends with `WarpToPrivateArea("PrivateAreaMasterPast", 3)`)
+        // is drained through this runtime path, not the login applier. Without
+        // these arms the warp hit `_ => false` and was silently dropped, so
+        // the client finished the cutscene and sat on "Now Loading" forever.
+        // (Garlemald-Server #46.)
+        LC::WarpToPublicArea { player_id, target } => {
+            let Some(handle) = registry.get(player_id).await else {
+                tracing::warn!(player = player_id, "WarpToPublicArea: actor missing");
+                return true;
+            };
+            let (zone_id, x, y, z, rotation) = warp_origin(&handle, target).await;
+            apply_do_zone_change(
+                player_id, zone_id, None, 0, 15, x, y, z, rotation, registry, db, world, lua,
+            )
+            .await;
+            true
+        }
+        LC::WarpToPrivateArea {
+            player_id,
+            area_class,
+            area_index,
+            target,
+        } => {
+            let Some(handle) = registry.get(player_id).await else {
+                tracing::warn!(
+                    player = player_id,
+                    %area_class,
+                    area_index,
+                    "WarpToPrivateArea: actor missing"
+                );
+                return true;
+            };
+            let (zone_id, x, y, z, rotation) = warp_origin(&handle, target).await;
+            apply_do_zone_change(
+                player_id,
+                zone_id,
+                Some(area_class),
+                area_index,
+                15,
+                x,
+                y,
+                z,
+                rotation,
+                registry,
+                db,
+                world,
+                lua,
+            )
+            .await;
+            true
+        }
         _ => false,
     }
+}
+
+/// Resolve a warp's origin zone + spawn coordinates: an explicit
+/// `target` overrides, otherwise fall back to the actor's current zone and
+/// position (pmeteor `WarpTo{Public,Private}Area` with no coords reuses the
+/// player's current pos so the visible effect is just a loading flicker).
+async fn warp_origin(
+    handle: &ActorHandle,
+    target: Option<(f32, f32, f32, f32)>,
+) -> (u32, f32, f32, f32, f32) {
+    let c = handle.character.read().await;
+    let zone_id = c.base.zone_id;
+    let (x, y, z, rotation) = target.unwrap_or((
+        c.base.position_x,
+        c.base.position_y,
+        c.base.position_z,
+        c.base.rotation,
+    ));
+    (zone_id, x, y, z, rotation)
 }
 
 /// Phase C3 — port of C# `Controller::Engage(target)` /
