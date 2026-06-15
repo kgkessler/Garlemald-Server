@@ -3290,36 +3290,37 @@ impl PacketProcessor {
             client.send_bytes(msg.to_bytes()).await;
         }
 
-        // DeleteAllActors + 0x00E2(0x10) — THE same-zone reload trigger.
+        // 0x00E2(0x02) force-reload latch ONLY — NO leading DeleteAllActors.
         //
-        // These two were previously sent UNTAGGED (`target_id == 0`), and
-        // every map-server subpacket crosses the world-server proxy, whose
-        // fan-out drops untargeted subpackets (`if target == 0 { continue; }`,
-        // world-server/src/server.rs). So the client never received either
-        // packet: no actor wipe, and — critically — no 0x00E2. The decompiled
-        // client (FUN_0058cca0, case 0x00E2) sets the MapLayoutElement's
-        // force-reload latch [+0xbc]=1 for any subcode except 0x15/0x16; the
-        // SetMap handler (FUN_0059ced0) then schedules a scene reload when
-        // `latch != 0 OR region != resident [+0x94]`. With the 0x00E2 dropped,
-        // a same-region SetMap(106) took the no-op arm and "Now Loading" hung
-        // forever — which is what the high-16 region tag (now removed, see
-        // send_zone_in_bundle) was papering over by forcing the
-        // region-mismatch arm at the cost of committing an invalid resident
-        // region. Tagging the pair delivers the latch, so the unmodified
-        // parent region reloads exactly like pmeteor's capture.
-        // (Garlemald-Server #28.)
+        // This now mirrors the WORKING cross-zone warp (apply_do_zone_change /
+        // quest_apply.rs:2022-2042). That path's comment is explicit: a bare
+        // 0x0007 wipe-all ahead of the bundle deletes the player's own actor
+        // mid-scene — "tolerated on cross-region warps (the region mismatch
+        // forces a clean scene rebuild) but FATAL on a same-region map change."
+        // The content warp IS a same-region change (the instance shares the
+        // parent's region 101), so the leading wipe was the killer: the client
+        // reloaded the scene + echoed RX 0x0007 (verified on the wire) but the
+        // "Now Loading" overlay never dismissed. The in-repo client decomp
+        // (captures/issue28-rca/03-decomp-reload.md) confirms the zone-actor
+        // field is NOT a reload discriminator — the latch (0x00E2) + the
+        // keep-list-commit scene rebuild is. Retail does the old-actor cleanup
+        // via the Mass-Delete KEEP-LIST at the END of the bundle (the exempt
+        // lists name every just-spawned actor incl. the player), NOT a bare
+        // up-front wipe. Subcode 0x02 is the full-zone-change latch value
+        // retail/pmeteor use (0x10 is the in-place variant the prior shape
+        // tried). (Garlemald-Server #46.)
         {
-            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
-            wipe.set_target_id(session_id);
-            client.send_bytes(wipe.to_bytes()).await;
-            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
             e2.set_target_id(session_id);
             client.send_bytes(e2.to_bytes()).await;
         }
 
         // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
         //    the session + character we just updated, so the bundle
-        //    spawns the player at the content-area coords.
+        //    spawns the player at the content-area coords. `commit_keep_list
+        //    = true` so the old zone's actors are cleaned up via the trailing
+        //    Mass-Delete keep-list trio (the retail/working-warp shape) instead
+        //    of the fatal up-front bare wipe removed above. (Garlemald-Server #46.)
         self.world
             .send_zone_in_bundle(
                 &self.registry,
@@ -3327,12 +3328,7 @@ impl PacketProcessor {
                 self.lua.as_ref(),
                 session_id,
                 spawn_type as u16,
-                // Content warps keep their pmeteor-verified shape: the
-                // bare 0x0007 wipe ahead of this bundle (see above) is
-                // load-bearing for the same-zone content transition, so
-                // no trailing keep-list commit is added on top.
-                /* commit_keep_list */
-                false,
+                /* commit_keep_list */ true,
             )
             .await;
 
