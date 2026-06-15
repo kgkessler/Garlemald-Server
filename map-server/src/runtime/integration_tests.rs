@@ -13229,8 +13229,15 @@ fn event_start_body(
     v.extend_from_slice(&0x2680_0000u32.to_le_bytes()); // serverCodes
     v.extend_from_slice(&0u32.to_le_bytes()); // unknown
     v.push(0); // event_type
-    v.extend_from_slice(event_name.as_bytes());
-    v.push(0);
+    // The client packs eventName into a FIXED 0x20-byte field; the LuaParam
+    // tail begins at name_start + 0x20 (see EventStartPacket::parse /
+    // read_fixed_field_ascii). Write it the same way so the synthetic packet
+    // matches the real wire format. (Garlemald-Server #46.)
+    let mut name_field = [0u8; 0x20];
+    let name_bytes = event_name.as_bytes();
+    let n = name_bytes.len().min(0x1f); // leave room for the NUL terminator
+    name_field[..n].copy_from_slice(&name_bytes[..n]);
+    v.extend_from_slice(&name_field);
     common::luaparam::write_lua_params(&mut v, params).expect("lua params encode");
     v
 }
