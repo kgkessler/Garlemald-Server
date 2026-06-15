@@ -82,6 +82,9 @@ pub enum QuestHookArg {
     Int(i64),
     Bool(bool),
     Nil,
+    /// An owned string — e.g. the `eventName` passed to
+    /// `onEmote`/`onPush`/`onCommand` (`"emoteDefault1"`, `"pushDefault"`, …).
+    Str(String),
     /// Materialise a fresh `LuaNpc` userdata inside the script VM.
     Npc(LuaNpcSpec),
 }
@@ -111,6 +114,7 @@ impl QuestHookArg {
             QuestHookArg::Int(i) => Value::Integer(i as mlua::Integer),
             QuestHookArg::Bool(b) => Value::Boolean(b),
             QuestHookArg::Nil => Value::Nil,
+            QuestHookArg::Str(s) => Value::String(lua.create_string(&s)?),
             QuestHookArg::Npc(spec) => {
                 let npc = userdata::LuaNpc {
                     base: userdata::LuaActor {
@@ -1951,6 +1955,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `npc.Id` must expose the actor INSTANCE id (distinct from the class id
+    /// via `GetActorClassId`). onEmote passes `npc.Id` to `player:DoEmote` as
+    /// the target — a nil there errors the binding (`target_actor_id: u32`)
+    /// and unwinds the hook. (Garlemald-Server #46.)
+    #[test]
+    fn lua_npc_exposes_instance_id_field() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("quests/man")).unwrap();
+        std::fs::write(
+            root.join("quests/man/man0l0.lua"),
+            r#"
+                function onTalk(player, quest, npc)
+                    if npc.Id == 0x12345 and npc:GetActorClassId() == 1000155 then
+                        quest:SetQuestFlag(6)
+                    end
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("quests/man/man0l0.lua");
+        let npc_spec = LuaNpcSpec {
+            actor_id: 0x12345,
+            name: "Sisipu".to_string(),
+            class_name: "PopulaceStandard".to_string(),
+            class_path: "/Chara/Npc/Populace/PopulaceStandard".to_string(),
+            unique_id: "sisipu".to_string(),
+            zone_id: 230,
+            zone_name: "test".to_string(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            actor_class_id: 1_000_155,
+            quest_graphic: 0,
+        };
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onTalk",
+            sample_snapshot(),
+            sample_quest_handle(CommandQueue::new()),
+            vec![QuestHookArg::Npc(npc_spec)],
+        );
+        assert!(result.error.is_none(), "onTalk errored: {:?}", result.error);
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::QuestSetFlag { bit: 6, .. })),
+            "npc.Id (instance) / GetActorClassId (class) mismatch; got {:?}",
+            result.commands
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn call_quest_hook_receives_extra_args_after_player_and_quest() {
         let root = tmpdir();
@@ -1987,6 +2047,53 @@ mod tests {
         assert!(
             seen,
             "script didn't see sequence=10; got {:?}",
+            result.commands
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: a `QuestHookArg::Str` reaches the hook as its positional
+    /// arg. `onEmote(player, quest, npc, eventName)` needs the eventName
+    /// string ("emoteDefault1" = /bow) to pick the right branch — the
+    /// dispatcher previously passed only the npc, leaving eventName nil so
+    /// man0l1 SEQ_040's hand-signal test never matched. (Garlemald-Server #46.)
+    #[test]
+    fn call_quest_hook_passes_string_event_name_arg() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("quests/man")).unwrap();
+        std::fs::write(
+            root.join("quests/man/man0l1.lua"),
+            r#"
+                function onEmote(player, quest, npc, eventName)
+                    if eventName == "emoteDefault1" then
+                        quest:StartSequence(77)
+                    end
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("quests/man/man0l1.lua");
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onEmote",
+            sample_snapshot(),
+            sample_quest_handle(CommandQueue::new()),
+            // [npc, eventName] — npc is unused by this hook so Nil stands in.
+            vec![
+                QuestHookArg::Nil,
+                QuestHookArg::Str("emoteDefault1".to_string()),
+            ],
+        );
+        assert!(result.error.is_none(), "hook errored: {:?}", result.error);
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::QuestStartSequence { sequence: 77, .. })),
+            "onEmote didn't receive the eventName string; got {:?}",
             result.commands
         );
 

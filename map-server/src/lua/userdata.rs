@@ -407,6 +407,17 @@ pub struct LuaNpc {
 }
 
 impl UserData for LuaNpc {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        // `npc.Id` — the actor INSTANCE id (pmeteor `Actor.Id`). man0l1's
+        // onEmote passes it to `player:DoEmote(npc.Id, emoteId, msgId)` as the
+        // emote target. Without this field the access is nil; the DoEmote
+        // binding takes `target_actor_id: u32`, so a nil arg ERRORS the
+        // binding and unwinds the onEmote coroutine before it can play the
+        // animation or advance the hand-signal counter (man0l1 SEQ_040).
+        // 13 `npc.Id` call sites across the quest corpus. (Garlemald-Server #46.)
+        fields.add_field_method_get("Id", |_, this| Ok(this.base.actor_id));
+    }
+
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("GetName", |_, this, _: ()| Ok(this.base.name.clone()));
         methods.add_method("GetUniqueId", |_, this, _: ()| {

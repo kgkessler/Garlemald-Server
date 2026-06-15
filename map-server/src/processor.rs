@@ -7504,8 +7504,13 @@ impl PacketProcessor {
             0 => Some("onCommand"),
             _ => None,
         } {
-            self.fire_quest_hook_for_active_quests(&handle, owner_actor_id, hook_name)
-                .await;
+            self.fire_quest_hook_for_active_quests(
+                &handle,
+                owner_actor_id,
+                hook_name,
+                &event_name_for_cmd,
+            )
+            .await;
         }
 
         // Non-quest NPC / object interaction — run the TARGET actor's OWN
@@ -8744,6 +8749,7 @@ impl PacketProcessor {
         handle: &ActorHandle,
         npc_actor_id: u32,
         hook_name: &'static str,
+        event_name: &str,
     ) {
         let active_quest_ids: Vec<u32> = {
             let c = handle.character.read().await;
@@ -8765,11 +8771,22 @@ impl PacketProcessor {
         };
 
         for quest_id in active_quest_ids {
+            // Pass the eventName as the hook's trailing arg —
+            // `onEmote(player, quest, npc, eventName)` /
+            // `onPush(.., eventName)` / `onCommand(.., eventName)` need it to
+            // tell WHICH condition fired (e.g. "emoteDefault1" = /bow). Omitting
+            // it left eventName nil, so man0l1 SEQ_040's hand-signal test never
+            // matched a branch — no DoEmote animation, no counter advance.
+            // Harmless for `onTalk` (3-arg), which ignores the extra value.
+            // (Garlemald-Server #46.)
             self.fire_quest_event_hook(
                 handle,
                 quest_id,
                 hook_name,
-                vec![crate::lua::QuestHookArg::Npc(npc_spec.clone())],
+                vec![
+                    crate::lua::QuestHookArg::Npc(npc_spec.clone()),
+                    crate::lua::QuestHookArg::Str(event_name.to_string()),
+                ],
             )
             .await;
         }
