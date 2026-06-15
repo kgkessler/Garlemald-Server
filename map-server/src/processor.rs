@@ -9040,7 +9040,9 @@ impl PacketProcessor {
         //     the warp path (quest_apply::apply_do_zone_change). The
         //     instance list was already cleared by
         //     do_seamless_zone_change, so step 3b streams the new zone.
-        if let crate::world_manager::SeamlessResult::ZoneChanged(dest) = seamless {
+        let seamless_dest = if let crate::world_manager::SeamlessResult::ZoneChanged(dest) =
+            seamless
+        {
             self.registry.reassign_zone(actor_id, dest).await;
             {
                 let mut c = handle.character.write().await;
@@ -9061,7 +9063,10 @@ impl PacketProcessor {
             {
                 tracing::warn!(actor = actor_id, dest, err = %e, "seamless: position persist failed");
             }
-        }
+            Some(dest)
+        } else {
+            None
+        };
 
         // 3b. Continuous instance update — stream in any NPC/Ally/
         //     BattleNpc that has walked within 50y since the last update
@@ -9070,6 +9075,36 @@ impl PacketProcessor {
         self.world
             .send_instance_update(&self.registry, self.lua.as_ref(), actor_id, session_id)
             .await;
+
+        // 3c. On a seamless zone CHANGE, re-establish the active quests' ENPC
+        //     conditions for the DESTINATION zone. Without this the only thing
+        //     arming a cross-zone quest push trigger (e.g. man0l1's Zephyr Gate
+        //     trigger 1090004, which lives in zone 128 but is enabled by an
+        //     onStateChange that ran while the player was still in town zone
+        //     133) is `send_instance_update`'s per-stream-in `push_enabled`
+        //     override — a single timing-fragile snapshot. Re-running the same
+        //     idempotent re-establish the login path uses (apply_quest_update
+        //     _enpcs → begin_sequence_swap + onStateChange + diff broadcast,
+        //     processor.rs:835) now that the destination zone is current
+        //     re-emits the enabling SetEventStatus + quest graphic via the
+        //     session-zone-aware `broadcast_quest_enpc_update`, so the push is
+        //     armed regardless of stream timing. Mirrors pmeteor re-arming
+        //     quest ENPCs per stream-in with NO zone predicate
+        //     (Session.UpdateInstance → GetQuestsForNpc). (Garlemald-Server #46.)
+        if seamless_dest.is_some() {
+            let active_quest_ids: Vec<u32> = {
+                let c = handle.character.read().await;
+                c.quest_journal
+                    .slots
+                    .iter()
+                    .flatten()
+                    .map(|q| q.quest_id())
+                    .collect()
+            };
+            for quest_id in active_quest_ids {
+                self.apply_quest_update_enpcs(actor_id, quest_id).await;
+            }
+        }
 
         // 4. Proximity-push dispatch is now CLIENT-SIDE. The
         //    `SetPushEventConditionWithCircle` packets emitted in the

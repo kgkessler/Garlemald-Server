@@ -771,7 +771,10 @@ impl LuaEngine {
         player_snapshot: userdata::PlayerSnapshot,
         command_actor_id: u32,
         event_name: String,
-        event_type: u8,
+        // Wire field kept for signature symmetry with the director path, but
+        // NOT forwarded to command scripts (they take triggerName, not
+        // eventType — see the arg-push block below). (Garlemald-Server #46.)
+        _event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
     ) -> PartialLuaCallResult {
         let owner_player_id = player_snapshot.actor_id;
@@ -805,7 +808,18 @@ impl LuaEngine {
             let mut mv = MultiValue::new();
             mv.push_back(Value::UserData(player_ud));
             mv.push_back(Value::UserData(command_ud));
-            mv.push_back(Value::Integer(event_type as mlua::Integer));
+            // Command scripts take `onEventStarted(player, command, triggerName,
+            // ...params)` — triggerName IS the event_name string (e.g.
+            // "commandRequest"), and the real LuaParams (emoteId, showText, …)
+            // follow. Unlike pmeteor (whose command scripts carry an extra
+            // leading `eventType`), garlemald's ported command scripts in
+            // scripts/lua/commands/*.lua drop it, so we must NOT push
+            // `event_type` here: doing so shifted triggerName→eventType(0) and
+            // emoteId→event_name("commandRequest"), which made
+            // EmoteStandardCommand.lua's `string.format("%d", emoteId)` crash on
+            // a string and every free emote silently no-op. The director path
+            // (call_director_on_event_started) keeps eventType — directors DO
+            // declare it. (Garlemald-Server #46.)
             let event_name_lua = lua
                 .create_string(&event_name)
                 .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
@@ -837,7 +851,11 @@ impl LuaEngine {
         player_snapshot: userdata::PlayerSnapshot,
         npc_spec: LuaNpcSpec,
         event_name: String,
-        event_type: u8,
+        // Like the command path: NPC/object scripts take
+        // `onEventStarted(player, npc, triggerName, …)` (triggerName = the
+        // event_name string), NOT eventType. Kept for signature symmetry only.
+        // (Garlemald-Server #46.)
+        _event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
     ) -> PartialLuaCallResult {
         let owner_player_id = player_snapshot.actor_id;
@@ -875,7 +893,11 @@ impl LuaEngine {
             let mut mv = MultiValue::new();
             mv.push_back(Value::UserData(player_ud));
             mv.push_back(Value::UserData(npc_ud));
-            mv.push_back(Value::Integer(event_type as mlua::Integer));
+            // No eventType push — base NPC/object scripts compare their 3rd arg
+            // (triggerName) to STRING literals like "talkDefault" / "pushDefault"
+            // / "caution" / "exit". Pushing the eventType integer here made
+            // those comparisons silently always-false (number != string).
+            // (Garlemald-Server #46.)
             let event_name_lua = lua
                 .create_string(&event_name)
                 .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
@@ -2330,6 +2352,49 @@ mod tests {
                 result.commands,
             );
         }
+    }
+
+    /// Garlemald-Server #46 regression — a FREE emote (the emote menu /
+    /// `/bow`) fires an EventStart against the EmoteStandardCommand static
+    /// actor carrying `event_name="commandRequest"` + LuaParams
+    /// `[emoteId, showText]`. The command script signature is
+    /// `onEventStarted(player, actor, triggerName, emoteId, showText, …)` —
+    /// NO eventType. Before the fix, `call_command_on_event_started` pushed a
+    /// spurious `event_type` integer, so `emoteId` received the STRING
+    /// "commandRequest" → `emoteTable[emoteId]` was nil → the script hit
+    /// `string.format("%d", emoteId)` and CRASHED, and no emote ever played
+    /// outside a scripted quest interaction. Assert the real numeric emoteId
+    /// reaches the script: Bow (105) → `player:doEmote(0, animId 5, descId
+    /// 21041)` → a `LuaCommand::DoEmote { emote_id: 5, message_id: 21041 }`.
+    #[test]
+    fn real_emote_standard_command_plays_emote() {
+        use common::luaparam::LuaParam;
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let engine = LuaEngine::new(root);
+        let script_path = root.join("commands/EmoteStandardCommand.lua");
+        assert!(script_path.exists(), "EmoteStandardCommand must be on disk");
+        let result = engine.call_command_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            0xA0F0_5E26, // EmoteStandardCommand static actor
+            "commandRequest".to_string(),
+            0, // event_type — now ignored on the command path
+            vec![LuaParam::Int32(105), LuaParam::Int32(1)], // emoteId=Bow, showText=1
+        );
+        assert!(
+            result.error.is_none(),
+            "EmoteStandardCommand onEventStarted errored (arg shift?): {:?}",
+            result.error,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::DoEmote { emote_id, message_id, .. }
+                    if *emote_id == 5 && *message_id == 21041
+            )),
+            "Bow must produce DoEmote(animId 5, descId 21041); got {:?}",
+            result.commands,
+        );
     }
 
     /// #28 S0.4 — drive the REAL `SimpleContent30010.lua::onUpdate`
