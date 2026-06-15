@@ -24,6 +24,21 @@ end
 function onEventStarted(player, actor, triggerName)
 	man0l1Quest = player:GetQuest("Man0l1");
 
+	-- Dismiss the "Now Loading" overlay the content warp's noticeEvent kick
+	-- armed. On a noticeEvent area-entry the client suppresses its automatic
+	-- loading dismissal and hands the fade to THIS script; it only clears
+	-- when the noticeEvent handler drives MyPlayer:_fadeInNowLoadingForNotice
+	-- EventJustInArea (client vtable slot 66 / FUN_006e32f0) — exactly the
+	-- no-cutscene branch of the shipped InstanceRaidBaseClass.startEvent
+	-- (`if cut ~= "none" then executeCutScene(..) else player:_fadeInNow
+	-- LoadingForNoticeEventJustInArea() end; player:_fadeIn(1)`). The escort
+	-- plays no entry cutscene, so without these the escort runs server-side
+	-- but the client stays on the loading screen forever. Driven via
+	-- RunEventFunction on the still-open noticeEvent (no yield — the clearer
+	-- does not round-trip an EventUpdate). (Garlemald-Server #46.)
+	player:RunEventFunction("_fadeInNowLoadingForNoticeEventJustInArea");
+	player:RunEventFunction("_fadeIn", 1);
+
 	-- Close the notice kick's event context; the escort walk runs free
 	-- (no client event open) until the arrival beat below.
 	player:EndEvent();
