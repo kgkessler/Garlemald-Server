@@ -405,6 +405,7 @@ impl PacketProcessor {
                     row.counter1,
                     row.counter2,
                     row.counter3,
+                    row.counter4,
                     row.npc_ls_from,
                     row.npc_ls_msg_step,
                 ));
@@ -6177,7 +6178,12 @@ impl PacketProcessor {
             if q.is_dirty() {
                 let sequence = q.get_sequence();
                 let flags = q.get_flags();
-                let counters = [q.get_counter(0), q.get_counter(1), q.get_counter(2)];
+                let counters = [
+                    q.get_counter(0),
+                    q.get_counter(1),
+                    q.get_counter(2),
+                    q.get_counter(3),
+                ];
                 let actor_id = q.actor_id;
                 q.clear_dirty();
                 Some((slot as i32, actor_id, sequence, flags, counters))
@@ -6185,10 +6191,10 @@ impl PacketProcessor {
                 None
             }
         };
-        if let Some((slot, actor_id, sequence, flags, [c1, c2, c3])) = save_tuple
+        if let Some((slot, actor_id, sequence, flags, [c1, c2, c3, c4])) = save_tuple
             && let Err(e) = self
                 .db
-                .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3)
+                .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3, c4)
                 .await
         {
             tracing::warn!(
@@ -6571,7 +6577,7 @@ impl PacketProcessor {
         let (slot, actor_id) = save_tuple;
         if let Err(e) = self
             .db
-            .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0)
+            .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0, 0)
             .await
         {
             tracing::warn!(
@@ -6798,20 +6804,21 @@ impl PacketProcessor {
                         q.get_counter(0),
                         q.get_counter(1),
                         q.get_counter(2),
+                        q.get_counter(3),
                         q.get_npc_ls_from(),
                         q.get_npc_ls_msg_step(),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+                .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0));
             let handle = crate::lua::LuaQuestHandle {
                 player_id: snapshot.actor_id,
                 quest_id,
                 has_quest: c.quest_journal.has(quest_id),
                 sequence: quest.0,
                 flags: quest.1,
-                counters: [quest.2, quest.3, quest.4],
-                npc_ls_from: quest.5,
-                npc_ls_msg_step: quest.6,
+                counters: [quest.2, quest.3, quest.4, quest.5],
+                npc_ls_from: quest.6,
+                npc_ls_msg_step: quest.7,
                 queue: crate::lua::command::CommandQueue::new(),
             };
             (snapshot, handle)
@@ -6922,7 +6929,12 @@ impl PacketProcessor {
                 has_quest: true,
                 sequence: q.get_sequence(),
                 flags: q.get_flags(),
-                counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                counters: [
+                    q.get_counter(0),
+                    q.get_counter(1),
+                    q.get_counter(2),
+                    q.get_counter(3),
+                ],
                 npc_ls_from: q.get_npc_ls_from(),
                 npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 queue: crate::lua::command::CommandQueue::new(),
@@ -8392,7 +8404,12 @@ impl PacketProcessor {
                             has_quest: true,
                             sequence: q.get_sequence(),
                             flags: q.get_flags(),
-                            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                            counters: [
+                                q.get_counter(0),
+                                q.get_counter(1),
+                                q.get_counter(2),
+                                q.get_counter(3),
+                            ],
                             npc_ls_from: q.get_npc_ls_from(),
                             npc_ls_msg_step: q.get_npc_ls_msg_step(),
                             queue: crate::lua::command::CommandQueue::new(),
@@ -9658,7 +9675,12 @@ pub(crate) fn build_player_snapshot_from_character(
             quest_id: q.quest_id(),
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
         })

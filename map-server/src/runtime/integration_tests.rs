@@ -1842,19 +1842,20 @@ async fn save_quest_roundtrips_all_columns_through_load_quest_scenario() {
         /* counter1 */ 3,
         /* counter2 */ 12,
         /* counter3 */ 0xFFFF,
+        /* counter4 */ 0,
     )
     .await
     .unwrap();
 
     // Second slot — exercises the PK (characterId, slot) guard.
     let actor_aid_b = crate::actor::quest::quest_actor_id(110_020);
-    db.save_quest(101, 1, actor_aid_b, 0, 0, 0, 0, 0)
+    db.save_quest(101, 1, actor_aid_b, 0, 0, 0, 0, 0, 0)
         .await
         .unwrap();
 
     // Re-save slot 0 with new values — ON CONFLICT should update, not
     // duplicate.
-    db.save_quest(101, 0, actor_aid, 8, 0xFF, 9, 10, 11)
+    db.save_quest(101, 0, actor_aid, 8, 0xFF, 9, 10, 11, 12)
         .await
         .unwrap();
 
@@ -2032,7 +2033,7 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
             quest_id: 110_001,
             sequence: 0,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -2044,7 +2045,7 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
         has_quest: true,
         sequence: 0,
         flags: 0,
-        counters: [0; 3],
+        counters: [0; 4],
         npc_ls_from: 0,
         npc_ls_msg_step: 0,
         queue: CommandQueue::new(),
@@ -2116,7 +2117,7 @@ async fn ported_man0l0_seq000_marker_gating_follows_retail_order() {
                 quest_id: 110_001,
                 sequence: 0,
                 flags,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
             }],
@@ -2128,7 +2129,7 @@ async fn ported_man0l0_seq000_marker_gating_follows_retail_order() {
             has_quest: true,
             sequence: 0,
             flags,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
             queue: CommandQueue::new(),
@@ -2242,7 +2243,7 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
             quest_id: 110_001,
             sequence: 0,
             flags: 0xF, // all four mini-tutorial beats done — door armed
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -2254,7 +2255,7 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
         has_quest: true,
         sequence: 0,
         flags: 0xF,
-        counters: [0; 3],
+        counters: [0; 4],
         npc_ls_from: 0,
         npc_ls_msg_step: 0,
         queue: CommandQueue::new(),
@@ -2399,7 +2400,7 @@ async fn ported_man0l0_hob_handoff_starts_man0l1_inn_warp() {
             quest_id,
             sequence,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -2411,7 +2412,7 @@ async fn ported_man0l0_hob_handoff_starts_man0l1_inn_warp() {
         has_quest: true,
         sequence,
         flags: 0,
-        counters: [0; 3],
+        counters: [0; 4],
         npc_ls_from: 0,
         npc_ls_msg_step: 0,
         queue: CommandQueue::new(),
@@ -14043,7 +14044,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
             quest_id,
             sequence: 5,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -15205,7 +15206,7 @@ fn real_aetheryte_parent_attunement_advances_man0l1() {
             quest_id: 110_002,
             sequence: 3, // SEQ_003
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],

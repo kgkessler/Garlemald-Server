@@ -96,6 +96,7 @@ pub enum EventEvent {
         counter1: u16,
         counter2: u16,
         counter3: u16,
+        counter4: u16,
     },
     /// `SendGameMessage(worldmaster, text_id, 0x20, quest_id)` — sequence
     /// advance (25116), completion (25225), abandonment (25236).

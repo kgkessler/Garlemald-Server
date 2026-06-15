@@ -2256,7 +2256,12 @@ pub async fn apply_quest_mutation<F>(
         if q.is_dirty() {
             let sequence = q.get_sequence();
             let flags = q.get_flags();
-            let counters = [q.get_counter(0), q.get_counter(1), q.get_counter(2)];
+            let counters = [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ];
             let actor_id = q.actor_id;
             q.clear_dirty();
             Some((slot as i32, actor_id, sequence, flags, counters))
@@ -2264,9 +2269,9 @@ pub async fn apply_quest_mutation<F>(
             None
         }
     };
-    if let Some((slot, actor_id, sequence, flags, [c1, c2, c3])) = save_tuple
+    if let Some((slot, actor_id, sequence, flags, [c1, c2, c3, c4])) = save_tuple
         && let Err(e) = db
-            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3)
+            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3, c4)
             .await
     {
         tracing::warn!(
@@ -2323,7 +2328,7 @@ pub async fn apply_add_quest(
     };
     let (slot, actor_id) = save_tuple;
     if let Err(e) = db
-        .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0)
+        .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0, 0)
         .await
     {
         tracing::warn!(
@@ -3537,7 +3542,7 @@ async fn advance_regional_leves(
     // Collect dirty-slot save work under the write lock, then drop
     // the lock before awaiting the DB so a slow disk write doesn't
     // hold the player's character lock.
-    let pending_saves: Vec<(i32, u32, u32, u32, [u16; 3], u32)> = {
+    let pending_saves: Vec<(i32, u32, u32, u32, [u16; 4], u32)> = {
         let mut c = handle.character.write().await;
         let mut saves = Vec::new();
         for &leve_id in leve_ids {
@@ -3564,6 +3569,7 @@ async fn advance_regional_leves(
                     quest.get_counter(0),
                     quest.get_counter(1),
                     quest.get_counter(2),
+                    quest.get_counter(3),
                 ];
                 let actor_id = quest.actor_id;
                 quest.clear_dirty();
@@ -3572,9 +3578,9 @@ async fn advance_regional_leves(
         }
         saves
     };
-    for (slot, actor_id, sequence, flags, [c1, c2, c3], leve_id) in pending_saves {
+    for (slot, actor_id, sequence, flags, [c1, c2, c3, c4], leve_id) in pending_saves {
         if let Err(e) = db
-            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3)
+            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3, c4)
             .await
         {
             tracing::warn!(
@@ -3880,7 +3886,7 @@ pub async fn apply_accept_regional_leve(
     // (progress starts fresh), counter2 = band (difficulty),
     // counter3 = 0 (reserved).
     if let Err(e) = db
-        .save_quest(player_id, slot, actor_id, 0, flags, 0, band as u16, 0)
+        .save_quest(player_id, slot, actor_id, 0, flags, 0, band as u16, 0, 0)
         .await
     {
         tracing::warn!(
@@ -4957,7 +4963,12 @@ pub async fn apply_quest_on_notice(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -4975,7 +4986,12 @@ pub async fn apply_quest_on_notice(
             has_quest: true,
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
@@ -5517,7 +5533,12 @@ async fn fire_quest_npc_hook_via_command(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -5532,7 +5553,12 @@ async fn fire_quest_npc_hook_via_command(
             has_quest: true,
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
@@ -5726,7 +5752,12 @@ pub async fn fire_quest_on_talk_via_command(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -5744,7 +5775,12 @@ pub async fn fire_quest_on_talk_via_command(
             has_quest: true,
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
@@ -5909,7 +5945,12 @@ async fn fire_quest_hook(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -5924,12 +5965,17 @@ async fn fire_quest_hook(
                 (
                     q.get_sequence(),
                     q.get_flags(),
-                    [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     q.get_npc_ls_from(),
                     q.get_npc_ls_msg_step(),
                 )
             })
-            .unwrap_or((0, 0, [0; 3], 0, 0));
+            .unwrap_or((0, 0, [0; 4], 0, 0));
         let handle = crate::lua::LuaQuestHandle {
             player_id: snap.actor_id,
             quest_id,

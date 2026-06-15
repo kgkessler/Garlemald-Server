@@ -205,6 +205,7 @@ pub async fn dispatch_event_event(
             counter1,
             counter2,
             counter3,
+            counter4,
         } => {
             if let Err(e) = db
                 .save_quest(
@@ -216,6 +217,7 @@ pub async fn dispatch_event_event(
                     *counter1,
                     *counter2,
                     *counter3,
+                    *counter4,
                 )
                 .await
             {
@@ -463,7 +465,12 @@ async fn dispatch_npc_event_started(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -802,7 +809,12 @@ async fn dispatch_director_event_started(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })

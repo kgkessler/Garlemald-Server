@@ -2069,7 +2069,7 @@ impl Database {
             .call_db(move |c| {
                 let mut stmt = c.prepare(
                     r"SELECT slot, questId, sequence, flags, counter1, counter2, counter3,
-                              npc_ls_from, npc_ls_msg_step
+                              counter4, npc_ls_from, npc_ls_msg_step
                       FROM characters_quest_scenario WHERE characterId = :cid",
                 )?;
                 let rows: Vec<QuestScenarioEntry> = stmt
@@ -2082,8 +2082,9 @@ impl Database {
                             counter1: r.get::<_, u16>(4).unwrap_or_default(),
                             counter2: r.get::<_, u16>(5).unwrap_or_default(),
                             counter3: r.get::<_, u16>(6).unwrap_or_default(),
-                            npc_ls_from: r.get::<_, u32>(7).unwrap_or_default(),
-                            npc_ls_msg_step: r.get::<_, u8>(8).unwrap_or_default(),
+                            counter4: r.get::<_, u16>(7).unwrap_or_default(),
+                            npc_ls_from: r.get::<_, u32>(8).unwrap_or_default(),
+                            npc_ls_msg_step: r.get::<_, u8>(9).unwrap_or_default(),
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -2369,6 +2370,7 @@ impl Database {
         counter1: u16,
         counter2: u16,
         counter3: u16,
+        counter4: u16,
     ) -> Result<()> {
         let qid = 0xF_FFFFu32 & quest_actor_id;
         self.conn
@@ -2376,16 +2378,17 @@ impl Database {
                 c.execute(
                     r"INSERT INTO characters_quest_scenario
                         (characterId, slot, questId, sequence, flags,
-                         counter1, counter2, counter3)
+                         counter1, counter2, counter3, counter4)
                       VALUES (:cid, :slot, :qid, :seq, :flags,
-                              :c1, :c2, :c3)
+                              :c1, :c2, :c3, :c4)
                       ON CONFLICT(characterId, slot) DO UPDATE SET
                         questId  = excluded.questId,
                         sequence = excluded.sequence,
                         flags    = excluded.flags,
                         counter1 = excluded.counter1,
                         counter2 = excluded.counter2,
-                        counter3 = excluded.counter3",
+                        counter3 = excluded.counter3,
+                        counter4 = excluded.counter4",
                     named_params! {
                         ":cid": chara_id,
                         ":slot": slot,
@@ -2395,6 +2398,7 @@ impl Database {
                         ":c1": counter1,
                         ":c2": counter2,
                         ":c3": counter3,
+                        ":c4": counter4,
                     },
                 )?;
                 Ok(())

@@ -386,6 +386,9 @@ pub struct QuestScenarioEntry {
     pub counter1: u16,
     pub counter2: u16,
     pub counter3: u16,
+    /// 4th counter (migration 062) — pmeteor `QuestData.counter4`.
+    /// man0l1 SEQ_040 (CNTR_SEQ40_FSH = index 3) needs it. (Garlemald-Server #46.)
+    pub counter4: u16,
     /// Per-quest NpcLs scratchpad (migration 050). 0 = no chain
     /// active. See `actor::quest::QuestData::npc_ls_from`.
     pub npc_ls_from: u32,

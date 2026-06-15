@@ -93,7 +93,12 @@ pub async fn fire_on_kill_bnpc(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -144,7 +149,7 @@ pub async fn fire_on_kill_bnpc(
                     s.npc_ls_msg_step,
                 )
             })
-            .unwrap_or((0, 0, [0; 3], 0, 0));
+            .unwrap_or((0, 0, [0; 4], 0, 0));
         let handle = crate::lua::LuaQuestHandle {
             player_id: snapshot.actor_id,
             quest_id,

@@ -1524,7 +1524,7 @@ mod tests {
                 quest_id: 110_001,
                 sequence: 0,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
             }],
@@ -1539,7 +1539,7 @@ mod tests {
             has_quest: true,
             sequence: 0,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
             queue,
@@ -1727,7 +1727,7 @@ mod tests {
             has_quest: true,
             sequence: 3, // SEQ_003
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 1,
             npc_ls_msg_step: 1,
             queue: CommandQueue::new(),
@@ -1794,7 +1794,7 @@ mod tests {
             has_quest: true,
             sequence: 3, // SEQ_003
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 1,
             npc_ls_msg_step: 1,
             queue: CommandQueue::new(),
@@ -1844,7 +1844,7 @@ mod tests {
         assert!(script_path.exists());
         let engine = LuaEngine::new(root);
 
-        let handle_at = |sequence: u32, counters: [u16; 3]| userdata::LuaQuestHandle {
+        let handle_at = |sequence: u32, counters: [u16; 4]| userdata::LuaQuestHandle {
             player_id: 42,
             quest_id: 110_002,
             has_quest: true,
@@ -1855,7 +1855,7 @@ mod tests {
             npc_ls_msg_step: 0,
             queue: CommandQueue::new(),
         };
-        let markers = |sequence: u32, counters: [u16; 3]| {
+        let markers = |sequence: u32, counters: [u16; 4]| {
             engine
                 .call_quest_getter(
                     &script_path,
@@ -1868,22 +1868,22 @@ mod tests {
         use common::luaparam::LuaParam::Int32;
 
         // SEQ_003: Camp Bearded Rock attunement → base+2.
-        assert_eq!(markers(3, [0; 3]), vec![Int32(11_000_102)]);
+        assert_eq!(markers(3, [0; 4]), vec![Int32(11_000_102)]);
         // SEQ_007 fresh: both guild errands outstanding → CUL + MSK.
         assert_eq!(
-            markers(7, [0; 3]),
+            markers(7, [0; 4]),
             vec![Int32(11_000_103), Int32(11_000_104)],
         );
         // SEQ_007 after the Balloonfish sale (CUL counter=1, slot 1) and
         // the MSK Echo exit (MSK counter=4, slot 2): no markers left.
-        assert_eq!(markers(7, [0, 1, 4]), vec![]);
+        assert_eq!(markers(7, [0, 1, 4, 0]), vec![]);
         // SEQ_048: Zephyr Gate muster → base+6.
-        assert_eq!(markers(48, [0; 3]), vec![Int32(11_000_106)]);
+        assert_eq!(markers(48, [0; 4]), vec![Int32(11_000_106)]);
         // SEQ_050 (escort instance) and SEQ_070 (linkshell beat): none.
-        assert_eq!(markers(50, [0; 3]), vec![]);
-        assert_eq!(markers(70, [0; 3]), vec![]);
+        assert_eq!(markers(50, [0; 4]), vec![]);
+        assert_eq!(markers(70, [0; 4]), vec![]);
         // SEQ_092: back to Baderon → base+1.
-        assert_eq!(markers(92, [0; 3]), vec![Int32(11_000_101)]);
+        assert_eq!(markers(92, [0; 4]), vec![Int32(11_000_101)]);
 
         // getJournalInformation: (0, CUL*5, MSK*5) from the SEQ_007
         // counters.
@@ -1892,7 +1892,7 @@ mod tests {
                 &script_path,
                 "getJournalInformation",
                 sample_snapshot(),
-                handle_at(7, [0, 1, 4]),
+                handle_at(7, [0, 1, 4, 0]),
             )
             .expect("info getter should run");
         assert_eq!(info, vec![Int32(0), Int32(5), Int32(20)]);
@@ -3861,7 +3861,7 @@ mod tests {
             quest_id: 110_005,
             sequence: 5,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }];
@@ -4128,7 +4128,7 @@ mod tests {
             quest_id: 110_001,
             sequence: 10, // SEQ_010 — Limsa port, talking to Hob
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }];
@@ -4158,7 +4158,7 @@ mod tests {
                 has_quest: true,
                 sequence: 10,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
                 queue: CommandQueue::new(),
@@ -4201,7 +4201,7 @@ mod tests {
             quest_id: 110_002,
             sequence: 0,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }];
@@ -4215,7 +4215,7 @@ mod tests {
                 has_quest: true,
                 sequence: 0,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
                 queue: CommandQueue::new(),
@@ -4272,7 +4272,7 @@ mod tests {
                 quest_id,
                 sequence: 0,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
             }];
@@ -4286,7 +4286,7 @@ mod tests {
                     has_quest: true,
                     sequence: 0,
                     flags: 0,
-                    counters: [0; 3],
+                    counters: [0; 4],
                     npc_ls_from: 0,
                     npc_ls_msg_step: 0,
                     queue: CommandQueue::new(),

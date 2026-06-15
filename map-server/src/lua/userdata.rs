@@ -457,7 +457,7 @@ pub struct QuestStateSnapshot {
     pub quest_id: u32,
     pub sequence: u32,
     pub flags: u32,
-    pub counters: [u16; 3],
+    pub counters: [u16; 4],
     /// Migration-050 NpcLs scratchpad — read by `LuaQuestHandle`'s
     /// `NewNpcLsMsg` / `ReadNpcLsMsg` / `EndOfNpcLsMsgs` to know
     /// which NPC linkshell is driving the active message chain.
@@ -627,7 +627,12 @@ impl From<&crate::actor::Player> for PlayerSnapshot {
                 quest_id: q.quest_id(),
                 sequence: q.get_sequence(),
                 flags: q.get_flags(),
-                counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                counters: [
+                    q.get_counter(0),
+                    q.get_counter(1),
+                    q.get_counter(2),
+                    q.get_counter(3),
+                ],
                 npc_ls_from: q.get_npc_ls_from(),
                 npc_ls_msg_step: q.get_npc_ls_msg_step(),
             })
@@ -2525,7 +2530,7 @@ impl UserData for LuaPlayer {
                     quest_id: id,
                     sequence: 0,
                     flags: 0,
-                    counters: [0; 3],
+                    counters: [0; 4],
                     npc_ls_from: 0,
                     npc_ls_msg_step: 0,
                 });
@@ -2611,7 +2616,7 @@ impl UserData for LuaPlayer {
                         quest_id: *qid,
                         sequence: 0,
                         flags: 0,
-                        counters: [0; 3],
+                        counters: [0; 4],
                         npc_ls_from: 0,
                         npc_ls_msg_step: 0,
                     });
@@ -2649,7 +2654,7 @@ impl UserData for LuaPlayer {
                             quest_id: qid,
                             sequence: 0,
                             flags: 0,
-                            counters: [0; 3],
+                            counters: [0; 4],
                             npc_ls_from: 0,
                             npc_ls_msg_step: 0,
                         });
@@ -4842,7 +4847,7 @@ pub struct LuaQuestHandle {
     /// Mirror of `QuestData.flags`.
     pub flags: u32,
     /// Mirror of `QuestData.counters`.
-    pub counters: [u16; 3],
+    pub counters: [u16; 4],
     /// Mirror of `QuestData.npc_ls_from` — set by `Quest::NewNpcLsMsg`,
     /// read by `ReadNpcLsMsg` / `EndOfNpcLsMsgs` to know which NPC LS
     /// to flip back to ACTIVE / INACTIVE state.
@@ -5247,7 +5252,7 @@ pub struct LuaQuestDataHandle {
     pub player_id: u32,
     pub quest_id: u32,
     pub flags: u32,
-    pub counters: [u16; 3],
+    pub counters: [u16; 4],
     pub npc_ls_from: u32,
     pub npc_ls_msg_step: u8,
     pub queue: Arc<Mutex<CommandQueue>>,
