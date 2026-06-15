@@ -2036,7 +2036,19 @@ pub(crate) async fn apply_do_zone_change(
         };
         old_region == new_region
     };
-    if same_region {
+    // Defer ONLY for a genuine cross-zone change within the same region (the
+    // 230 → 133 Drowning Wench case the pacing was added for). A SAME-zone warp
+    // — entering/leaving a private-area instance (WarpToPrivate/PublicArea, both
+    // 230 → 230) or an in-zone reposition (the MSK "go downstairs") — must flush
+    // immediately, exactly like a cold login does. The 6 s deferral on a
+    // same-zone warp leaves the client interactive in a half-transitioned state
+    // for 6 s; any input during that window (man0l1 SEQ_040: the player talks to
+    // Sisipu again after the hand-signal cutscene) corrupts the instance-exit and
+    // the client hangs on "Now Loading" — it never sends the 0x0007 zone-in-
+    // complete. pmeteor never defers; the deferral is "retail parity, not a
+    // proven client requirement". (Garlemald-Server #46.)
+    let defer_same_region = same_region && old_zone_id != zone_id;
+    if defer_same_region {
         const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
         let fire_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -242,13 +242,31 @@ pub fn build_reset_head(actor_id: u32) -> SubPacket {
     SubPacket::new(OP_RESET_HEAD, actor_id, body(0x28))
 }
 
-/// 0x00E1 ActorDoEmotePacket.
+/// 0x00E1 ActorDoEmotePacket — port of pmeteor `ActorDoEmotePacket.cs`.
+///
+/// `animation_id` is the bare emote id the script passes (e.g. 5 = /bow). The
+/// client expects it packed as `realAnimID = 0x5000000 | (animation_id << 12)`
+/// — writing the raw id makes the client resolve the description text (so the
+/// "You bow…" log line still prints) but play NO animation. Also mirrors
+/// pmeteor's `targetedActorId == 0` fallback (retarget to self + bump the
+/// description id, except the 10105 "generic" id). (Garlemald-Server #46.)
 pub fn build_actor_do_emote(
     actor_id: u32,
-    real_anim_id: u32,
+    animation_id: u32,
     targeted_actor_id: u32,
     description_id: u32,
 ) -> SubPacket {
+    let (targeted_actor_id, description_id) = if targeted_actor_id == 0 {
+        let desc = if description_id != 10105 {
+            description_id + 1
+        } else {
+            description_id
+        };
+        (actor_id, desc)
+    } else {
+        (targeted_actor_id, description_id)
+    };
+    let real_anim_id = 0x0500_0000 | (animation_id << 12);
     let mut data = body(0x30);
     let mut c = Cursor::new(&mut data[..]);
     c.write_u32::<LittleEndian>(real_anim_id).unwrap();
@@ -1134,6 +1152,47 @@ mod reset_head_tests {
         assert!(pkt.data.iter().all(|b| *b == 0));
         assert_eq!(pkt.game_message.opcode, OP_RESET_HEAD);
         assert_eq!(pkt.header.source_id, 0x44D0_35D5);
+    }
+}
+
+#[cfg(test)]
+mod do_emote_tests {
+    use super::*;
+
+    /// The bare emote id must be packed as `0x5000000 | (id << 12)` (pmeteor
+    /// `ActorDoEmotePacket`). Writing the raw id makes the client print the
+    /// description text but play no animation. (Garlemald-Server #46.)
+    #[test]
+    fn animation_id_is_packed() {
+        let pkt = build_actor_do_emote(0x0000_0001, 5, 0x4730_00D8, 21041);
+        assert_eq!(pkt.game_message.opcode, OP_ACTOR_DO_EMOTE);
+        let real = u32::from_le_bytes([pkt.data[0], pkt.data[1], pkt.data[2], pkt.data[3]]);
+        assert_eq!(real, 0x0500_0000 | (5u32 << 12), "realAnimID = 0x5005000");
+        // target + description pass through unchanged when target != 0.
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[4], pkt.data[5], pkt.data[6], pkt.data[7]]),
+            0x4730_00D8
+        );
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[8], pkt.data[9], pkt.data[10], pkt.data[11]]),
+            21041
+        );
+    }
+
+    /// target == 0 retargets to self and bumps the description id (pmeteor).
+    #[test]
+    fn target_zero_falls_back_to_self() {
+        let pkt = build_actor_do_emote(0x0000_0001, 5, 0, 21041);
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[4], pkt.data[5], pkt.data[6], pkt.data[7]]),
+            0x0000_0001,
+            "retargets to source actor"
+        );
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[8], pkt.data[9], pkt.data[10], pkt.data[11]]),
+            21042,
+            "description id +1"
+        );
     }
 }
 
