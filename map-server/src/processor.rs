@@ -7215,7 +7215,7 @@ impl PacketProcessor {
                         .as_ref()
                         .map(|a| (a.director_actor_id, a.parent_zone_id))
                 });
-                if let Some((director_actor_id, parent_zone_id)) = reveal {
+                if let Some((director_actor_id, _parent_zone_id)) = reveal {
                     let roster = {
                         let mut roster: Vec<u32> = Vec::new();
                         if let Some(mut snap) = self.world.session(source).await {
@@ -7233,23 +7233,16 @@ impl PacketProcessor {
                         roster
                     };
                     // Reveal Sisipu + the ankle biters now that the client is
-                    // in the instance. spawn_bundle_fanout no-ops for the
-                    // non-renderable director entry and the player's own actor.
-                    if let Some(zone) = self.world.zone(parent_zone_id).await {
-                        for member_id in roster {
-                            if member_id == source || member_id == director_actor_id {
-                                continue;
-                            }
-                            crate::runtime::dispatcher::spawn_bundle_fanout(
-                                &self.world,
-                                &self.registry,
-                                &zone,
-                                parent_zone_id,
-                                member_id,
-                            )
-                            .await;
-                        }
-                    }
+                    // in the instance, via the proven push_npc_spawn path
+                    // (direct send to the player). Skip the player's own actor
+                    // and the non-renderable director entry.
+                    let npc_ids: Vec<u32> = roster
+                        .into_iter()
+                        .filter(|&id| id != source && id != director_actor_id)
+                        .collect();
+                    self.world
+                        .reveal_content_npcs(&self.registry, self.lua.as_ref(), source, &npc_ids)
+                        .await;
                     tracing::info!(
                         session = source,
                         "content warp acked — roster revealed, onUpdate driver unparked",

@@ -419,7 +419,7 @@ fn quest_push_overrides(character: &crate::actor::Character) -> HashMap<u32, boo
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_npc_spawn(
+pub(crate) fn push_npc_spawn(
     subpackets: &mut Vec<common::subpacket::SubPacket>,
     character: &crate::actor::Character,
     zone_name: &str,
@@ -1281,6 +1281,76 @@ impl WorldManager {
             session.is_updates_locked = false;
         }
         Ok(())
+    }
+
+    /// Stream a set of already-spawned content NPCs into one player's view
+    /// via the proven `push_npc_spawn` path (the exact builder
+    /// `send_zone_in_bundle` uses for neighbours — full ActorInstantiate +
+    /// appearance/name/state tail that actually RENDERS), sent DIRECTLY to the
+    /// player's client (target-tagged), independent of the spatial grid.
+    ///
+    /// Used by the man0l1 escort's post-warp content reveal: the escort NPCs
+    /// (Sisipu + ankle biters) are kept out of the warp bundle and revealed
+    /// here once the client has zoned back in from the entry cutscene, so they
+    /// stream in AFTER the player (matching retail). Replaces
+    /// `spawn_bundle_fanout`, whose `build_add_actor(flag 0)` grid-broadcast
+    /// never rendered them. (Garlemald-Server #46.)
+    pub async fn reveal_content_npcs(
+        &self,
+        registry: &ActorRegistry,
+        lua: Option<&Arc<crate::lua::LuaEngine>>,
+        session_id: u32,
+        npc_ids: &[u32],
+    ) {
+        let Some(client) = self.client(session_id).await else {
+            return;
+        };
+        let Some(player_handle) = registry.by_session(session_id).await else {
+            return;
+        };
+        let zone_id = { player_handle.character.read().await.base.zone_id };
+        let Some(zone_arc) = self.zone(zone_id).await else {
+            return;
+        };
+        let zone_name = { zone_arc.read().await.core.zone_name.clone() };
+        let mut revealed: Vec<u32> = Vec::new();
+        for &npc_id in npc_ids {
+            let Some(handle) = registry.get(npc_id).await else {
+                continue;
+            };
+            let mut npc_bundle = Vec::new();
+            {
+                let character = handle.character.read().await;
+                push_npc_spawn(
+                    &mut npc_bundle,
+                    &character,
+                    &zone_name,
+                    /* priv_level */ 0,
+                    /* in_private_area */ false,
+                    lua,
+                    Some(handle.kind),
+                    /* push_enabled */ None,
+                );
+            }
+            for mut sub in npc_bundle {
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+            revealed.push(npc_id);
+        }
+        // Mark them present so the continuous `send_instance_update` streaming
+        // doesn't re-AddActor them on the first walk-tick.
+        if !revealed.is_empty() {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                s.actor_instance_list.extend(revealed.iter().copied());
+            }
+        }
+        tracing::info!(
+            session = session_id,
+            count = revealed.len(),
+            "content NPCs revealed to player via push_npc_spawn (direct send)",
+        );
     }
 
     /// Port of `Player.SendZoneInPackets(world, spawnType)`. This is the
