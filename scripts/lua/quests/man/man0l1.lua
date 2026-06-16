@@ -778,7 +778,13 @@ end
 
 function startMan0l1Content(player, quest)
 	quest:StartSequence(SEQ_050);
-	player:EndEvent();
+	-- NO player:EndEvent() here. A packet-level diff vs pmeteor's working
+	-- SEQ_005 warp burst showed garlemald's only pre-kick divergences were a
+	-- stray 0x0131 EndEvent (this call) and the party trio (Sisipu's onCreate
+	-- party-add) — pmeteor emits neither before the kick (it ends the trigger
+	-- event at burst END, like its talkDefault). The reload-gating packets
+	-- (0x00E2/SetMap/0x00CE) are byte-equivalent to pmeteor; the EndEvent fires
+	-- post-warp in QuestDirectorMan0l101:onEventStarted instead. (Garlemald #46.)
 
 	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
 

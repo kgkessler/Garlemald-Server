@@ -60,9 +60,12 @@ function onCreate(starterPlayer, contentArea, director)
 		mobs[i]:ChangeState(2);
 	end
 
-	-- Party-add the escort so her HP bar lights the HUD roster;
-	-- ContentFinished clears the transient roster at teardown.
-	starterPlayer.currentParty:AddMember(sisipu.actorId);
+	-- NO party-add here. onCreate runs PRE-warp, and a currentParty:AddMember
+	-- broadcasts a content/party group trio (0x017C/D/F/E) referencing Sisipu
+	-- before the client has spawned her — a pre-kick divergence from pmeteor's
+	-- working SEQ_005 warp burst (which emits no party trio pre-kick). The HUD
+	-- HP-bar party-add is a cosmetic follow-up to wire post-warp once the warp
+	-- itself is solid. (Garlemald-Server #46.)
 
 	-- No-fail guarantees: retail fails the escort when Sisipu dies and
 	-- restarts it; garlemald's first cut floors her (and the player)
