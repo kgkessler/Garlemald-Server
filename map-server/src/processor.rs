@@ -2434,20 +2434,26 @@ impl PacketProcessor {
         {
             let mut zone = zone_arc.write().await;
             let mut ob = crate::zone::outbox::AreaOutbox::new();
+            let spawn_pos =
+                common::Vector3::new(spawn.position_x, spawn.position_y, spawn.position_z);
             zone.core.add_actor(
                 crate::zone::area::StoredActor {
                     actor_id,
                     kind: crate::zone::area::ActorKind::BattleNpc,
-                    position: common::Vector3::new(
-                        spawn.position_x,
-                        spawn.position_y,
-                        spawn.position_z,
-                    ),
+                    position: spawn_pos,
                     grid: (0, 0),
                     is_alive: true,
                 },
                 &mut ob,
             );
+            // Project into the correct spatial-grid cell. `add_actor` stores
+            // grid (0,0); `actors_around` / `broadcast_around_actor` read the
+            // grid cell, not the raw position — so without this the NPC sits in
+            // cell (0,0) and the post-warp content reveal's spawn_bundle_fanout
+            // finds no nearby player and the NPC never renders (until its first
+            // MoveActorToPosition happens to fix the cell). (Garlemald-Server #46.)
+            zone.core
+                .update_actor_position(actor_id, spawn_pos, &mut ob);
         }
 
         // 6. Register the live Character in the ActorRegistry.
