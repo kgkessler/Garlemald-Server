@@ -3081,6 +3081,20 @@ impl PacketProcessor {
             return;
         }
 
+        // Project the PLAYER into the correct spatial-grid cell. The helper
+        // re-inserts the player at grid (0,0); broadcast_around_actor (the
+        // post-warp content reveal) keys on the grid CELL, so without this the
+        // player sits in cell (0,0) while the escort NPCs are at the gate, and
+        // the reveal's spawn_bundle_fanout finds no nearby player → the NPCs
+        // never render. Normal warps self-correct via the deferred bundle / the
+        // player's first position update, but the instant spawnType-0x16 warp
+        // reveals immediately on RX 0x0007, before that happens. (Garlemald #46.)
+        if let Some(zone_arc) = self.world.zone(parent_zone_id).await {
+            let mut zw = zone_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            zw.core.update_actor_position(actor_id, spawn, &mut ob);
+        }
+
         // 3. Update the session's spawn_type / destination fields. The
         //    helper above set zone + xyz/rot but not the spawn_type
         //    arg the bundle uses.
