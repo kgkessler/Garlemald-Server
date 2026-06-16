@@ -1,0 +1,24 @@
+-- Garlemald-Server #46 (Man0l1 "Treasures of the Main" — Zephyr Gate
+-- escort): re-home the escort BattleNpc groups to zone 128.
+--
+-- Migration 064 moved these groups to zone 141 (sea0Field01a) for the
+-- since-abandoned "warp into a separate instance zone" approach. That
+-- approach could never clear the client's "Now Loading" overlay: 141 reuses
+-- zone 128's Lower La Noscea map, and the 1.x client only dismisses the
+-- overlay when it loads a DIFFERENT map resource off disk — so a same-map
+-- instance warp hung forever (exhaustively bisected). The escort now runs
+-- OPEN-FIELD in the player's current zone (128) with no warp at all: the
+-- content area is built on the player's CurrentArea and DoZoneChangeContent
+-- takes an in-place reveal path (processor.rs apply_do_zone_change_content)
+-- that spawns the escort NPCs where they stand and emits none of the
+-- loading-screen packets. This matches the real 2010 quest (no loading
+-- transition).
+--
+-- The spawn loader (database.rs load_battle_npc_spawn) keys only on bnpcId,
+-- and the spawn zone is taken from the content area's parent zone, so this
+-- groupId.zoneId is metadata only — but it should agree with where the
+-- escort actually runs (128), reverting 064's 141.
+--
+-- Idempotent UPDATE; no schema change.
+
+UPDATE "server_battlenpc_groups" SET "zoneId" = 128 WHERE "groupId" IN (11, 12);

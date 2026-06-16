@@ -2993,7 +2993,7 @@ impl PacketProcessor {
         player_id: u32,
         parent_zone_id: u32,
         area_name: String,
-        _director_actor_id: u32,
+        director_actor_id: u32,
         spawn_type: u8,
         x: f32,
         y: f32,
@@ -3008,12 +3008,90 @@ impl PacketProcessor {
         let actor_id = handle.actor_id;
 
         // Capture the player's CURRENT zone before step 1 overwrites it —
-        // the same-region bundle-pacing decision below needs the old zone to
-        // compare regions (man0l1's escort warps 128 -> 141, both region 101).
+        // both the in-place check immediately below and the same-region
+        // bundle-pacing decision further down compare against it.
         let old_zone_id = {
             let c = handle.character.read().await;
             c.base.zone_id
         };
+
+        // ------------------------------------------------------------------
+        // OPEN-FIELD in-place reveal (Garlemald-Server #46). When the content
+        // area's parent zone IS the player's current zone (man0l1's Zephyr
+        // Gate escort: both 128, Lower La Noscea) there is no map to load —
+        // the player stays in the field. "Warping" into it would re-present
+        // the SAME map resource, which the 1.x client never reloads, so the
+        // "Now Loading" overlay hangs forever (exhaustively bisected: seamless
+        // bounce, deferred bundle, packet shape, kick all ruled out, and a
+        // genuine cross-zone hop only clears the overlay when the destination
+        // is a DIFFERENT map). The real 2010 quest had no loading transition
+        // either. So reveal the content NPCs where they already spawned (their
+        // spawn fan-out was suppressed during onCreate) and emit NONE of the
+        // loading-screen packets (0x00E2 latch / DeleteAllActors / zone-in
+        // bundle). The player is NOT repositioned — they're standing at the
+        // trigger on valid ground (avoids the seeded-height mid-air snap).
+        //
+        // Gated on NO pending entry-kick: the kick-driven content tutorials
+        // (man0g0 SEQ_005 et al.) ALSO build their content area on the player's
+        // current zone, but they fire a `noticeEvent` KickEvent to drive an
+        // entry cinematic + the client's loading-overlay clearer — they keep
+        // the existing warp path. man0l1's escort sends no kick (no entry
+        // cinematic), so it takes this reveal. A same-zone NO-kick content warp
+        // is exactly the hang bucket (no different map to load, no kick to clear
+        // the overlay), so anything else landing here was already stuck.
+        let in_place_reveal = old_zone_id == parent_zone_id
+            && self
+                .world
+                .session(session_id)
+                .await
+                .is_some_and(|s| s.pending_kick_event.is_none());
+        if in_place_reveal {
+            // Lift the pre-spawn broadcast suppression and read the content
+            // director's roster (populated by onCreate's director:AddMember).
+            let roster = {
+                let mut roster: Vec<u32> = Vec::new();
+                if let Some(mut snap) = self.world.session(session_id).await {
+                    if let Some(active) = snap.active_content_script.as_mut() {
+                        active.warp_complete = true;
+                    }
+                    roster = snap
+                        .transient_director_members
+                        .get(&director_actor_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.world.upsert_session(snap).await;
+                }
+                roster
+            };
+
+            // Reveal each content NPC (Sisipu + the ankle biters) by fanning
+            // its full spawn bundle out to the player, who is already a zone
+            // neighbour. spawn_bundle_fanout no-ops for the non-renderable
+            // director entry and skips the player's own actor.
+            if let Some(zone) = self.world.zone(parent_zone_id).await {
+                for member_id in roster {
+                    if member_id == actor_id || member_id == director_actor_id {
+                        continue;
+                    }
+                    crate::runtime::dispatcher::spawn_bundle_fanout(
+                        &self.world,
+                        &self.registry,
+                        &zone,
+                        parent_zone_id,
+                        member_id,
+                    )
+                    .await;
+                }
+            }
+
+            tracing::info!(
+                player = player_id,
+                zone = parent_zone_id,
+                area = %area_name,
+                "DoZoneChangeContent applied IN PLACE (open-field reveal; no loading screen)",
+            );
+            return;
+        }
 
         // 1. Update character position so subsequent reads + the zone-in
         //    bundle's `CreateSpawnPositionPacket` see the new coords.

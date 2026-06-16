@@ -805,16 +805,22 @@ function startMan0l1Content(player, quest)
 	-- a cross-zone warp; pmeteor's startMan0l1Content does the same with
 	-- StartDirector(true). Dropping the kick lets the overlay clear the
 	-- retail way.
-	-- Create the content area in zone 141 (sea0Field01a, region 101, the same
-	-- Lower La Noscea map as zone 128) rather than the player's current zone
-	-- (128). This makes the DoZoneChangeContent warp a genuine CROSS-zone load
-	-- (128 -> 141) — the one thing that makes the 1.x client do the real scene
-	-- load that dismisses "Now Loading". A same-zone content warp never
-	-- triggers it (the client skips the load when the zone is already
-	-- resident), which is why every prior same-zone attempt hung. Zone 141 is
-	-- a loaded, dependency-free field zone; the escort BNpcs are re-homed there
-	-- by migration 064. (Garlemald-Server #46.)
-	local contentArea = GetWorldManager():GetArea(141):CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
+	-- OPEN-FIELD escort (Garlemald-Server #46) — run the escort IN PLACE in
+	-- the player's current zone (Lower La Noscea, 128), NOT in an instanced
+	-- copy. Every instanced-warp attempt hung on "Now Loading": the 1.x client
+	-- only dismisses that overlay once it loads a DIFFERENT map resource off
+	-- disk, and a content instance reuses the parent zone's map (128 and the
+	-- ill-fated 141 sea0Field01a are the same Lower La Noscea map), so the
+	-- client had nothing to load and sat on the overlay forever — exhaustively
+	-- bisected (seamless bounce, deferred bundle, packet shape, kick all ruled
+	-- out). The real 2010 quest had no loading transition either (the Part 5
+	-- recording shows Sisipu just walking out of the gate). So: build the
+	-- content area on the player's CURRENT area and DoZoneChangeContent into
+	-- that SAME zone. The processor detects the in-place case (old_zone ==
+	-- parent_zone) and reveals the escort NPCs without any of the loading-screen
+	-- packets — the player never leaves the field. The content-area machinery is
+	-- still used for the 500 ms onUpdate escort driver + the director.
+	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
 
 	if (contentArea == nil) then
 		return;
@@ -824,6 +830,10 @@ function startMan0l1Content(player, quest)
 	player:AddDirector(director);
 	director:StartDirector(true);
 
+	-- In-place reveal: parent_zone == the player's current zone, so the
+	-- processor takes the no-loading-screen path. Coords are the gate road
+	-- start; the player is NOT repositioned (they're already standing at the
+	-- trigger on valid ground — avoids the seeded-height mid-air snap).
 	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
 end
 

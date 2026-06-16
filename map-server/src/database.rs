@@ -4556,9 +4556,10 @@ mod battle_npc_spawn_tests {
         assert_eq!(sisipu.actor_class_id, 2_290_007);
         assert_eq!(sisipu.script_name, "sisipu");
         assert_eq!(sisipu.allegiance, 1, "sisipu escorts as an ally");
-        // Re-homed to zone 141 (sea0Field01a) by migration 064 so the escort
-        // instance is a real cross-zone load. (Garlemald-Server #46.)
-        assert_eq!(sisipu.zone_id, 141);
+        // Re-homed to zone 128 by migration 065: the escort runs OPEN-FIELD in
+        // the player's current zone (no instance warp), reverting 064's 141.
+        // (Garlemald-Server #46.)
+        assert_eq!(sisipu.zone_id, 128);
 
         let biter = db
             .load_battle_npc_spawn(17)
@@ -4567,7 +4568,7 @@ mod battle_npc_spawn_tests {
             .expect("ankle biter row");
         assert_eq!(biter.actor_class_id, 2_205_603);
         assert_eq!(biter.allegiance, 0);
-        assert_eq!(biter.zone_id, 141);
+        assert_eq!(biter.zone_id, 128);
 
         // The migration's UPDATEs filled the stripped class rows.
         let sisipu_class = db
