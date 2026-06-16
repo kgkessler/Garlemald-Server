@@ -3007,6 +3007,14 @@ impl PacketProcessor {
         let session_id = handle.session_id;
         let actor_id = handle.actor_id;
 
+        // Capture the player's CURRENT zone before step 1 overwrites it —
+        // the same-region bundle-pacing decision below needs the old zone to
+        // compare regions (man0l1's escort warps 128 -> 141, both region 101).
+        let old_zone_id = {
+            let c = handle.character.read().await;
+            c.base.zone_id
+        };
+
         // 1. Update character position so subsequent reads + the zone-in
         //    bundle's `CreateSpawnPositionPacket` see the new coords.
         //    Also purge LOSE_ON_ZONING status effects — content-area
@@ -3315,31 +3323,84 @@ impl PacketProcessor {
             client.send_bytes(e2.to_bytes()).await;
         }
 
-        // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
-        //    the session + character we just updated, so the bundle
-        //    spawns the player at the content-area coords. `commit_keep_list
-        //    = true` so the old zone's actors are cleaned up via the trailing
-        //    Mass-Delete keep-list trio (the retail/working-warp shape) instead
-        //    of the fatal up-front bare wipe removed above. (Garlemald-Server #46.)
-        self.world
-            .send_zone_in_bundle(
-                &self.registry,
-                &self.db,
-                self.lua.as_ref(),
-                session_id,
-                spawn_type as u16,
-                /* commit_keep_list */ true,
-            )
-            .await;
-
-        // The bundle has now AddActor'd + state-synced the content NPCs on
-        // the client; lift the pre-warp suppression of roster broadcasts
-        // (see `ActiveContentScript::warp_complete`).
+        // Lift the pre-warp roster-broadcast suppression NOW (before the
+        // bundle dispatches — immediately or deferred — so it includes the
+        // content NPCs). `send_zone_in_bundle` reads `active_content_script`
+        // and AddActor's the content roster only once `warp_complete` is set.
         if let Some(mut snap) = self.world.session(session_id).await {
             if let Some(active) = snap.active_content_script.as_mut() {
                 active.warp_complete = true;
             }
             self.world.upsert_session(snap).await;
+        }
+
+        // 4. Dispatch the zone-in bundle — retail-paced, mirroring the WORKING
+        //    cross-zone warp (`apply_do_zone_change` / quest_apply.rs:2044).
+        //    `commit_keep_list = true` so the old zone's actors are cleaned up
+        //    via the trailing Mass-Delete keep-list trio (the retail shape)
+        //    instead of a fatal up-front bare wipe.
+        //
+        //    A content instance shares its parent zone's REGION (man0l1's
+        //    escort: 128 -> 141, both region 101), so this is a SAME-REGION
+        //    cross-zone change — exactly the case the working warp DEFERS the
+        //    bundle ~6 s behind the 0x00E2 latch for (the 230 -> 133 Drowning
+        //    Wench pacing). The deferral parks `pending_zone_in` on the session
+        //    (the game ticker fires the bundle) and, while parked, the position
+        //    handler holds the client's stale OLD-zone (128) coordinate reports
+        //    off the character so they can't relocate the warp destination
+        //    mid-load. Sending the bundle IMMEDIATELY for a same-region change
+        //    is the one combination that hangs "Now Loading": the client echoes
+        //    RX 0x0007 but never fires the cinematic EventStart and the overlay
+        //    never dismisses (live-verified — the 128 -> 141 escort warp hung on
+        //    immediate dispatch, while the 128 -> 230 / 230 -> 133 same-region
+        //    warps clear only WITH the deferral). A SAME-zone content change
+        //    (man0g0 SEQ_005: old == new) is excluded by `old != new` and keeps
+        //    the immediate flush. (Garlemald-Server #46.)
+        let same_region = {
+            let old_region = match self.world.zone(old_zone_id).await {
+                Some(z) => z.read().await.core.region_id,
+                None => 0,
+            };
+            let new_region = match self.world.zone(parent_zone_id).await {
+                Some(z) => z.read().await.core.region_id,
+                None => u16::MAX,
+            };
+            old_region == new_region
+        };
+        let defer_same_region = same_region && old_zone_id != parent_zone_id;
+        if defer_same_region {
+            const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
+            let fire_at_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                + RETAIL_ZONE_CHANGE_GAP_MS;
+            if let Some(mut snap) = self.world.session(session_id).await {
+                snap.pending_zone_in = Some(crate::data::PendingZoneIn {
+                    fire_at_unix_ms,
+                    spawn_type: spawn_type as u16,
+                    commit_keep_list: true,
+                    notify_private_area: false,
+                });
+                self.world.upsert_session(snap).await;
+            }
+            tracing::info!(
+                player = player_id,
+                zone = parent_zone_id,
+                old_zone = old_zone_id,
+                "DoZoneChangeContent: zone-in bundle deferred (retail same-region pacing)",
+            );
+        } else {
+            self.world
+                .send_zone_in_bundle(
+                    &self.registry,
+                    &self.db,
+                    self.lua.as_ref(),
+                    session_id,
+                    spawn_type as u16,
+                    /* commit_keep_list */ true,
+                )
+                .await;
         }
 
         // 5. B7 of the SEQ_005 unblock plan — fire the content
