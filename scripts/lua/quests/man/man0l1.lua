@@ -791,6 +791,16 @@ function startMan0l1Content(player, quest)
 	-- [+0xb9]==0 the cut's _waitForMapLoaded unblocks and fades the player back
 	-- in. (Garlemald-Server #46.)
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
+	-- Close the contentsJoinAskInBasaClass push event. Without this the
+	-- pushDefault event stays open (the director only EndEvents the separate
+	-- noticeEvent kick), and the client keeps the player in event mode — menus,
+	-- targeting and actions stay locked even though movement is free, which is
+	-- why the escort NPCs can't be targeted. (This EndEvent was dropped earlier
+	-- while chasing the reload hang; the warp now completes via spawnType 0x16,
+	-- independent of the event system, so it is safe to close here.) The cut
+	-- still plays — the client renders processEvent604 before processing the
+	-- EndEvent (proven by the earlier "cutscene then hang" runs). (Garlemald #46.)
+	player:EndEvent();
 
 	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
 
