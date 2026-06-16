@@ -2155,9 +2155,18 @@ impl WorldManager {
                     .into_iter()
                     .filter(|a| a.actor_id != actor_id)
                     .filter(|a| {
+                        // In a content instance the INITIAL warp bundle must be
+                        // the player's reload ONLY — bundling the content NPC
+                        // spawns into the same flush as the order-machine reload
+                        // crashes the client. They're revealed in a separate
+                        // flush once the client echoes its post-warp zone-in
+                        // (RX 0x0007 → `content_warp_acked`; see the handler's
+                        // spawn_bundle_fanout). After the ack (e.g. a later
+                        // re-bundle) the content band is kept. (Garlemald #46.)
                         !in_content_instance
                             || matches!(a.kind, crate::zone::area::ActorKind::Player)
-                            || (a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
+                            || ((a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
+                                && session.content_warp_acked)
                     })
                     .map(|a| (a.actor_id, a.kind))
                     .collect(),

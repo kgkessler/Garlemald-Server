@@ -3323,18 +3323,18 @@ impl PacketProcessor {
             client.send_bytes(e2.to_bytes()).await;
         }
 
-        // Lift the pre-warp roster-broadcast suppression NOW (before the
-        // bundle dispatches — immediately or deferred — so it includes the
-        // content NPCs). `send_zone_in_bundle` reads `active_content_script`
-        // and AddActor's the content roster only once `warp_complete` is set.
-        // Also reset `content_warp_acked`: the content `onUpdate` driver must
-        // stay parked until the client finishes loading into the instance and
-        // echoes its post-warp zone-in (RX 0x0007) — driving the escort before
-        // then fires actor packets at a still-loading client and crashes it.
+        // Keep `warp_complete` FALSE through the warp bundle: the bundle must
+        // be the PLAYER's reload ONLY (matching pmeteor's reference burst —
+        // SetMap → player AddActor/0x132×8/0x00D0/0x00CE → appearance/name).
+        // Bundling the 9 content NPC spawns into the warp (interleaved AFTER
+        // the player's 0x00CE order-machine arm, while the scene is mid-reload)
+        // crashes the client. The content roster is instead revealed AFTER the
+        // client finishes the load and echoes its post-warp zone-in — see the
+        // RX 0x0007 handler, which flips `warp_complete` + fans the roster out
+        // then. `content_warp_acked` also gates the escort `onUpdate` driver so
+        // it can't fire actor packets at a still-loading client.
+        // (Garlemald-Server #46.)
         if let Some(mut snap) = self.world.session(session_id).await {
-            if let Some(active) = snap.active_content_script.as_mut() {
-                active.warp_complete = true;
-            }
             snap.content_warp_acked = false;
             self.world.upsert_session(snap).await;
         }
@@ -7181,23 +7181,61 @@ impl PacketProcessor {
                     source = source,
                     "RX 0x0007 zone-in-complete signal (no-op pending dedicated handler)",
                 );
-                // Content-warp gate: once the client echoes its post-warp
-                // zone-in for an active content instance, mark the warp
-                // acked so the content `onUpdate` driver may start. Driving
-                // the escort before this fires actor packets at a still-
-                // loading client and crashes it. (Garlemald-Server #46.)
-                if let Some(mut snap) = self.world.session(source).await
-                    && snap
-                        .active_content_script
+                // Content-warp completion: the warp bundle ships the PLAYER's
+                // reload only; the content NPCs are deferred to here so they
+                // never ride the same flush as the order-machine reload (which
+                // crashes the client). On the client's first post-warp zone-in
+                // echo, flip `warp_complete`, reveal the content roster, and
+                // unpark the `onUpdate` driver. The code at sub.data+0x14 is
+                // 0xFFFFFFFF on the terminal echo and a progress value earlier;
+                // we only need the FIRST one here — the reveal/escort run in a
+                // separate flush from the reload either way. (Garlemald #46.)
+                let reveal = self.world.session(source).await.and_then(|snap| {
+                    if snap.content_warp_acked {
+                        return None;
+                    }
+                    snap.active_content_script
                         .as_ref()
-                        .is_some_and(|a| a.warp_complete)
-                    && !snap.content_warp_acked
-                {
-                    snap.content_warp_acked = true;
-                    self.world.upsert_session(snap).await;
+                        .map(|a| (a.director_actor_id, a.parent_zone_id))
+                });
+                if let Some((director_actor_id, parent_zone_id)) = reveal {
+                    let roster = {
+                        let mut roster: Vec<u32> = Vec::new();
+                        if let Some(mut snap) = self.world.session(source).await {
+                            if let Some(active) = snap.active_content_script.as_mut() {
+                                active.warp_complete = true;
+                            }
+                            snap.content_warp_acked = true;
+                            roster = snap
+                                .transient_director_members
+                                .get(&director_actor_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.world.upsert_session(snap).await;
+                        }
+                        roster
+                    };
+                    // Reveal Sisipu + the ankle biters now that the client is
+                    // in the instance. spawn_bundle_fanout no-ops for the
+                    // non-renderable director entry and the player's own actor.
+                    if let Some(zone) = self.world.zone(parent_zone_id).await {
+                        for member_id in roster {
+                            if member_id == source || member_id == director_actor_id {
+                                continue;
+                            }
+                            crate::runtime::dispatcher::spawn_bundle_fanout(
+                                &self.world,
+                                &self.registry,
+                                &zone,
+                                parent_zone_id,
+                                member_id,
+                            )
+                            .await;
+                        }
+                    }
                     tracing::info!(
                         session = source,
-                        "content warp acked by client — onUpdate driver unparked",
+                        "content warp acked — roster revealed, onUpdate driver unparked",
                     );
                 }
             }
