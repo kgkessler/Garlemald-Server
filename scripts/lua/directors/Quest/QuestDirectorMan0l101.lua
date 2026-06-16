@@ -24,6 +24,13 @@ end
 function onEventStarted(player, actor, triggerName)
 	man0l1Quest = player:GetQuest("Man0l1");
 
+	-- Entry cutscene (man0l604): the kick (startMan0l1Content's KickEvent)
+	-- delivered this onEventStarted only AFTER the same-map content warp
+	-- reloaded the scene, so processEvent604's startFadeInCutSceneAfterWarp
+	-- fade resolves cleanly here (it could never play pre-warp). This is the
+	-- Sisipu "let's head to Oschon's Torch" muster beat the player expects.
+	callClientFunction(player, "delegateEvent", player, man0l1Quest, "processEvent604");
+
 	-- Close the notice kick's event context; the escort walk runs free
 	-- (no client event open) until the arrival beat below.
 	player:EndEvent();

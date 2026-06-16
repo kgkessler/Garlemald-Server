@@ -778,55 +778,8 @@ end
 
 function startMan0l1Content(player, quest)
 	quest:StartSequence(SEQ_050);
-	-- NO processEvent604 entry cutscene here. The client's man0l604 cutscene
-	-- is authored as a `startFadeInCutSceneAfterWarp` (confirmed in the
-	-- decompiled client script meteor-decomp/build/lpb/Man0l1.luac, proto#59):
-	-- it fades in ONLY after a real, different-map zone load completes. The
-	-- open-field escort never warps, so that fade-in would wait forever and the
-	-- client hangs on "Now Loading" (the symptom chased across 8 rounds — the
-	-- hang was never the warp, it was this warp-gated cutscene). The entry
-	-- cutscene is therefore dropped; the contentsJoinAskInBasaClass confirm
-	-- (a plain Yes/No, no fade) already gave the player the muster beat. The
-	-- ARRIVAL cutscene (processEvent605 — also after-warp) still plays at the
-	-- end, where there IS a real warp to the lighthouse echo. (Garlemald #46.)
 	player:EndEvent();
 
-	-- Content-start shape: retail / pmeteor form — StartDirector(true), NO
-	-- noticeEvent KickEvent and NO SetLoginDirector. The 4th arg is the
-	-- CONTENT SCRIPT name: the upstream port passed "SimpleContent30002",
-	-- which in garlemald is the Limsa deck tutorial's script (one VM per
-	-- script path — reusing it would run the tutorial's onCreate against the
-	-- escort area).
-	--
-	-- Why no kick (Garlemald-Server #46): the man0l0 doExitDoor flow this
-	-- previously copied fires a noticeEvent kick, which ARMS the client's
-	-- "JustInArea" loading-overlay suppression (event_type 5). The overlay
-	-- then only clears if the noticeEvent script drives the client clearer
-	-- (MyPlayer:_fadeInNowLoadingForNoticeEventJustInArea, vtable slot 66) —
-	-- a path the deck tutorials reach through their entry CUTSCENE, but which
-	-- the no-cutscene escort cannot (RunEventFunction can't invoke that
-	-- MyPlayer method — confirmed live: the call shipped but the client
-	-- ignored it and stayed on "Now Loading"). Retail content/leve warps
-	-- send ZERO kicks (ffxiv_traces/*.pcapng) and clear the overlay from the
-	-- normal zone-in (0x0005 SetMyActor + 0x0007 ZoneIn) bundle, exactly like
-	-- a cross-zone warp; pmeteor's startMan0l1Content does the same with
-	-- StartDirector(true). Dropping the kick lets the overlay clear the
-	-- retail way.
-	-- OPEN-FIELD escort (Garlemald-Server #46) — run the escort IN PLACE in
-	-- the player's current zone (Lower La Noscea, 128), NOT in an instanced
-	-- copy. Every instanced-warp attempt hung on "Now Loading": the 1.x client
-	-- only dismisses that overlay once it loads a DIFFERENT map resource off
-	-- disk, and a content instance reuses the parent zone's map (128 and the
-	-- ill-fated 141 sea0Field01a are the same Lower La Noscea map), so the
-	-- client had nothing to load and sat on the overlay forever — exhaustively
-	-- bisected (seamless bounce, deferred bundle, packet shape, kick all ruled
-	-- out). The real 2010 quest had no loading transition either (the Part 5
-	-- recording shows Sisipu just walking out of the gate). So: build the
-	-- content area on the player's CURRENT area and DoZoneChangeContent into
-	-- that SAME zone. The processor detects the in-place case (old_zone ==
-	-- parent_zone) and reveals the escort NPCs without any of the loading-screen
-	-- packets — the player never leaves the field. The content-area machinery is
-	-- still used for the 500 ms onUpdate escort driver + the director.
 	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
 
 	if (contentArea == nil) then
@@ -835,12 +788,19 @@ function startMan0l1Content(player, quest)
 
 	local director = contentArea:GetContentDirector();
 	player:AddDirector(director);
-	director:StartDirector(true);
+	director:StartDirector(false);
 
-	-- In-place reveal: parent_zone == the player's current zone, so the
-	-- processor takes the no-loading-screen path. Coords are the gate road
-	-- start; the player is NOT repositioned (they're already standing at the
-	-- trigger on valid ground — avoids the seeded-height mid-air snap).
+	-- The KickEvent delivers the entry cutscene AFTER the warp completes: the
+	-- client echoes EventStart(noticeEvent) once the same-map reload finishes,
+	-- firing QuestDirectorMan0l101:onEventStarted, which plays processEvent604
+	-- (man0l604 is startFadeInCutSceneAfterWarp — it can ONLY fade in post-warp)
+	-- and then drives the escort. Mirrors the proven man0g0 SEQ_005 doContentArea.
+	player:KickEvent(director, "noticeEvent", true);
+	player:SetLoginDirector(director);
+
+	-- Same-map content warp (parent_zone == current zone 128): the 0x00E2
+	-- force-reload latch + 0x00CE isZoning order machine reload Lower La Noscea
+	-- in place (the "teleport into the duty" animation, spawnType 16).
 	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
 end
 
