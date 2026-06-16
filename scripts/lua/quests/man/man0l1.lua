@@ -778,13 +778,19 @@ end
 
 function startMan0l1Content(player, quest)
 	quest:StartSequence(SEQ_050);
-	-- NO player:EndEvent() here. A packet-level diff vs pmeteor's working
-	-- SEQ_005 warp burst showed garlemald's only pre-kick divergences were a
-	-- stray 0x0131 EndEvent (this call) and the party trio (Sisipu's onCreate
-	-- party-add) — pmeteor emits neither before the kick (it ends the trigger
-	-- event at burst END, like its talkDefault). The reload-gating packets
-	-- (0x00E2/SetMap/0x00CE) are byte-equivalent to pmeteor; the EndEvent fires
-	-- post-warp in QuestDirectorMan0l101:onEventStarted instead. (Garlemald #46.)
+
+	-- Play the Sisipu entry cutscene NOW, before the warp. man0l604 is a
+	-- `startFadeInCutSceneAfterWarp` cut: it fades out, plays, then blocks on
+	-- `_waitForMapLoaded` (MapLayoutElement [+0xb9]) until the map "finishes
+	-- loading", then fades in. For a SAME-MAP duty the geometry is already
+	-- resident, so we must NOT schedule a reload (no 0x00E2 latch → [+0xb9]
+	-- stays 0) and we finish the zone-in instantly via spawnType 0x16 (the
+	-- client's instant zone-in-complete bypass — decompiled in
+	-- captures/issue28-rca, the only 0x00CE path that emits RX 0x0007
+	-- 0xFFFFFFFF without arming the order machine or touching [+0xb9]). With
+	-- [+0xb9]==0 the cut's _waitForMapLoaded unblocks and fades the player back
+	-- in. (Garlemald-Server #46.)
+	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
 
 	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
 
@@ -804,10 +810,13 @@ function startMan0l1Content(player, quest)
 	player:KickEvent(director, "noticeEvent", true);
 	player:SetLoginDirector(director);
 
-	-- Same-map content warp (parent_zone == current zone 128): the 0x00E2
-	-- force-reload latch + 0x00CE isZoning order machine reload Lower La Noscea
-	-- in place (the "teleport into the duty" animation, spawnType 16).
-	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
+	-- Same-map content warp. spawnType 0x16 (22) = the client's instant
+	-- zone-in-complete bypass: reposition the player + emit RX 0x0007
+	-- 0xFFFFFFFF immediately, NO order-machine reload (the map is already
+	-- resident — no "Now Loading"). Paired with the no-latch warp in
+	-- apply_do_zone_change_content so [+0xb9] stays 0 and the entry cut's
+	-- _waitForMapLoaded unblocks. (Garlemald-Server #46.)
+	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 22);
 end
 
 function getJournalInformation(player, quest)

@@ -3298,30 +3298,26 @@ impl PacketProcessor {
             client.send_bytes(msg.to_bytes()).await;
         }
 
-        // DeleteAllActors (despawn) → 0x00E2(0x10) latch — the pmeteor
-        // SEQ_005 content-warp recipe, decomp-proven in
-        // captures/issue28-rca/03-decomp-reload.md §5 (Recipe 1) and matching
-        // the observed retail flow (Now Loading → cutscene → Now Loading →
-        // teleport back in): the player + scene are despawned, the map reloads,
-        // and the player is re-AddActor'd by the warp bundle below.
+        // DeleteAllActors (despawn) ONLY — NO 0x00E2 force-reload latch.
         //
-        // The leading DeleteAllActors had been dropped (commit 25b3b64, "fatal
-        // on same-region"). That was a misdiagnosis: garlemald was sending it
-        // WITHOUT set_target_id, so the world-server proxy dropped every
-        // target_id==0 subpacket and the client never received it — the wipe
-        // was never actually tested. pmeteor sends it on this exact same-region
-        // warp (RCA §5) and the reload completes. Sent target-tagged here so it
-        // reaches the client. Subcode 0x10 is pmeteor's SEQ_005 value (the RCA
-        // notes any subcode except 0x15/0x16 sets the latch). (Garlemald #46.)
+        // Decompiled in captures/issue28-rca: the 0x00E2 latch makes a
+        // same-region SetMap SCHEDULE a reload, which sets MapLayoutElement
+        // [+0xb9] (map-load-in-progress) = 1. For a SAME-MAP duty the geometry
+        // is already resident, so the client's level streamer never re-streams
+        // and NOTHING ever clears [+0xb9] back to 0 (there is no server packet
+        // that can — the only [+0xb9]=0 writers are world teardown). The order
+        // machine escapes its own [+0xb9] wait via a 30s timeout, but the entry
+        // cutscene's `_waitForMapLoaded` has NO timeout and blocks on [+0xb9]==0
+        // forever — THE "Now Loading" hang. So we must NOT schedule a reload:
+        // omit the latch, leave [+0xb9] at the clean post-login 0, and finish
+        // the zone-in instantly via the spawnType-0x16 0x00CE (see the
+        // Lua-side DoZoneChangeContent and the bundle below). DeleteAllActors
+        // still fires to despawn the public-zone actors for the cut.
+        // (Garlemald-Server #46.)
         {
             let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
             wipe.set_target_id(session_id);
             client.send_bytes(wipe.to_bytes()).await;
-        }
-        {
-            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
-            e2.set_target_id(session_id);
-            client.send_bytes(e2.to_bytes()).await;
         }
 
         // Keep `warp_complete` FALSE through the warp bundle: the bundle must
