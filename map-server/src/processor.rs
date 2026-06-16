@@ -7243,9 +7243,22 @@ impl PacketProcessor {
                     self.world
                         .reveal_content_npcs(&self.registry, self.lua.as_ref(), source, &npc_ids)
                         .await;
+                    // Party-add the ally (Sisipu) POST-reveal so she gets a
+                    // targetable party nameplate + HP bar in the HUD (retail
+                    // shows her there). Done after the reveal so the party
+                    // group trio references an actor the client already has
+                    // spawned (the pre-warp party-add was dropped because the
+                    // client had no Sisipu yet). (Garlemald-Server #46.)
+                    for &npc_id in &npc_ids {
+                        if let Some(h) = self.registry.get(npc_id).await
+                            && matches!(h.kind, crate::runtime::actor_registry::ActorKindTag::Ally)
+                        {
+                            self.apply_party_add_member(source, npc_id).await;
+                        }
+                    }
                     tracing::info!(
                         session = source,
-                        "content warp acked — roster revealed, onUpdate driver unparked",
+                        "content warp acked — roster revealed, ally party-added, driver unparked",
                     );
                 }
             }
