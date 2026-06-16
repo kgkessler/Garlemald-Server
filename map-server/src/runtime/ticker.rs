@@ -364,6 +364,14 @@ impl GameTicker {
                 let Some(active) = session.active_content_script.clone() else {
                     continue;
                 };
+                // Park the content driver until the client has finished
+                // loading into the instance (it echoed its post-warp zone-in,
+                // setting `content_warp_acked`). Driving the escort/combat
+                // before then fires actor packets at a still-loading client
+                // and crashes it. (Garlemald-Server #46.)
+                if !session.content_warp_acked {
+                    continue;
+                }
                 let script_path = lua.resolver().content(&active.content_script);
                 if !script_path.exists() {
                     continue;

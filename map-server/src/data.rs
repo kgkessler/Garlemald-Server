@@ -140,6 +140,15 @@ pub struct Session {
     /// periodically — that's what drives ally engagement AI in the
     /// combat tutorial. B6 of the SEQ_005 unblock plan.
     pub active_content_script: Option<ActiveContentScript>,
+    /// `true` once the client has acknowledged the content-warp's post-warp
+    /// zone-in (an `RX 0x0007` arriving while `active_content_script` is set
+    /// with `warp_complete`). Gates the content `onUpdate` driver: until the
+    /// client has actually finished loading into the instance, driving the
+    /// content (moving escort NPCs, starting combat) fires actor packets at a
+    /// still-loading client, which crashes it (man0l1 #46 — the escort walks
+    /// Sisipu immediately, unlike SEQ_005 which waits for input). Reset to
+    /// `false` when a new content warp dispatches. (Garlemald-Server #46.)
+    pub content_warp_acked: bool,
     /// Secondary zone the player is currently *merged* with at a
     /// seamless boundary strip (C# `Player.zone2`). `Some(z)` while
     /// straddling the merge box of the `current_zone_id`↔`z` boundary;

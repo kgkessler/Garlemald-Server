@@ -26,6 +26,9 @@ cargo build --workspace $flag
 
 mkdir -p "$REPO_ROOT/logs"
 export GARLEMALD_PACKET_LOG_DIR="${GARLEMALD_PACKET_LOG_DIR:-$REPO_ROOT/logs/packet-logs}"
+# Capture pre-encryption (plaintext) bytes so warp bundles can be diffed
+# against the reference pmeteor captures when debugging content warps.
+export GARLEMALD_PACKET_LOG_PLAINTEXT="${GARLEMALD_PACKET_LOG_PLAINTEXT:-1}"
 mkdir -p "$GARLEMALD_PACKET_LOG_DIR"
 
 pids=()

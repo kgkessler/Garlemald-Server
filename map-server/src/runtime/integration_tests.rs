@@ -12250,6 +12250,7 @@ async fn ticker_survives_tutorial_state_and_drains_time_parks() {
         .upsert_session(MapSession {
             id: 1,
             current_zone_id: 166,
+            content_warp_acked: true,
             active_content_script: Some(crate::data::ActiveContentScript {
                 parent_zone_id: 166,
                 area_name: "man0g01".to_string(),
@@ -12696,6 +12697,7 @@ async fn apply_content_finished_tears_down_content_state() {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -12879,6 +12881,7 @@ async fn content_on_update_send_signal_resumes_parked_coroutine() {
         .upsert_session(MapSession {
             id: session_id,
             current_zone_id: 166,
+            content_warp_acked: true,
             active_content_script: Some(crate::data::ActiveContentScript {
                 parent_zone_id: 166,
                 area_name: "man0g01".to_string(),
@@ -13111,6 +13114,7 @@ async fn s2_5_content_onupdate_engages_roster_and_reengages_on_death() {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -13672,6 +13676,7 @@ async fn kill_gate_scene() -> KillGateScene {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -14045,6 +14050,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),

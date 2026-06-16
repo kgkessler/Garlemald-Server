@@ -3327,10 +3327,15 @@ impl PacketProcessor {
         // bundle dispatches — immediately or deferred — so it includes the
         // content NPCs). `send_zone_in_bundle` reads `active_content_script`
         // and AddActor's the content roster only once `warp_complete` is set.
+        // Also reset `content_warp_acked`: the content `onUpdate` driver must
+        // stay parked until the client finishes loading into the instance and
+        // echoes its post-warp zone-in (RX 0x0007) — driving the escort before
+        // then fires actor packets at a still-loading client and crashes it.
         if let Some(mut snap) = self.world.session(session_id).await {
             if let Some(active) = snap.active_content_script.as_mut() {
                 active.warp_complete = true;
             }
+            snap.content_warp_acked = false;
             self.world.upsert_session(snap).await;
         }
 
@@ -7176,6 +7181,25 @@ impl PacketProcessor {
                     source = source,
                     "RX 0x0007 zone-in-complete signal (no-op pending dedicated handler)",
                 );
+                // Content-warp gate: once the client echoes its post-warp
+                // zone-in for an active content instance, mark the warp
+                // acked so the content `onUpdate` driver may start. Driving
+                // the escort before this fires actor packets at a still-
+                // loading client and crashes it. (Garlemald-Server #46.)
+                if let Some(mut snap) = self.world.session(source).await
+                    && snap
+                        .active_content_script
+                        .as_ref()
+                        .is_some_and(|a| a.warp_complete)
+                    && !snap.content_warp_acked
+                {
+                    snap.content_warp_acked = true;
+                    self.world.upsert_session(snap).await;
+                    tracing::info!(
+                        session = source,
+                        "content warp acked by client — onUpdate driver unparked",
+                    );
+                }
             }
             OP_RX_LOCK_TARGET => {
                 // 66 events/session. Wiki: "Target Locked". Client
