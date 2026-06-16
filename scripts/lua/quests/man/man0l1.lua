@@ -778,10 +778,17 @@ end
 
 function startMan0l1Content(player, quest)
 	quest:StartSequence(SEQ_050);
-	-- "Cutscene for the start of the escort content" (wiki event table)
-	-- — plays before the instance warp, like man0l0's pre-content
-	-- processEvent000_2.
-	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
+	-- NO processEvent604 entry cutscene here. The client's man0l604 cutscene
+	-- is authored as a `startFadeInCutSceneAfterWarp` (confirmed in the
+	-- decompiled client script meteor-decomp/build/lpb/Man0l1.luac, proto#59):
+	-- it fades in ONLY after a real, different-map zone load completes. The
+	-- open-field escort never warps, so that fade-in would wait forever and the
+	-- client hangs on "Now Loading" (the symptom chased across 8 rounds — the
+	-- hang was never the warp, it was this warp-gated cutscene). The entry
+	-- cutscene is therefore dropped; the contentsJoinAskInBasaClass confirm
+	-- (a plain Yes/No, no fade) already gave the player the muster beat. The
+	-- ARRIVAL cutscene (processEvent605 — also after-warp) still plays at the
+	-- end, where there IS a real warp to the lighthouse echo. (Garlemald #46.)
 	player:EndEvent();
 
 	-- Content-start shape: retail / pmeteor form — StartDirector(true), NO
