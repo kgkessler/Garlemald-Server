@@ -3298,27 +3298,28 @@ impl PacketProcessor {
             client.send_bytes(msg.to_bytes()).await;
         }
 
-        // 0x00E2(0x02) force-reload latch ONLY — NO leading DeleteAllActors.
+        // DeleteAllActors (despawn) → 0x00E2(0x10) latch — the pmeteor
+        // SEQ_005 content-warp recipe, decomp-proven in
+        // captures/issue28-rca/03-decomp-reload.md §5 (Recipe 1) and matching
+        // the observed retail flow (Now Loading → cutscene → Now Loading →
+        // teleport back in): the player + scene are despawned, the map reloads,
+        // and the player is re-AddActor'd by the warp bundle below.
         //
-        // This now mirrors the WORKING cross-zone warp (apply_do_zone_change /
-        // quest_apply.rs:2022-2042). That path's comment is explicit: a bare
-        // 0x0007 wipe-all ahead of the bundle deletes the player's own actor
-        // mid-scene — "tolerated on cross-region warps (the region mismatch
-        // forces a clean scene rebuild) but FATAL on a same-region map change."
-        // The content warp IS a same-region change (the instance shares the
-        // parent's region 101), so the leading wipe was the killer: the client
-        // reloaded the scene + echoed RX 0x0007 (verified on the wire) but the
-        // "Now Loading" overlay never dismissed. The in-repo client decomp
-        // (captures/issue28-rca/03-decomp-reload.md) confirms the zone-actor
-        // field is NOT a reload discriminator — the latch (0x00E2) + the
-        // keep-list-commit scene rebuild is. Retail does the old-actor cleanup
-        // via the Mass-Delete KEEP-LIST at the END of the bundle (the exempt
-        // lists name every just-spawned actor incl. the player), NOT a bare
-        // up-front wipe. Subcode 0x02 is the full-zone-change latch value
-        // retail/pmeteor use (0x10 is the in-place variant the prior shape
-        // tried). (Garlemald-Server #46.)
+        // The leading DeleteAllActors had been dropped (commit 25b3b64, "fatal
+        // on same-region"). That was a misdiagnosis: garlemald was sending it
+        // WITHOUT set_target_id, so the world-server proxy dropped every
+        // target_id==0 subpacket and the client never received it — the wipe
+        // was never actually tested. pmeteor sends it on this exact same-region
+        // warp (RCA §5) and the reload completes. Sent target-tagged here so it
+        // reaches the client. Subcode 0x10 is pmeteor's SEQ_005 value (the RCA
+        // notes any subcode except 0x15/0x16 sets the latch). (Garlemald #46.)
         {
-            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
+            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            wipe.set_target_id(session_id);
+            client.send_bytes(wipe.to_bytes()).await;
+        }
+        {
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
             e2.set_target_id(session_id);
             client.send_bytes(e2.to_bytes()).await;
         }
