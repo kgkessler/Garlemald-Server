@@ -9024,11 +9024,30 @@ impl PacketProcessor {
             .await;
 
         // 3. Seamless-boundary check — may trigger a zone change or
-        //    a zone merge behind the scenes.
-        let seamless = self
-            .world
-            .seamless_check(actor_id, session_id, Vector3::new(pkt.x, pkt.y, pkt.z))
-            .await;
+        //    a zone merge behind the scenes. SKIPPED while the player is in a
+        //    content instance: the instance runs in a public field zone (the
+        //    man0l1 escort uses zone 141, sea0Field01a) and the instance warp
+        //    drops the player at a position that sits inside a public-world
+        //    seamless boundary box (the Zephyr Gate). Without this guard the
+        //    seamless check fires immediately after the cross-zone instance
+        //    warp and yanks the player straight back out (141 -> 128), undoing
+        //    the cross-zone load and hanging "Now Loading". A content instance
+        //    is an isolated copy, not the open world, so public-zone seamless
+        //    boundaries must not apply inside it. (Garlemald-Server #46.)
+        let in_content_instance = match self.world.session(session_id).await {
+            Some(s) => s
+                .active_content_script
+                .as_ref()
+                .is_some_and(|a| a.parent_zone_id == s.current_zone_id),
+            None => false,
+        };
+        let seamless = if in_content_instance {
+            crate::world_manager::SeamlessResult::None
+        } else {
+            self.world
+                .seamless_check(actor_id, session_id, Vector3::new(pkt.x, pkt.y, pkt.z))
+                .await
+        };
         // 3a. On a seamless zone CHANGE the registry handle's zone_id
         //     must follow (actors_in_zone / broadcast fan-out filter on
         //     it) and the new position persisted so a relog lands in the
