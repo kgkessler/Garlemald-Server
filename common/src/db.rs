@@ -139,7 +139,27 @@ pub async fn apply_migrations(conn: &Connection) -> Result<()> {
                     continue;
                 }
                 let started = Instant::now();
-                tx.execute_batch(sql)?;
+                match tx.execute_batch(sql) {
+                    Ok(()) => {}
+                    // The migration's schema change is already present — e.g. an
+                    // `ALTER TABLE ... ADD COLUMN` whose column exists because a
+                    // prior run applied it but the process died (or it was added
+                    // out-of-band) before the name was recorded in
+                    // `schema_migrations`. SQLite `ALTER` has no `IF NOT EXISTS`,
+                    // so a naive re-run aborts the whole batch and bricks startup
+                    // (every server that opens the shared DB dies ~1s in). Treat
+                    // "duplicate column name" as success: record the migration
+                    // and continue so a partially-migrated DB self-heals. Any
+                    // OTHER error still propagates and fails the boot loudly.
+                    Err(e) if is_already_satisfied(&e) => {
+                        tracing::warn!(
+                            migration = %name,
+                            error = %e,
+                            "migration's schema change already present; recording as applied and continuing",
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
                 tx.execute(
                     "INSERT INTO schema_migrations(name) VALUES(:n)",
                     named_params! { ":n": name },
@@ -166,6 +186,17 @@ pub async fn apply_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// True when a migration error means the change it makes is *already present*,
+/// so re-running it is a safe no-op rather than a failure. Currently this is
+/// SQLite's "duplicate column name" from an `ALTER TABLE ADD COLUMN` whose
+/// column already exists (ALTER has no `IF NOT EXISTS`). Scoped narrowly: any
+/// other error still aborts the migration pass.
+fn is_already_satisfied(e: &rusqlite::Error) -> bool {
+    e.to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate column name")
+}
+
 /// Extension trait that pins `E = rusqlite::Error` on the async `.call()`
 /// helper provided by `tokio_rusqlite::Connection`. Without it every closure
 /// body needs `Ok::<_, rusqlite::Error>(..)` annotations to satisfy the
@@ -188,5 +219,43 @@ impl ConnCallExt for Connection {
         R: Send + 'static,
     {
         async move { self.call(f).await.map_err(anyhow::Error::from) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Re-applying an `ALTER TABLE ADD COLUMN` whose column already exists must
+    /// be tolerated (this is the exact failure a re-run of an already-applied
+    /// migration hits — SQLite ALTER has no `IF NOT EXISTS`). Guards the boot
+    /// self-heal in `apply_migrations`. (Garlemald-Server #46.)
+    #[test]
+    fn duplicate_column_error_is_treated_as_already_satisfied() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE t (a INTEGER);").unwrap();
+        c.execute_batch("ALTER TABLE t ADD COLUMN b INTEGER;")
+            .unwrap();
+        let err = c
+            .execute_batch("ALTER TABLE t ADD COLUMN b INTEGER;")
+            .unwrap_err();
+        assert!(
+            is_already_satisfied(&err),
+            "duplicate column must be tolerated; got: {err}"
+        );
+    }
+
+    /// A genuine error (not a benign already-applied one) must NOT be swallowed
+    /// — the migration pass should still fail loudly.
+    #[test]
+    fn other_errors_are_not_tolerated() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        let err = c
+            .execute_batch("SELECT * FROM nonexistent_table;")
+            .unwrap_err();
+        assert!(
+            !is_already_satisfied(&err),
+            "a real error must not be swallowed; got: {err}"
+        );
     }
 }

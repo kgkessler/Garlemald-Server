@@ -103,14 +103,23 @@ pub fn build_set_notice_event_condition_raw(
 
 /// 0x016C `SetEmoteEventCondition` — port of `SetEmoteEventCondition.cs`.
 ///
-/// Layout (0x48 packet / 0x28 body):
-/// * 0x00: u8 unknown1 (4 in every Meteor capture).
-/// * 0x01: u16 emoteId (0x82, 0x76, 0x6E observed).
-/// * 0x03..0x27: ASCII condition name.
+/// Layout (0x48 packet / 0x28 body), matching pmeteor exactly:
+/// * 0x00: u8 = 4 (id type / priority — hardcoded in pmeteor).
+/// * 0x01: u8 unknown2.
+/// * 0x02: u16 emoteId (0x82, 0x76, 0x6E observed).
+/// * 0x04..0x28: ASCII condition name.
+///
+/// The earlier layout omitted the 0x01 `unknown2` byte and wrote `emoteId`
+/// at 0x01, shifting the emoteId (and the condition name) down one byte. The
+/// 1.x client then registered a garbled emote→condition map and never fired
+/// the emote `EventStart(eventType=3)` — so man0l1 SEQ_040's "do the hand
+/// signal" (emote at Sisipu, class 1000155) silently did nothing.
+/// (Garlemald-Server #46.)
 pub fn build_set_emote_event_condition(actor_id: u32, condition: &EmoteCondition) -> SubPacket {
     let mut data = body(0x48);
     let mut c = Cursor::new(&mut data[..]);
-    c.write_u8(condition.unknown1).unwrap();
+    c.write_u8(4).unwrap();
+    c.write_u8(condition.unknown2).unwrap();
     c.write_u16::<LittleEndian>(condition.emote_id as u16)
         .unwrap();
     write_condition_name(&mut c, &condition.condition_name);
@@ -240,4 +249,36 @@ pub fn build_event_condition_packets(
         out.push(build_set_push_box_event_condition(actor_id, cond));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::event_conditions::EmoteCondition;
+
+    /// Regression: the 0x016C emote-condition body must be
+    /// `[4, unknown2, emoteId_lo, emoteId_hi, name...]` (pmeteor
+    /// SetEmoteEventCondition.cs). A prior layout dropped the `unknown2`
+    /// byte, putting emoteId at 0x01 — the client then registered a garbled
+    /// emote→condition map and never fired the emote event (man0l1 SEQ_040
+    /// "do the hand signal" silently did nothing). (Garlemald-Server #46.)
+    #[test]
+    fn emote_condition_layout_matches_pmeteor() {
+        let cond = EmoteCondition {
+            condition_name: "emoteDefault1".to_string(),
+            unknown1: 4,
+            unknown2: 0,
+            emote_id: 105, // /bow
+        };
+        let pkt = build_set_emote_event_condition(0x4730_00D8, &cond);
+        assert_eq!(pkt.game_message.opcode, OP_SET_EMOTE_EVENT_CONDITION);
+        assert_eq!(pkt.data[0], 4, "0x00 = id-type/priority 4");
+        assert_eq!(pkt.data[1], 0, "0x01 = unknown2");
+        assert_eq!(
+            u16::from_le_bytes([pkt.data[2], pkt.data[3]]),
+            105,
+            "emoteId must sit at 0x02 so the client matches /bow (105)"
+        );
+        assert_eq!(&pkt.data[4..4 + 13], b"emoteDefault1", "name at 0x04");
+    }
 }

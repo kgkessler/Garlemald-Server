@@ -168,6 +168,56 @@ pub fn build_game_message_actor1(
     SubPacket::new(OP_GAME_MESSAGE_ACTOR1, source_actor_id, data)
 }
 
+/// pmeteor `GameMessagePacket.BuildPacket(sourceId, actorId,
+/// textOwnerActorId, textId, log, lParams)` — the WITH-LuaParams overload of
+/// `build_game_message_actor1` (GameMessagePacket.cs:100-145). The opcode is
+/// chosen by the serialized LuaParam byte size: `<= 0x8` → GameMessageWithActor2
+/// (0x0158, 0x38), `<= 0x10` → Actor3 (0x0159, 0x40), `<= 0x20` → Actor4
+/// (0x015A, 0x50), else Actor5 (0x015B, 0x70). Body layout is
+/// `[actorId u32][textOwnerActorId u32][textId u16][log u16][LuaParams]`, with
+/// a MANDATORY `u32 = 8` params-region marker at body offset 0x14 when the
+/// params are small (`<= 0x8` bytes) — the 1.23b client validates that marker
+/// (the same `_invalid_parameter` crash path the 0x0167 no-source tier hits if
+/// it's omitted). Used for quest "You obtain <item>" toasts (text 25117 + the
+/// item-id param) so the item name resolves instead of rendering blank.
+/// (Garlemald-Server #46.)
+pub fn build_game_message_actor1_with_params(
+    source_actor_id: u32,
+    actor_id: u32,
+    text_owner_actor_id: u32,
+    text_id: u16,
+    log: u8,
+    params: &[LuaParam],
+) -> SubPacket {
+    let mut pbytes = Vec::<u8>::new();
+    luaparam::write_lua_params(&mut pbytes, params).unwrap();
+    let (opcode, packet_size) = if pbytes.len() <= 0x8 {
+        (OP_GAME_MESSAGE_ACTOR2, 0x38usize)
+    } else if pbytes.len() <= 0x10 {
+        (OP_GAME_MESSAGE_ACTOR3, 0x40)
+    } else if pbytes.len() <= 0x20 {
+        (OP_GAME_MESSAGE_ACTOR4, 0x50)
+    } else {
+        (OP_GAME_MESSAGE_ACTOR5, 0x70)
+    };
+    let mut body_buf = Vec::<u8>::with_capacity(packet_size - 0x20);
+    body_buf.write_u32::<LittleEndian>(actor_id).unwrap();
+    body_buf
+        .write_u32::<LittleEndian>(text_owner_actor_id)
+        .unwrap();
+    body_buf.write_u16::<LittleEndian>(text_id).unwrap();
+    body_buf.write_u16::<LittleEndian>(log as u16).unwrap();
+    body_buf.extend_from_slice(&pbytes);
+    let mut data = body(packet_size);
+    data[..body_buf.len()].copy_from_slice(&body_buf);
+    // Small-params tier (Actor2): the client requires the `u32 = 8` marker at
+    // body offset 0x14 — pmeteor seeks to 0x14 and writes it after the params.
+    if pbytes.len() <= 0x8 {
+        data[0x14..0x18].copy_from_slice(&8u32.to_le_bytes());
+    }
+    SubPacket::new(opcode, source_actor_id, data)
+}
+
 // ---------------------------------------------------------------------------
 // 0x0166-0x016A "Text Sheet Message (No Source Actor)" family — system
 // messages routed through a static sender (WorldMaster, gamedata id, etc.)
@@ -576,6 +626,44 @@ pub fn build_text_sheet_dispid_x60(
     )
 }
 
+/// Auto-tier picker for the DispId-sender family — mirror of
+/// `build_text_sheet_no_source_auto`. Picks the smallest 0x0161-0x0165
+/// tier that fits the params (probing the serialized byte length), the
+/// same way pmeteor's `GameMessagePacket.BuildPacket` DispId overload
+/// selects its opcode. The man*l*1 NPC-linkshell narration passes NO
+/// params → the 0x0161 (30b) tier. (Garlemald-Server #46.)
+pub fn build_text_sheet_dispid_auto(
+    receiver_actor_id: u32,
+    disp_id: u32,
+    sender_actor_id: u32,
+    text_id: u16,
+    log_flag: u8,
+    lua_params: &[LuaParam],
+) -> SubPacket {
+    let mut probe = Vec::<u8>::new();
+    luaparam::write_lua_params(&mut probe, lua_params).unwrap();
+    let p_len = probe.len();
+    let builder = if p_len <= 4 {
+        build_text_sheet_dispid_x30
+    } else if p_len <= 12 {
+        build_text_sheet_dispid_x38
+    } else if p_len <= 20 {
+        build_text_sheet_dispid_x40
+    } else if p_len <= 36 {
+        build_text_sheet_dispid_x50
+    } else {
+        build_text_sheet_dispid_x60
+    };
+    builder(
+        receiver_actor_id,
+        disp_id,
+        sender_actor_id,
+        text_id,
+        log_flag,
+        lua_params,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_text_sheet_dispid_n(
     receiver_actor_id: u32,
@@ -823,6 +911,50 @@ mod tests {
             pkt.data[..],
             expected[..],
             "0x0167 body must byte-match the pmeteor reference capture",
+        );
+    }
+
+    /// Garlemald-Server #46 — the "You obtain <item>" toast (text 25117 +
+    /// item id 11000125) must carry the item-id LuaParam so the client
+    /// resolves the name (it was rendering "You obtain a ." because the
+    /// param was dropped). One small int param picks GameMessageWithActor2
+    /// (0x0158) and requires the `u32 = 8` marker at body 0x14.
+    #[test]
+    fn game_message_actor1_with_params_carries_item_id() {
+        let pkt = build_game_message_actor1_with_params(
+            WORLD_MASTER_ACTOR_ID, // source
+            2,                     // actorId (the player)
+            WORLD_MASTER_ACTOR_ID, // textOwnerActorId (system sheet)
+            25117,
+            0x20,
+            &[LuaParam::Int32(11_000_125)],
+        );
+        assert_eq!(pkt.game_message.opcode, OP_GAME_MESSAGE_ACTOR2);
+        assert_eq!(pkt.data.len(), 0x38 - 0x20);
+        assert_eq!(u32::from_le_bytes(pkt.data[0..4].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(pkt.data[4..8].try_into().unwrap()),
+            WORLD_MASTER_ACTOR_ID
+        );
+        assert_eq!(
+            u16::from_le_bytes(pkt.data[8..10].try_into().unwrap()),
+            25117
+        );
+        assert_eq!(
+            u16::from_le_bytes(pkt.data[10..12].try_into().unwrap()),
+            0x20
+        );
+        // Mandatory small-params-region marker at body offset 0x14.
+        assert_eq!(
+            u32::from_le_bytes(pkt.data[0x14..0x18].try_into().unwrap()),
+            8,
+            "the WITH-params game-message needs the u32=8 marker at 0x14",
+        );
+        // The item id must round-trip through the LuaParam region (offset 12).
+        let parsed = luaparam::read_lua_params(&pkt.data[12..]).unwrap();
+        assert!(
+            matches!(parsed.first(), Some(LuaParam::Int32(11_000_125))),
+            "item-id param must decode back to 11000125; got {parsed:?}",
         );
     }
 }

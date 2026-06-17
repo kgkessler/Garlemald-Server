@@ -205,6 +205,7 @@ pub async fn dispatch_event_event(
             counter1,
             counter2,
             counter3,
+            counter4,
         } => {
             if let Err(e) = db
                 .save_quest(
@@ -216,6 +217,7 @@ pub async fn dispatch_event_event(
                     *counter1,
                     *counter2,
                     *counter3,
+                    *counter4,
                 )
                 .await
             {
@@ -463,7 +465,12 @@ async fn dispatch_npc_event_started(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -482,105 +489,100 @@ async fn dispatch_npc_event_started(
     let npc_actor_id = owner_actor_id;
     let npc_zone_id = owner_handle.zone_id;
     let lua_params_owned: Vec<LuaParam> = lua_params.to_vec();
-    let _ = event_type; // Meteor's NPC dispatch ignores event_type for onEventStarted — eventName is what scripts branch on.
+    // NOTE: event_type is NOT passed to the NPC `onEventStarted` (Meteor's
+    // NPC dispatch omits it — scripts branch on eventName); it is only used
+    // for the inert-release EndEvent below.
 
+    // Run the NPC's `onEventStarted` INSIDE A COROUTINE (via the engine's
+    // director-hook helper), NOT a bare `f.call`. Conversational NPC scripts
+    // (`onEventStarted(player, npc, triggerName)`) call
+    // `callClientFunction(...)`, which does `coroutine.yield("_WAIT_EVENT")`;
+    // a direct call raises "attempt to yield from outside a coroutine", the
+    // talk event never completes, and the client stays modal → softlock
+    // (Garlemald-Server #46 — talking to a camp NPC e.g. Rhyssfloh).
+    // `spawn_director_on_event_started` spawns the hook as a Lua thread and
+    // parks it on the scheduler so the yield resumes on the client's 0x012E
+    // EventUpdate. We keep the populace NPC arg convention
+    // [player, npc, eventName, ...lparams] (NO eventType — unlike commands,
+    // real Npc base scripts are `onEventStarted(player, npc, triggerName)`).
     let result = tokio::task::spawn_blocking(move || {
-        let (lua_vm, queue) = match lua_clone.load_script(&script_path) {
-            Ok(pair) => pair,
-            Err(e) => {
-                return Err(format!("load_script failed: {e}"));
-            }
-        };
-        let globals = lua_vm.globals();
-        let Some(f): Option<mlua::Function> = globals.get("onEventStarted").ok() else {
-            // Quiet no-op — many NPC scripts only define `init()` /
-            // `main()` and rely on the global hook absence to skip.
-            return Ok((Vec::new(), None));
-        };
-
-        let player = crate::lua::userdata::LuaPlayer {
-            snapshot,
-            queue: queue.clone(),
-        };
-        let player_ud = lua_vm
-            .create_userdata(player)
-            .map_err(|e| format!("create_userdata(LuaPlayer): {e}"))?;
-        let npc = crate::lua::userdata::LuaNpc {
-            base: crate::lua::userdata::LuaActor {
-                actor_id: npc_actor_id,
-                name: class_name_owned.clone(),
-                class_name: class_name_owned,
-                class_path: class_path_owned,
-                unique_id: unique_id_owned,
-                zone_id: npc_zone_id,
-                zone_name: zone_name_owned,
-                state: npc_state,
-                pos: npc_pos,
-                rotation: npc_rot,
-                queue: queue.clone(),
-                // Event-dispatched NPCs are conversational, not
-                // combat — engagement defaults are correct.
-                is_engaged: false,
-                speed: 5.0,
-                target_actor_id: 0,
-            },
-            actor_class_id,
-            quest_graphic: 0,
-        };
-        let npc_ud = lua_vm
-            .create_userdata(npc)
-            .map_err(|e| format!("create_userdata(LuaNpc): {e}"))?;
-
-        let mut mv = MultiValue::new();
-        mv.push_back(Value::UserData(player_ud));
-        mv.push_back(Value::UserData(npc_ud));
-        // Meteor inserts `eventName` ahead of the original lparams (see
-        // `LuaEngine.EventStarted` `lparams.Insert(0, ...)`). That's
-        // what surfaces as the third script arg — `triggerName` in
-        // most NPC scripts.
-        mv.push_back(Value::String(
-            lua_vm
-                .create_string(&event_name_owned)
-                .map_err(|e| format!("create_string(eventName): {e}"))?,
-        ));
-        for p in &lua_params_owned {
-            let v = match p {
-                LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
-                LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
-                LuaParam::String(s) => Value::String(
+        lua_clone.spawn_director_on_event_started(
+            &script_path,
+            player_actor_id,
+            move |lua_vm, queue| {
+                let player = crate::lua::userdata::LuaPlayer {
+                    snapshot,
+                    queue: queue.clone(),
+                };
+                let player_ud = lua_vm
+                    .create_userdata(player)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+                let npc = crate::lua::userdata::LuaNpc {
+                    base: crate::lua::userdata::LuaActor {
+                        actor_id: npc_actor_id,
+                        name: class_name_owned.clone(),
+                        class_name: class_name_owned,
+                        class_path: class_path_owned,
+                        unique_id: unique_id_owned,
+                        zone_id: npc_zone_id,
+                        zone_name: zone_name_owned,
+                        state: npc_state,
+                        pos: npc_pos,
+                        rotation: npc_rot,
+                        queue: queue.clone(),
+                        // Event-dispatched NPCs are conversational, not
+                        // combat — engagement defaults are correct.
+                        is_engaged: false,
+                        speed: 5.0,
+                        target_actor_id: 0,
+                    },
+                    actor_class_id,
+                    quest_graphic: 0,
+                };
+                let npc_ud = lua_vm
+                    .create_userdata(npc)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaNpc): {e}"))?;
+                let mut mv = MultiValue::new();
+                mv.push_back(Value::UserData(player_ud));
+                mv.push_back(Value::UserData(npc_ud));
+                // Meteor inserts `eventName` ahead of the original lparams
+                // (LuaEngine.EventStarted `lparams.Insert(0, ...)`) — the
+                // third script arg (`triggerName`).
+                mv.push_back(Value::String(
                     lua_vm
-                        .create_string(s)
-                        .map_err(|e| format!("create_string(lparam): {e}"))?,
-                ),
-                LuaParam::True => Value::Boolean(true),
-                LuaParam::False => Value::Boolean(false),
-                LuaParam::Nil => Value::Nil,
-                LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
-                LuaParam::Type7 { actor_id, .. } => Value::Integer(*actor_id as mlua::Integer),
-                LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
-                LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
-                LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
-            };
-            mv.push_back(v);
-        }
-
-        let call_err = f.call::<Value>(mv).err().map(|e| format!("{e}"));
-        let commands = crate::lua::command::CommandQueue::drain(&queue);
-        Ok((commands, call_err))
+                        .create_string(&event_name_owned)
+                        .map_err(|e| anyhow::anyhow!("create_string(eventName): {e}"))?,
+                ));
+                for p in &lua_params_owned {
+                    let v = match p {
+                        LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
+                        LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
+                        LuaParam::String(s) => Value::String(
+                            lua_vm
+                                .create_string(s)
+                                .map_err(|e| anyhow::anyhow!("create_string(lparam): {e}"))?,
+                        ),
+                        LuaParam::True => Value::Boolean(true),
+                        LuaParam::False => Value::Boolean(false),
+                        LuaParam::Nil => Value::Nil,
+                        LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
+                        LuaParam::Type7 { actor_id, .. } => {
+                            Value::Integer(*actor_id as mlua::Integer)
+                        }
+                        LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
+                        LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
+                        LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
+                    };
+                    mv.push_back(v);
+                }
+                Ok(mv)
+            },
+        )
     })
     .await;
 
     let (commands, hook_err) = match result {
-        Ok(Ok((cmds, err))) => (cmds, err),
-        Ok(Err(setup_err)) => {
-            tracing::debug!(
-                error = %setup_err,
-                owner = owner_actor_id,
-                event = %event_name,
-                "NPC onEventStarted setup failed",
-            );
-            return;
-        }
+        Ok(r) => (r.commands, r.error.map(|e| format!("{e}"))),
         Err(join_err) => {
             tracing::warn!(
                 error = %join_err,
@@ -631,6 +633,62 @@ async fn dispatch_npc_event_started(
             Some(lua),
         )
         .await;
+    } else {
+        // Inert: the NPC/object script defined no handler for this event
+        // (empty command list, nothing parked) — e.g. an object push trigger
+        // whose `pushDefault` no quest claims at the current sequence. The
+        // client opened a modal event; without an EndEvent it stays modal and
+        // every further interaction is dropped → softlock. Release it,
+        // mirroring the owner-missing release above and the processor
+        // NPC-dispatch path. (Garlemald-Server #46.)
+        //
+        // BUT NOT for a CURRENT QUEST ENPC. `start_event` ALWAYS emits an
+        // `EventStarted` (even for a client-initiated push), which routes here
+        // and runs the owner's BASE populace `onEventStarted`. For a
+        // quest-claimed ENPC that base script has no handler for the event
+        // name (the quest owns it via `onTalk`/`onPush`/`onEmote`, fired
+        // separately in `handle_event_start`), so it emits empty commands and
+        // lands in this branch — but the quest hook is about to park a
+        // cutscene the client MUST keep open. man0l0 Rostnsthal's `pushDefault`
+        // is exactly this: the base `PopulaceStandard.onEventStarted` returns
+        // nothing while `quest:OnPush` drives the `processTtrNomal002`
+        // targeting tutorial. Releasing here closes the event out from under
+        // the tutorial → controls re-lock → softlock (the regression the
+        // entrance-push fix introduced). Only GENUINELY UNCLAIMED owners — the
+        // La Noscea→Limsa entrance push `1090004`, claimed by no quest at
+        // SEQ_005 — get the inert release. Mirrors the `is_quest_enpc` guard in
+        // `processor::dispatch_event_start_to_npc`, so the dispatcher and
+        // processor NPC paths treat quest ENPCs identically. (Garlemald-Server
+        // #46 — the entrance-push fix must NOT comingle with quest pushes.)
+        let is_quest_enpc = if let (Some(owner_h), Some(player_h)) = (
+            registry.get(owner_actor_id).await,
+            registry.get(player_actor_id).await,
+        ) {
+            let owner_class_id = owner_h.character.read().await.chara.actor_class_id;
+            let c = player_h.character.read().await;
+            c.quest_journal.slots.iter().flatten().any(|q| {
+                q.state
+                    .current
+                    .values()
+                    .any(|e| e.actor_class_id == owner_class_id)
+            })
+        } else {
+            false
+        };
+        if !is_quest_enpc
+            && let Some(player_handle) = registry.get(player_actor_id).await
+            && player_handle.session_id != 0
+            && let Some(client) = world.client(player_handle.session_id).await
+        {
+            let mut sub = crate::packets::send::events::build_end_event(
+                player_actor_id,
+                owner_actor_id,
+                event_name,
+                event_type,
+            );
+            sub.set_target_id(player_handle.session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
     }
 }
 
@@ -751,7 +809,12 @@ async fn dispatch_director_event_started(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })

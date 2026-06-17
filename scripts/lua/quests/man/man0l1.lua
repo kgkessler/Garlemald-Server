@@ -95,6 +95,29 @@ TRINNE					= 1000268;
 ECHO_EXIT_TRIGGER2		= 1090007;
 
 -- Quest Markers
+--
+-- Marker ids select rows in the client's quest_marker sheet (see
+-- pmeteor RequestQuestJournalCommand.lua: "Check the quest sheet and
+-- quest_marker sheet for valid entries for your quest"). The sibling
+-- quests follow a questId-suffix block convention (man0u0/110009 →
+-- 1100090x) EXCEPT the Limsa pair, which is swapped: man0l0 (110001)
+-- ships with the 1100020x block, so man0l1 (110002) takes 1100010x.
+-- The sheet lives client-side only — if the markers render in the
+-- wrong spots (or not at all), flip MRKR_BASE to 11000200, the only
+-- other candidate block. Indices are in quest beat order, the same
+-- ordering every sibling block uses. (Garlemald-Server #46)
+MRKR_BASE			= 11000100;
+MRKR_BADERON		= MRKR_BASE + 1;	-- SEQ_000/005/006/092: Baderon at the Drowning Wench
+MRKR_BEARDED_ROCK	= MRKR_BASE + 2;	-- SEQ_003: Camp Bearded Rock aetheryte
+MRKR_CUL_GUILD		= MRKR_BASE + 3;	-- SEQ_007: Charlys at the Bismarck
+MRKR_MSK_GUILD		= MRKR_BASE + 4;	-- SEQ_007: Isandorel at Naldiq & Vymelli's
+MRKR_FSH_GUILD		= MRKR_BASE + 5;	-- SEQ_035/040/065: Nnmulika at the Fishermen's Guild
+MRKR_ZEPHYR_GATE	= MRKR_BASE + 6;	-- SEQ_048: Zephyr Gate escort muster
+MRKR_LIGHTHOUSE		= MRKR_BASE + 7;	-- SEQ_055: the corpse at Oschon's Torch
+MRKR_SISIPU			= MRKR_BASE + 8;	-- SEQ_060: Sisipu at the lighthouse
+MRKR_ARM_BSM_GUILD	= MRKR_BASE + 9;	-- SEQ_075: Bodenolf at Naldiq & Vymelli's forge
+MRKR_HNAANZA		= MRKR_BASE + 10;	-- SEQ_080: H'naanza in the forge interior
+MRKR_GUILD_EXIT		= MRKR_BASE + 11;	-- SEQ_085: the Echo exit trigger
 
 -- Quest Data
 CNTR_SEQ7_CUL		= 1;
@@ -350,6 +373,14 @@ function onTalk(player, quest, npc)
 		if (classId == BADERON) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEventComplete");
 			callClientFunction(player, "delegateEvent", player, quest, "sqrwa", 300, 1, 1, 2);
+			-- Completion rewards: 200 EXP + 6,000 gil (era guides;
+			-- FFXIVenturer "Treasures of the Main" completion box). The
+			-- guides also list an unnamed food item — no surviving
+			-- source names it (quest_new_reward.csv isn't in any local
+			-- dump), so the item grant stays TODO until the sheet row
+			-- is recovered. (Garlemald-Server #46)
+			player:AddExp(200, player.charaWork.parameterSave.state_mainSkill[0], 0);
+			player:AddGil(6000);
 			player:EndEvent();
 			player:CompleteQuest(quest);
 			return;
@@ -418,11 +449,16 @@ function seq007_onTalk(player, quest, npc, classId)
 	elseif (classId == CHARLYS) then
 		if (subseqCUL == 0) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent030");
-			data:IncCounter(CNTR_SEQ7_CUL);			
+			data:IncCounter(CNTR_SEQ7_CUL);
 			if (data:GetCounter(CNTR_SEQ7_MSK) == 4) then
 				seq007_endSequence(player, quest);
 			end
-			--give 1000g
+			-- Charlys buys the Balloonfish for 2,000 gil — the upstream
+			-- "--give 1000g" TODO undershot it; processEvent030's dialogue
+			-- and the era guides both say 2,000 ("Sell the balloonfish to
+			-- Charlys ... You will receive 2000 gil", FFXIVenturer
+			-- "Treasures of the Main"). (Garlemald-Server #46)
+			player:AddGil(2000);
 		else
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent030_2");
 		end
@@ -438,6 +474,11 @@ function seq007_onTalk(player, quest, npc, classId)
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent035_2");
 		end
 	elseif (classId == MERLZIRN) then
+		-- "processEvent40_2" is NOT a typo for processEvent040_2: the
+		-- client's decompiled Man0l1 event table really names this one
+		-- without the zero padding, unlike its 0-padded siblings
+		-- (meteor-decomp tools/decode_lpb.py on Man0l1.lpb). Renaming it
+		-- would make the client drop the RPC. (Garlemald-Server #46)
 		callClientFunction(player, "delegateEvent", player, quest, "processEvent40_2");
 	elseif (classId == INTIMIDATING_BARRACUDA) then
 		callClientFunction(player, "delegateEvent", player, quest, "processEvent050_2");
@@ -516,22 +557,25 @@ function onPush(player, quest, npc)
 		if (classId == ZEPHYR_TRIGGER) then
 			local result = callClientFunction(player, "delegateEvent", player, quest, "contentsJoinAskInBasaClass");
 			if (result == 1) then
-				-- DO ESCORT DUTY HERE
-				-- startMan0l1Content(player, quest);
-				-- For now just skip the sequence
-				quest:StartSequence(SEQ_050);
-				callClientFunction(player, "delegateEvent", player, quest, "processEvent605");
-				player:EndEvent();
-				quest:StartSequence(SEQ_055);
-				GetWorldManager():DoZoneChange(player, 128, "PrivateAreaMasterPast", 2, 15, 137.44, 60.33, 1322.0, -1.60);
+				-- The Zephyr Gate escort duty (Garlemald-Server #46) —
+				-- replaces the inherited pmeteor skip ("For now just
+				-- skip the sequence") that jumped straight to the
+				-- processEvent605 arrival. The escort's completion beat
+				-- (605 → SEQ_055 → lighthouse-echo warp) now lives in
+				-- QuestDirectorMan0l101's coroutine.
+				startMan0l1Content(player, quest);
 				return;
 			end
 			player:EndEvent();
 		end
 	elseif (sequence == SEQ_065) then
 		if (classId == FSH_TRIGGER) then
-			callClientFunction(player, "delegateEvent", player, quest, "processEvent620");			
-			-- Give 3000 gil
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent620");
+			-- Fishermen's Guild payout for the strongbox delivery —
+			-- 3,000 gil per the upstream TODO and the era guides
+			-- (FFXIVenturer "Treasures of the Main": "You will receive
+			-- 3000 gil"). (Garlemald-Server #46)
+			player:AddGil(3000);
 			player:EndEvent();
 			quest:NewNpcLsMsg(1);
 			quest:StartSequence(SEQ_070);
@@ -651,11 +695,36 @@ end
 
 function onNotice(player, quest, target)
 	local sequence = quest:getSequence();
-	
+
 	if (sequence == SEQ_003) then
+		-- Lift the tutorial desktop-widget mask the client entered during the
+		-- Baderon talk. processEvent020 deliberately leaves the client in
+		-- desktopWidgetMode 16 (HUD hidden, Map/menu/linkpearl/NPC/aetheryte
+		-- all disabled), verified by disassembling the shipped Man0l1.lpb. The
+		-- ONLY thing that cancels mode 16 for the Limsa opener is the
+		-- client-side `processEventTu_001` (the NPC-linkshell tutorial: it
+		-- calls cancelDesktopWidgetMode(16) → desktopWidgetMode 120 — which
+		-- the menu gate processCommandMap ALLOWS — plus setTutorialMask +
+		-- openTutorialWidget(15) for the Path-Companion linkpearl).
+		--
+		-- IMPORTANT: drive it with the RAW (non-parking) RunEventFunction, NOT
+		-- callClientFunction. callClientFunction does RunEventFunction THEN
+		-- coroutine.yield("_WAIT_EVENT") and PARKS until the client replies
+		-- with a 0x012E EventUpdate. processEventTu_001 is a synchronous UI
+		-- mask (no _wait/cutscene/finishEvent) so it sends NO EventUpdate — so
+		-- callClientFunction here parks forever, the trailing EndEvent never
+		-- runs, the noticeEvent stays OPEN, and the client is event-locked
+		-- (movement locked + every menu/pearl click suppressed → softlock).
+		-- The raw RunEventFunction does not park, so the EndEvent below runs,
+		-- closing the noticeEvent; the wire order is the proven
+		-- RunEventFunction-then-EndEvent. After this the menu works (mode 120)
+		-- and the now-flashing linkpearl is clickable → onNpcLS →
+		-- endTutorialMode → full unlock (mode 8, free movement).
+		-- (Garlemald-Server #46 — Baderon menu/softlock root cause.)
+		player:RunEventFunction("delegateEvent", player, quest, "processEventTu_001");
 		player:EndEvent();
 	end
-		
+
 	quest:UpdateENPCs();
 end
 
@@ -685,6 +754,15 @@ function onNpcLS(player, quest, from, msgStep)
 		
 		-- Handle anything else
 		if (sequence == SEQ_003) then
+			-- Player clicked the now-clickable Path-Companion linkpearl:
+			-- show the success widget, close the NPC-linkshell tutorial that
+			-- onNotice's processEventTu_001 opened, then end tutorial mode
+			-- (final cleanup, cancels mode 120 / clears tutorialFlag → full
+			-- menu). Mirrors man0g1; the wait(3) the Gridania script uses to
+			-- pace the success animation is omitted here to keep onNpcLS a
+			-- non-parking, run-to-completion hook.
+			showTutorialSuccessWidget(player, 9080);
+			closeTutorialWidget(player);
 			endTutorialMode(player);
 		elseif (sequence == SEQ_007) then
 			quest:StartSequenceForNpcLs(SEQ_035);
@@ -699,27 +777,106 @@ function onNpcLS(player, quest, from, msgStep)
 end
 
 function startMan0l1Content(player, quest)
-	quest:StartSequence(SEQ_050);	
+	quest:StartSequence(SEQ_050);
+
+	-- Play the Sisipu entry cutscene NOW, before the warp. man0l604 is a
+	-- `startFadeInCutSceneAfterWarp` cut: it fades out, plays, then blocks on
+	-- `_waitForMapLoaded` (MapLayoutElement [+0xb9]) until the map "finishes
+	-- loading", then fades in. For a SAME-MAP duty the geometry is already
+	-- resident, so we must NOT schedule a reload (no 0x00E2 latch → [+0xb9]
+	-- stays 0) and we finish the zone-in instantly via spawnType 0x16 (the
+	-- client's instant zone-in-complete bypass — decompiled in
+	-- captures/issue28-rca, the only 0x00CE path that emits RX 0x0007
+	-- 0xFFFFFFFF without arming the order machine or touching [+0xb9]). With
+	-- [+0xb9]==0 the cut's _waitForMapLoaded unblocks and fades the player back
+	-- in. (Garlemald-Server #46.)
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
+	-- Close the contentsJoinAskInBasaClass push event. Without this the
+	-- pushDefault event stays open (the director only EndEvents the separate
+	-- noticeEvent kick), and the client keeps the player in event mode — menus,
+	-- targeting and actions stay locked even though movement is free, which is
+	-- why the escort NPCs can't be targeted. (This EndEvent was dropped earlier
+	-- while chasing the reload hang; the warp now completes via spawnType 0x16,
+	-- independent of the event system, so it is safe to close here.) The cut
+	-- still plays — the client renders processEvent604 before processing the
+	-- EndEvent (proven by the earlier "cutscene then hang" runs). (Garlemald #46.)
 	player:EndEvent();
-		
-	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContent30002", "Quest/QuestDirectorMan0l101");
-	
+
+	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
+
 	if (contentArea == nil) then
 		return;
 	end
-	
+
 	local director = contentArea:GetContentDirector();
 	player:AddDirector(director);
-	director:StartDirector(true);
-	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
+	director:StartDirector(false);
+
+	-- The KickEvent delivers the entry cutscene AFTER the warp completes: the
+	-- client echoes EventStart(noticeEvent) once the same-map reload finishes,
+	-- firing QuestDirectorMan0l101:onEventStarted, which plays processEvent604
+	-- (man0l604 is startFadeInCutSceneAfterWarp — it can ONLY fade in post-warp)
+	-- and then drives the escort. Mirrors the proven man0g0 SEQ_005 doContentArea.
+	player:KickEvent(director, "noticeEvent", true);
+	player:SetLoginDirector(director);
+
+	-- Same-map content warp. spawnType 0x16 (22) = the client's instant
+	-- zone-in-complete bypass: reposition the player + emit RX 0x0007
+	-- 0xFFFFFFFF immediately, NO order-machine reload (the map is already
+	-- resident — no "Now Loading"). Paired with the no-latch warp in
+	-- apply_do_zone_change_content so [+0xb9] stays 0 and the entry cut's
+	-- _waitForMapLoaded unblocks. (Garlemald-Server #46.)
+	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 22);
 end
 
 function getJournalInformation(player, quest)
+	-- The leading 0 is intentional, not a stub: the journal sheet's
+	-- first qtdata arg slot is unused for this quest (the SEQ_007
+	-- objective text reads args 2-3 — '0,5,20' renders "visited both
+	-- guilds", see the SEQ_007 sequence note up top). Sibling quests
+	-- pass quest-item ids in this slot; man0l1 has none.
 	return 0, quest:GetData():GetCounter(CNTR_SEQ7_CUL) * 5, quest:GetData():GetCounter(CNTR_SEQ7_MSK) * 5;
 end
 
 function getJournalMapMarkerList(player, quest)
 	local sequence = quest:getSequence();
-	
+	local data = quest:GetData();
+	local possibleMarkers = {};
+
+	if (sequence == SEQ_000 or sequence == SEQ_005 or sequence == SEQ_006) then
+		table.insert(possibleMarkers, MRKR_BADERON);
+	elseif (sequence == SEQ_003) then
+		table.insert(possibleMarkers, MRKR_BEARDED_ROCK);
+	elseif (sequence == SEQ_007) then
+		-- Both guild errands run in parallel; drop each marker as its
+		-- sub-quest completes (CUL counter latches at 1 after the
+		-- Balloonfish sale, MSK at 4 after the Echo exit).
+		if (data:GetCounter(CNTR_SEQ7_CUL) == 0) then
+			table.insert(possibleMarkers, MRKR_CUL_GUILD);
+		end
+		if (data:GetCounter(CNTR_SEQ7_MSK) < 4) then
+			table.insert(possibleMarkers, MRKR_MSK_GUILD);
+		end
+	elseif (sequence == SEQ_035 or sequence == SEQ_040 or sequence == SEQ_065) then
+		table.insert(possibleMarkers, MRKR_FSH_GUILD);
+	elseif (sequence == SEQ_048) then
+		table.insert(possibleMarkers, MRKR_ZEPHYR_GATE);
+	elseif (sequence == SEQ_055) then
+		table.insert(possibleMarkers, MRKR_LIGHTHOUSE);
+	elseif (sequence == SEQ_060) then
+		table.insert(possibleMarkers, MRKR_SISIPU);
+	elseif (sequence == SEQ_075) then
+		table.insert(possibleMarkers, MRKR_ARM_BSM_GUILD);
+	elseif (sequence == SEQ_080) then
+		table.insert(possibleMarkers, MRKR_HNAANZA);
+	elseif (sequence == SEQ_085) then
+		table.insert(possibleMarkers, MRKR_GUILD_EXIT);
+	elseif (sequence == SEQ_092) then
+		table.insert(possibleMarkers, MRKR_BADERON);
+	end
+	-- SEQ_050 (escort instance) and the SEQ_070/SEQ_090 linkshell beats
+	-- have no map destination — empty list, same as the sibling quests'
+	-- non-travel sequences.
+
+	return unpack(possibleMarkers);
 end

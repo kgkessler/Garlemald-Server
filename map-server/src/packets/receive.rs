@@ -38,6 +38,40 @@ fn read_null_term_ascii(c: &mut Cursor<&[u8]>, max: usize) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Read a FIXED-width ASCII field: take the string content up to the first NUL,
+/// but ALWAYS advance the cursor by exactly `size` bytes — a direct port of
+/// pmeteor's `Utils.ReadNullTermString` (which scans for the NUL to size the
+/// string, then `Seek(pos + maxSize)` regardless of where the NUL was).
+///
+/// 1.x packs the EventStart `eventName` into a fixed 0x20-byte field whose unused
+/// tail is uninitialised client-stack garbage (a live retail `emote_kneel`
+/// capture shows `commandRequest\0` followed by `0d 06 10 a0 …` filler before the
+/// real LuaParam tail). Reading the name null-terminated (variable width) left
+/// the param cursor inside that padding, so the emote command's `emoteId` decoded
+/// as 0/garbage and every free emote silently no-opped. (Garlemald-Server #46.)
+fn read_fixed_field_ascii(c: &mut Cursor<&[u8]>, size: usize) -> String {
+    let start = c.position();
+    let mut out = Vec::new();
+    let mut terminated = false;
+    for _ in 0..size {
+        let mut buf = [0u8; 1];
+        if c.read_exact(&mut buf).is_err() {
+            break;
+        }
+        if buf[0] == 0 {
+            terminated = true;
+        }
+        if !terminated {
+            out.push(buf[0]);
+        }
+    }
+    // Land exactly `size` bytes past the field start (pmeteor's
+    // `Seek(pos + maxSize)`), so the caller reads what FOLLOWS the field — not
+    // the field's own padding.
+    let _ = c.seek(SeekFrom::Start(start + size as u64));
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Session + handshake
 // ---------------------------------------------------------------------------
@@ -436,11 +470,21 @@ impl EventStartPacket {
         }
 
         let event_type = c.read_u8()?;
-        // Matches the C# parser: read null-term ASCII for the event name,
-        // then — if the next byte isn't 0x01 — decode the LuaParam tail.
-        let event_name = read_null_term_ascii(&mut c, 256);
+        // The event name is a FIXED 0x20-byte field (pmeteor
+        // `Utils.ReadNullTermString` default maxSize=0x20), NOT a variable
+        // null-terminated string — the LuaParam tail begins at name_start +
+        // 0x20 regardless of the name's length. Reading it variable-width made
+        // the param cursor land in the field's padding, so the emote command's
+        // emoteId decoded as garbage. Then — if the next byte is 0x01 — there
+        // are no params (mirrors pmeteor's `PeekChar() == 0x1` guard).
+        // (Garlemald-Server #46.)
+        let event_name = read_fixed_field_ascii(&mut c, 0x20);
         let pos = c.position() as usize;
-        let lua_params = if pos < data.len() && data[pos] == 0x01 {
+        // No params if the fixed name field ran to (or past) the end of the
+        // body, or if the next byte is the 0x01 "no params" marker (pmeteor's
+        // `PeekChar() == 0x1`). The `pos >= data.len()` arm also keeps a
+        // truncated/short EventStart from panicking on `&data[pos..]`.
+        let lua_params = if pos >= data.len() || data[pos] == 0x01 {
             Vec::new()
         } else {
             luaparam::read_lua_params(&data[pos..]).unwrap_or_default()
@@ -758,5 +802,59 @@ impl GameMessageEnvelope {
             sender_actor_id,
             body,
         })
+    }
+}
+
+#[cfg(test)]
+mod event_start_tests {
+    use super::*;
+
+    /// Garlemald-Server #46 — the EventStart `eventName` is a FIXED 0x20-byte
+    /// field; the LuaParam tail begins at name_start + 0x20, NOT right after the
+    /// name's NUL. Mirrors a live retail `emote_kneel` capture where
+    /// "commandRequest\0" is followed by 17 bytes of client-stack junk before
+    /// the real params (emoteId=119 Kneel). Before the fix the param cursor
+    /// landed in that junk/padding, so emoteId decoded as 0/garbage and the free
+    /// emote silently no-opped.
+    #[test]
+    fn event_start_reads_emote_id_past_fixed_name_field() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // trigger_actor_id (player)
+        data.extend_from_slice(&0xA0F0_5E26u32.to_le_bytes()); // owner (EmoteStandardCommand)
+        data.extend_from_slice(&0u32.to_le_bytes()); // server_codes
+        data.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        data.push(0x00); // event_type
+        let name_field_start = data.len();
+        data.extend_from_slice(b"commandRequest\0");
+        // 17 bytes of leftover junk filling the rest of the 0x20 field — these
+        // are the bytes a variable-width reader would wrongly parse as params.
+        data.extend_from_slice(&[
+            0x0d, 0x06, 0x10, 0xa0, 0x0d, 0x06, 0x10, 0xc0, 0x0d, 0x06, 0x10, 0xe0, 0x0d, 0x06,
+            0x10, 0x00, 0x0e,
+        ]);
+        assert_eq!(
+            data.len() - name_field_start,
+            0x20,
+            "name field must be exactly 0x20 bytes"
+        );
+        // Real LuaParam tail: Int32(119) emoteId, then LUA_END (0x0f).
+        data.push(0x00); // Int32 type tag
+        data.extend_from_slice(&119u32.to_be_bytes()); // emoteId, big-endian
+        data.push(0x0f); // LUA_END
+
+        let pkt = EventStartPacket::parse(&data).expect("parse");
+        assert_eq!(pkt.event_name, "commandRequest");
+        assert_eq!(pkt.owner_actor_id, 0xA0F0_5E26);
+        assert_eq!(
+            pkt.lua_params.len(),
+            1,
+            "expected exactly the emoteId param; got {:?}",
+            pkt.lua_params
+        );
+        assert!(
+            matches!(pkt.lua_params[0], LuaParam::Int32(119)),
+            "emoteId must parse as 119 (Kneel) from past the fixed name field; got {:?}",
+            pkt.lua_params
+        );
     }
 }

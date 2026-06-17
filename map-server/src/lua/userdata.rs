@@ -407,6 +407,17 @@ pub struct LuaNpc {
 }
 
 impl UserData for LuaNpc {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        // `npc.Id` — the actor INSTANCE id (pmeteor `Actor.Id`). man0l1's
+        // onEmote passes it to `player:DoEmote(npc.Id, emoteId, msgId)` as the
+        // emote target. Without this field the access is nil; the DoEmote
+        // binding takes `target_actor_id: u32`, so a nil arg ERRORS the
+        // binding and unwinds the onEmote coroutine before it can play the
+        // animation or advance the hand-signal counter (man0l1 SEQ_040).
+        // 13 `npc.Id` call sites across the quest corpus. (Garlemald-Server #46.)
+        fields.add_field_method_get("Id", |_, this| Ok(this.base.actor_id));
+    }
+
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("GetName", |_, this, _: ()| Ok(this.base.name.clone()));
         methods.add_method("GetUniqueId", |_, this, _: ()| {
@@ -446,7 +457,7 @@ pub struct QuestStateSnapshot {
     pub quest_id: u32,
     pub sequence: u32,
     pub flags: u32,
-    pub counters: [u16; 3],
+    pub counters: [u16; 4],
     /// Migration-050 NpcLs scratchpad — read by `LuaQuestHandle`'s
     /// `NewNpcLsMsg` / `ReadNpcLsMsg` / `EndOfNpcLsMsgs` to know
     /// which NPC linkshell is driving the active message chain.
@@ -616,7 +627,12 @@ impl From<&crate::actor::Player> for PlayerSnapshot {
                 quest_id: q.quest_id(),
                 sequence: q.get_sequence(),
                 flags: q.get_flags(),
-                counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                counters: [
+                    q.get_counter(0),
+                    q.get_counter(1),
+                    q.get_counter(2),
+                    q.get_counter(3),
+                ],
                 npc_ls_from: q.get_npc_ls_from(),
                 npc_ls_msg_step: q.get_npc_ls_msg_step(),
             })
@@ -1459,32 +1475,71 @@ impl UserData for LuaPlayer {
         methods.add_method("SetNpcLs", set_npc_ls_handler);
         methods.add_method("SetNpcLS", set_npc_ls_handler);
 
-        // `player:SendGameMessageLocalizedDisplayName(quest, msgId,
-        // messageType, npcDisplayNameId)` — sheet-message dispatch
-        // with the NPC display name as the sender. Used heavily by
-        // the man*l*.lua NPC-linkshell narration (`NPCLS_MSGS[pack][step]`).
-        // 8 call sites. Routes through the existing SendMessage path
-        // for now (canonical 0x015C-0x0160 Text Sheet "Custom Sender"
-        // builders are defined but not yet auto-wired); the message
-        // body lands in chat with a synthetic sender placeholder so
-        // the script flow doesn't error.
+        // `player:SendGameMessageLocalizedDisplayName(textOwner, msgId,
+        // messageType, npcDisplayNameId, ...)` — the real 0x0161 DispId
+        // text-sheet line, sender shown by display-name id. Mirror of C#
+        // `Player.SendGameMessageLocalizedDisplayName` (Player.cs:1004):
+        // BuildPacket(worldMaster, textOwner.Id, textId, displayId, log).
+        // Drives the man*l*1 NPC-linkshell narration
+        // (`NPCLS_MSGS[pack][step]`, 8 call sites). `textOwner` is the
+        // TEXT-SHEET host — the quest's 0xA0F0xxxx static actor (the
+        // `quest` userdata) — so the client resolves the id against the
+        // quest's sheet, NOT WorldMaster's (the load-bearing text-owner
+        // rule; wrong owner crashes the client). (Garlemald-Server #46
+        // live test.)
         methods.add_method(
             "SendGameMessageLocalizedDisplayName",
             |_,
              this,
-             (_quest, msg_id, message_type, sender_display_name_id): (
-                mlua::AnyUserData,
+             (text_owner, msg_id, message_type, sender_display_name_id, varargs): (
+                mlua::Value,
                 u32,
                 u8,
                 Option<u32>,
+                mlua::Variadic<mlua::Value>,
             )| {
+                // Resolve the text-sheet owner. The script passes the
+                // `quest` userdata; derive the quest's static actor id
+                // (0xA0F00000 | questId). Fall back to WorldMaster for any
+                // non-quest owner (matches the system-line owner default).
+                let text_owner_actor_id = match &text_owner {
+                    mlua::Value::UserData(ud) => ud
+                        .borrow::<LuaQuestHandle>()
+                        .map(|q| 0xA0F0_0000 | (q.quest_id & 0xF_FFFF))
+                        .unwrap_or(crate::packets::send::misc::WORLD_MASTER_ACTOR_ID),
+                    _ => crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                };
+                // Marshal trailing varargs → LuaParams, stopping at the
+                // first nil (Lua vararg convention). man0l1 passes none.
+                let mut params = Vec::new();
+                for v in varargs.iter() {
+                    match v {
+                        mlua::Value::Integer(i) => {
+                            params.push(common::luaparam::LuaParam::Int32(*i as i32))
+                        }
+                        mlua::Value::Number(n) => {
+                            params.push(common::luaparam::LuaParam::Int32(*n as i32))
+                        }
+                        mlua::Value::Boolean(b) => params.push(if *b {
+                            common::luaparam::LuaParam::True
+                        } else {
+                            common::luaparam::LuaParam::False
+                        }),
+                        mlua::Value::String(s) => params.push(common::luaparam::LuaParam::String(
+                            s.to_string_lossy().to_string(),
+                        )),
+                        _ => break,
+                    }
+                }
                 push(
                     &this.queue,
-                    LuaCommand::SendMessage {
-                        actor_id: this.snapshot.actor_id,
-                        message_type,
-                        sender: format!("[{}]", sender_display_name_id.unwrap_or(0)),
-                        text: format!("[sheet:{}]", msg_id),
+                    LuaCommand::SendGameMessageLocalizedDisplayName {
+                        player_id: this.snapshot.actor_id,
+                        text_owner_actor_id,
+                        text_id: msg_id as u16,
+                        log_type: message_type,
+                        display_id: sender_display_name_id.unwrap_or(0),
+                        params,
                     },
                 );
                 Ok(())
@@ -2205,6 +2260,11 @@ impl UserData for LuaPlayer {
             let mut text_owner: u32 = crate::packets::send::WORLD_MASTER_ACTOR_ID;
             let mut text_id: Option<i64> = None;
             let mut log_type: Option<i64> = None;
+            // Numeric args AFTER text_id + log_type are message params (e.g.
+            // the item id for the "You obtain <item>" toast, text 25117).
+            // Without forwarding them the client renders "You obtain a ."
+            // (blank). (Garlemald-Server #46.)
+            let mut params: Vec<i64> = Vec::new();
             for v in args.iter() {
                 match v {
                     Value::UserData(ud) if text_id.is_none() => {
@@ -2230,6 +2290,8 @@ impl UserData for LuaPlayer {
                             text_id = Some(i);
                         } else if log_type.is_none() {
                             log_type = Some(i);
+                        } else {
+                            params.push(i);
                         }
                     }
                     Value::Number(n) => {
@@ -2240,6 +2302,8 @@ impl UserData for LuaPlayer {
                             text_id = Some(i);
                         } else if log_type.is_none() {
                             log_type = Some(i);
+                        } else {
+                            params.push(i);
                         }
                     }
                     _ => {}
@@ -2256,6 +2320,7 @@ impl UserData for LuaPlayer {
                     text_owner_id: text_owner,
                     text_id: text_id.max(0) as u32,
                     log_type,
+                    params,
                 },
             );
             Ok(())
@@ -2418,6 +2483,14 @@ impl UserData for LuaPlayer {
                         "Man0l0" => 110001,
                         "Man0g0" => 110005,
                         "Man0u0" => 110009,
+                        // Second opening quests (the "go attune the
+                        // aetheryte" leg) — AetheryteParent.lua resolves
+                        // these by name to advance SEQ_003/SEQ_005 on
+                        // attunement. (Garlemald-Server #46 live test
+                        // round 2.)
+                        "Man0l1" => 110002,
+                        "Man0g1" => 110006,
+                        "Man0u1" => 110010,
                         other => {
                             // Lenient fallback: search snapshot for any
                             // active quest with this exact name (case-
@@ -2457,7 +2530,7 @@ impl UserData for LuaPlayer {
                     quest_id: id,
                     sequence: 0,
                     flags: 0,
-                    counters: [0; 3],
+                    counters: [0; 4],
                     npc_ls_from: 0,
                     npc_ls_msg_step: 0,
                 });
@@ -2543,7 +2616,7 @@ impl UserData for LuaPlayer {
                         quest_id: *qid,
                         sequence: 0,
                         flags: 0,
-                        counters: [0; 3],
+                        counters: [0; 4],
                         npc_ls_from: 0,
                         npc_ls_msg_step: 0,
                     });
@@ -2581,7 +2654,7 @@ impl UserData for LuaPlayer {
                             quest_id: qid,
                             sequence: 0,
                             flags: 0,
-                            counters: [0; 3],
+                            counters: [0; 4],
                             npc_ls_from: 0,
                             npc_ls_msg_step: 0,
                         });
@@ -2918,6 +2991,21 @@ impl UserData for LuaPlayer {
                 LuaCommand::ChangeState {
                     actor_id: this.snapshot.actor_id,
                     main_state: state,
+                },
+            );
+            Ok(())
+        });
+        // `player:PlayAnimation(animation_id)` — mirror of the LuaActor
+        // binding (userdata.rs ~141). TeleportCommand.lua fires
+        // `player:PlayAnimation(0x4000FFA/FFB)` for the teleport cast +
+        // arrival; without it on LuaPlayer the teleport/return menu
+        // errored out mid-script. (Garlemald-Server #46 live test.)
+        methods.add_method("PlayAnimation", |_, this, animation_id: u32| {
+            push(
+                &this.queue,
+                LuaCommand::PlayAnimation {
+                    actor_id: this.snapshot.actor_id,
+                    animation_id,
                 },
             );
             Ok(())
@@ -4759,7 +4847,7 @@ pub struct LuaQuestHandle {
     /// Mirror of `QuestData.flags`.
     pub flags: u32,
     /// Mirror of `QuestData.counters`.
-    pub counters: [u16; 3],
+    pub counters: [u16; 4],
     /// Mirror of `QuestData.npc_ls_from` — set by `Quest::NewNpcLsMsg`,
     /// read by `ReadNpcLsMsg` / `EndOfNpcLsMsgs` to know which NPC LS
     /// to flip back to ACTIVE / INACTIVE state.
@@ -5164,7 +5252,7 @@ pub struct LuaQuestDataHandle {
     pub player_id: u32,
     pub quest_id: u32,
     pub flags: u32,
-    pub counters: [u16; 3],
+    pub counters: [u16; 4],
     pub npc_ls_from: u32,
     pub npc_ls_msg_step: u8,
     pub queue: Arc<Mutex<CommandQueue>>,
@@ -5226,6 +5314,16 @@ impl UserData for LuaQuestDataHandle {
             Ok(())
         });
         methods.add_method("IncCounter", |_, this, idx: u32| {
+            // DIAGNOSTIC (Garlemald-Server #46): confirm the binding runs on
+            // resume AND log the queue Arc it pushes to, so we can compare it
+            // against the queue drained by fire_player_event_and_drain. If the
+            // ptrs differ, data:IncCounter is pushing to a stale queue. Temp.
+            tracing::debug!(
+                quest = this.quest_id,
+                idx,
+                queue_ptr = format!("{:p}", std::sync::Arc::as_ptr(&this.queue)),
+                "IncCounter binding invoked (Garlemald-Server #46 diag)",
+            );
             push(
                 &this.queue,
                 LuaCommand::QuestIncCounter {

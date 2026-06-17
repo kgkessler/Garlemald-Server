@@ -32,15 +32,49 @@ function init(npc)
 end
 
 function onEventStarted(player, aetheryte, triggerName)
-	
+
+	-- Main Scenario Intro Quests — attuning the opening-city aetheryte
+	-- advances the "go attune" step. Ported from pmeteor's
+	-- AetheryteParent.lua:36-62 (garlemald previously omitted this block,
+	-- so touching the Camp Bearded Rock aetheryte at man0l1 SEQ_003 never
+	-- progressed the quest). Reachable now that the engine dispatches a
+	-- non-quest object's own onEventStarted (Garlemald-Server #46 live
+	-- test round 2).
+	if (player:HasQuest(110002) == true) then
+		require ("quests/man/man0l1");
+		local quest = player:GetQuest("Man0l1");
+		if (quest:GetSequence() == SEQ_003) then
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent025");
+			quest:StartSequence(SEQ_005);
+		end
+	elseif (player:HasQuest(110006) == true) then
+		require ("quests/man/man0g1");
+		local quest = player:GetQuest("Man0g1");
+		if (quest:GetSequence() == SEQ_005) then
+			if (ENABLE_GL_TUTORIAL) then
+				callClientFunction(player, "delegateEvent", player, quest, "processEvent013");
+			else
+				callClientFunction(player, "delegateEvent", player, quest, "processEvent013_2");
+			end
+			quest:StartSequence(SEQ_010);
+		end
+	elseif (player:HasQuest(110010) == true) then
+		require ("quests/man/man0u1");
+		local quest = player:GetQuest("Man0u1");
+		if (quest:GetSequence() == SEQ_005) then
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent013");
+			quest:StartSequence(SEQ_010);
+		end
+	end
+
 	if (player:GetGuildleveDirector() ~= nil) then
 		doGuildleveMenu(player, aetheryte);
 	else
 		doNormalMenu(player, aetheryte);
-	end	
-	
+	end
+
 	player:EndEvent();
-	
+
 end
 
 function doGuildleveMenu(player, aetheryte)

@@ -1003,6 +1003,114 @@ async fn add_gil_creates_stack_then_increments() {
     let _ = named_params! { ":x": 0 }; // silence unused-import if the macro is unused above
 }
 
+/// Garlemald-Server #46 — `apply_add_gil` with a live world pushes the
+/// new balance to the owning client: the currency-package delta bracket
+/// (`0x016D → 0x0146(320,99) → 0x0148 → 0x0147 → 0x016E`), every
+/// subpacket target-stamped (proxy rule), the X01 row carrying the gil
+/// item id + post-grant total, then the 25246 "You obtain" toast for
+/// the positive delta.
+#[tokio::test]
+async fn apply_add_gil_emits_currency_bracket_and_obtain_toast() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Charlys Customer')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let chara = Character::new(42);
+    registry
+        .insert(ActorHandle::new(42, ActorKindTag::Player, 230, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_add_gil(42, 2000, &registry, Some(&world), &db).await;
+
+    // The channel carries raw subpacket streams (the writer task owns
+    // BasePacket framing) — parse each frame as one subpacket.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        &opcodes[..5],
+        &[
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_LIST_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "bracket order; saw {opcodes:?}",
+    );
+    assert_eq!(opcodes.len(), 6, "bracket + one toast; saw {opcodes:?}");
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+    // SetBegin body: u32 actor, u16 capacity 320, u16 code 99.
+    let set_begin = &subs[1].data;
+    assert_eq!(
+        u16::from_le_bytes([set_begin[4], set_begin[5]]),
+        crate::inventory::CAP_CURRENCY,
+    );
+    assert_eq!(
+        u16::from_le_bytes([set_begin[6], set_begin[7]]),
+        crate::inventory::PKG_CURRENCY_CRYSTALS,
+    );
+    // X01 item record: u64 unique_id, i32 quantity @8, u32 item_id @12.
+    let item = &subs[2].data;
+    let qty = i32::from_le_bytes([item[8], item[9], item[10], item[11]]);
+    let item_id = u32::from_le_bytes([item[12], item[13], item[14], item[15]]);
+    assert_eq!(qty, 2000, "X01 carries the post-grant balance");
+    assert_eq!(item_id, 1_000_001, "X01 carries the gil item id");
+    let unique_id = u64::from_le_bytes(item[..8].try_into().unwrap());
+    assert_ne!(unique_id, 0, "gil row must carry its server_items.id");
+
+    // A deduction updates the bracket but never toasts "You obtain".
+    crate::runtime::quest_apply::apply_add_gil(42, -500, &registry, Some(&world), &db).await;
+    let mut deduction_opcodes = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            deduction_opcodes.push(sub.game_message.opcode);
+        }
+    }
+    assert_eq!(
+        deduction_opcodes.len(),
+        5,
+        "deduction = bracket only, no toast; saw {deduction_opcodes:?}",
+    );
+}
+
 #[tokio::test]
 async fn set_exp_persists_per_class_column() {
     use common::db::ConnCallExt;
@@ -1734,19 +1842,20 @@ async fn save_quest_roundtrips_all_columns_through_load_quest_scenario() {
         /* counter1 */ 3,
         /* counter2 */ 12,
         /* counter3 */ 0xFFFF,
+        /* counter4 */ 0,
     )
     .await
     .unwrap();
 
     // Second slot — exercises the PK (characterId, slot) guard.
     let actor_aid_b = crate::actor::quest::quest_actor_id(110_020);
-    db.save_quest(101, 1, actor_aid_b, 0, 0, 0, 0, 0)
+    db.save_quest(101, 1, actor_aid_b, 0, 0, 0, 0, 0, 0)
         .await
         .unwrap();
 
     // Re-save slot 0 with new values — ON CONFLICT should update, not
     // duplicate.
-    db.save_quest(101, 0, actor_aid, 8, 0xFF, 9, 10, 11)
+    db.save_quest(101, 0, actor_aid, 8, 0xFF, 9, 10, 11, 12)
         .await
         .unwrap();
 
@@ -1924,7 +2033,7 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
             quest_id: 110_001,
             sequence: 0,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -1936,7 +2045,7 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
         has_quest: true,
         sequence: 0,
         flags: 0,
-        counters: [0; 3],
+        counters: [0; 4],
         npc_ls_from: 0,
         npc_ls_msg_step: 0,
         queue: CommandQueue::new(),
@@ -2008,7 +2117,7 @@ async fn ported_man0l0_seq000_marker_gating_follows_retail_order() {
                 quest_id: 110_001,
                 sequence: 0,
                 flags,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
             }],
@@ -2020,7 +2129,7 @@ async fn ported_man0l0_seq000_marker_gating_follows_retail_order() {
             has_quest: true,
             sequence: 0,
             flags,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
             queue: CommandQueue::new(),
@@ -2134,7 +2243,7 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
             quest_id: 110_001,
             sequence: 0,
             flags: 0xF, // all four mini-tutorial beats done — door armed
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -2146,7 +2255,7 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
         has_quest: true,
         sequence: 0,
         flags: 0xF,
-        counters: [0; 3],
+        counters: [0; 4],
         npc_ls_from: 0,
         npc_ls_msg_step: 0,
         queue: CommandQueue::new(),
@@ -2291,7 +2400,7 @@ async fn ported_man0l0_hob_handoff_starts_man0l1_inn_warp() {
             quest_id,
             sequence,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -2303,7 +2412,7 @@ async fn ported_man0l0_hob_handoff_starts_man0l1_inn_warp() {
         has_quest: true,
         sequence,
         flags: 0,
-        counters: [0; 3],
+        counters: [0; 4],
         npc_ls_from: 0,
         npc_ls_msg_step: 0,
         queue: CommandQueue::new(),
@@ -9508,6 +9617,92 @@ async fn add_retainer_bazaar_item_command_drains_to_db() {
     assert_eq!(rows[0].price_gil, 200);
 }
 
+/// Regression: the runtime drain (`apply_runtime_lua_command`) MUST handle
+/// `WarpToPrivateArea` / `WarpToPublicArea` rather than drop them into its
+/// `_ => false` catch-all. A quest-talk coroutine that parks on
+/// `callClientFunction` and emits the warp on resume is drained through this
+/// path (man0l1 SEQ_007 — Isandorel's second cutscene ends with
+/// `WarpToPrivateArea("PrivateAreaMasterPast", 3)`); the dropped warp left the
+/// client on "Now Loading" forever. With no registered actor the arm
+/// short-circuits, but must still report handled = true (pre-fix it was false).
+/// (Garlemald-Server #46.)
+#[tokio::test]
+async fn runtime_drain_handles_warp_commands() {
+    use crate::lua::LuaCommandKind;
+    use crate::runtime::quest_apply::apply_runtime_lua_command;
+
+    let db = crate::database::Database::open(tempdb())
+        .await
+        .expect("db stub");
+    let registry = ActorRegistry::new();
+    let world = WorldManager::new();
+
+    let priv_handled = apply_runtime_lua_command(
+        LuaCommandKind::WarpToPrivateArea {
+            player_id: 999,
+            area_class: "PrivateAreaMasterPast".to_string(),
+            area_index: 3,
+            target: None,
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(
+        priv_handled,
+        "WarpToPrivateArea must be handled by the runtime drain"
+    );
+
+    let pub_handled = apply_runtime_lua_command(
+        LuaCommandKind::WarpToPublicArea {
+            player_id: 999,
+            target: None,
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(
+        pub_handled,
+        "WarpToPublicArea must be handled by the runtime drain"
+    );
+}
+
+/// Regression: the runtime drain must handle `DoEmote` — EmoteStandardCommand
+/// (a free emote from the menu) is dispatched through this path, so a missing
+/// arm dropped the emote animation outside scripted quest interactions.
+/// (Garlemald-Server #46.)
+#[tokio::test]
+async fn runtime_drain_handles_do_emote() {
+    use crate::lua::LuaCommandKind;
+    use crate::runtime::quest_apply::apply_runtime_lua_command;
+
+    let db = crate::database::Database::open(tempdb())
+        .await
+        .expect("db stub");
+    let registry = ActorRegistry::new();
+    let world = WorldManager::new();
+
+    let handled = apply_runtime_lua_command(
+        LuaCommandKind::DoEmote {
+            actor_id: 999,
+            target_actor_id: 0,
+            emote_id: 5,
+            message_id: 21041,
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(handled, "DoEmote must be handled by the runtime drain");
+}
+
 /// `retainer:AddBazaarItem(...)` on the `LuaRetainer` userdata pushes a
 /// `LuaCommand::AddRetainerBazaarItem` onto the queue with the right
 /// shape. Regression guard — mlua `add_method` is last-write-wins for
@@ -10587,7 +10782,7 @@ async fn hand_in_fieldcraft_leve_grants_gil_and_clears_journal() {
 
     let (db, registry, lua) = setup_completed_leve(201, 130_001, 0, 0).await;
 
-    let outcome = apply_regional_leve_hand_in(201, 130_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(201, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 200); // seed 048 band-0 gil
     assert_eq!(
@@ -10625,7 +10820,7 @@ async fn hand_in_battlecraft_unenlisted_grants_gil_no_seals() {
 
     let (db, registry, lua) = setup_completed_leve(202, 140_001, 0, 0).await;
 
-    let outcome = apply_regional_leve_hand_in(202, 140_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(202, 140_001, &registry, None, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 300); // seed 048 battlecraft band-0 gil
     assert_eq!(
@@ -10642,7 +10837,7 @@ async fn hand_in_battlecraft_enlisted_grants_gil_and_seals() {
 
     let (db, registry, lua) = setup_completed_leve(203, 140_001, 0, GC_MAELSTROM).await;
 
-    let outcome = apply_regional_leve_hand_in(203, 140_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(203, 140_001, &registry, None, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 300);
     assert_eq!(
@@ -10708,7 +10903,7 @@ async fn hand_in_incomplete_leve_is_noop() {
         ))
         .await;
 
-    let outcome = apply_regional_leve_hand_in(204, 130_001, &registry, &db, Some(&lua)).await;
+    let outcome = apply_regional_leve_hand_in(204, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(!outcome.applied, "incomplete leve hand-in must no-op");
     assert_eq!(outcome.gil_granted, 0);
 
@@ -10727,10 +10922,10 @@ async fn hand_in_is_idempotent_across_double_calls() {
 
     let (db, registry, lua) = setup_completed_leve(205, 130_001, 0, 0).await;
 
-    let first = apply_regional_leve_hand_in(205, 130_001, &registry, &db, Some(&lua)).await;
+    let first = apply_regional_leve_hand_in(205, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(first.applied);
 
-    let second = apply_regional_leve_hand_in(205, 130_001, &registry, &db, Some(&lua)).await;
+    let second = apply_regional_leve_hand_in(205, 130_001, &registry, None, &db, Some(&lua)).await;
     assert!(
         !second.applied,
         "second hand-in on a cleared leve is a no-op"
@@ -12055,6 +12250,7 @@ async fn ticker_survives_tutorial_state_and_drains_time_parks() {
         .upsert_session(MapSession {
             id: 1,
             current_zone_id: 166,
+            content_warp_acked: true,
             active_content_script: Some(crate::data::ActiveContentScript {
                 parent_zone_id: 166,
                 area_name: "man0g01".to_string(),
@@ -12501,6 +12697,7 @@ async fn apply_content_finished_tears_down_content_state() {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -12684,6 +12881,7 @@ async fn content_on_update_send_signal_resumes_parked_coroutine() {
         .upsert_session(MapSession {
             id: session_id,
             current_zone_id: 166,
+            content_warp_acked: true,
             active_content_script: Some(crate::data::ActiveContentScript {
                 parent_zone_id: 166,
                 area_name: "man0g01".to_string(),
@@ -12916,6 +13114,7 @@ async fn s2_5_content_onupdate_engages_roster_and_reengages_on_death() {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -13034,8 +13233,15 @@ fn event_start_body(
     v.extend_from_slice(&0x2680_0000u32.to_le_bytes()); // serverCodes
     v.extend_from_slice(&0u32.to_le_bytes()); // unknown
     v.push(0); // event_type
-    v.extend_from_slice(event_name.as_bytes());
-    v.push(0);
+    // The client packs eventName into a FIXED 0x20-byte field; the LuaParam
+    // tail begins at name_start + 0x20 (see EventStartPacket::parse /
+    // read_fixed_field_ascii). Write it the same way so the synthetic packet
+    // matches the real wire format. (Garlemald-Server #46.)
+    let mut name_field = [0u8; 0x20];
+    let name_bytes = event_name.as_bytes();
+    let n = name_bytes.len().min(0x1f); // leave room for the NUL terminator
+    name_field[..n].copy_from_slice(&name_bytes[..n]);
+    v.extend_from_slice(&name_field);
     common::luaparam::write_lua_params(&mut v, params).expect("lua params encode");
     v
 }
@@ -13470,6 +13676,7 @@ async fn kill_gate_scene() -> KillGateScene {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -13843,6 +14050,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     let mut session = MapSession {
         id: session_id,
         current_zone_id: 166,
+        content_warp_acked: true,
         active_content_script: Some(crate::data::ActiveContentScript {
             parent_zone_id: 166,
             area_name: "man0g01".to_string(),
@@ -13880,7 +14088,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
             quest_id,
             sequence: 5,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }],
@@ -14617,5 +14825,468 @@ async fn man0u0_seq000_tutorial_flags_and_exit_gate() {
         sequence,
         Some(5),
         "pushing the armed exit door must advance Man0u0 to SEQ_005",
+    );
+}
+
+/// Garlemald-Server #46 live test — `send_instance_update` streams an
+/// NPC that has walked into range since zone-in. A camp NPC sits in the
+/// zone core but is NOT in the session's `actor_instance_list` (the
+/// zone-in bundle only spawned actors near the warp point); after the
+/// player walks up to it, the continuous instance update must AddActor
+/// it to the client and record it in the list. This is the fix for "no
+/// NPCs at Camp Bearded Rock" after the Zephyr Gate seamless crossing.
+#[tokio::test]
+async fn send_instance_update_streams_walked_in_npc() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let zone = Zone::new(
+        128,
+        "sea0Field01".to_string(),
+        101,
+        String::new(),
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(128).await.unwrap();
+
+    // Player at the gate.
+    let mut player = Character::new(1);
+    player.base.zone_id = 128;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 128, 1, player))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    let mut session = MapSession::new(1);
+    session.current_zone_id = 128;
+    world.upsert_session(session).await;
+
+    // A camp NPC near the player, present in the zone core but NOT yet
+    // in the client's instance list (it spawned far from the warp).
+    let mut npc = Character::new(0x4000_0010);
+    npc.base.zone_id = 128;
+    npc.chara.actor_class_id = 1_500_013; // bearded_rock_battlewarden
+    npc.base.actor_name = "battlewarden".to_string();
+    registry
+        .insert(ActorHandle::new(
+            0x4000_0010,
+            ActorKindTag::Npc,
+            128,
+            0,
+            npc,
+        ))
+        .await;
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 0x4000_0010,
+                kind: ActorKind::Npc,
+                position: Vector3::new(3.0, 0.0, 3.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world.send_instance_update(&registry, None, 1, 1).await;
+
+    // The client received the NPC's AddActor (push_npc_spawn's first
+    // packet is the 0x00CA AddActor).
+    let mut saw_add_actor = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR {
+                saw_add_actor = true;
+            }
+        }
+    }
+    assert!(
+        saw_add_actor,
+        "send_instance_update must AddActor the walked-in NPC",
+    );
+
+    // And it's now recorded so the next tick won't re-spawn it.
+    let session = world.session(1).await.unwrap();
+    assert!(
+        session.actor_instance_list.contains(&0x4000_0010),
+        "the streamed NPC must be recorded in actor_instance_list",
+    );
+}
+
+/// Garlemald-Server #46 live test round 2 — `send_instance_update` must
+/// also ENABLE the streamed actor's event conditions (SetEventStatus
+/// 0x0136), not just register them, or the 1.x client treats the NPC as
+/// non-talkable and never sends a talk EventStart ("NPCs show up but
+/// interacting does nothing"). The camp NPC carries a talkDefault
+/// condition; the stream-in must include its 0x0136 enable.
+#[tokio::test]
+async fn send_instance_update_enables_talk_condition() {
+    use crate::actor::Character;
+    use crate::actor::event_conditions::{EventConditionList, TalkCondition};
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let zone = Zone::new(
+        128,
+        "sea0Field01".to_string(),
+        101,
+        String::new(),
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(128).await.unwrap();
+
+    let mut player = Character::new(1);
+    player.base.zone_id = 128;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 128, 1, player))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    let mut session = MapSession::new(1);
+    session.current_zone_id = 128;
+    world.upsert_session(session).await;
+
+    // Camp NPC with a talkDefault condition (as parsed from the seed
+    // class JSON at spawn).
+    let mut npc = Character::new(0x4000_0010);
+    npc.base.zone_id = 128;
+    npc.chara.actor_class_id = 1_500_013;
+    npc.base.event_conditions = EventConditionList {
+        talk: vec![TalkCondition {
+            condition_name: "talkDefault".to_string(),
+            unknown1: 0,
+            is_disabled: false,
+        }],
+        ..Default::default()
+    };
+    registry
+        .insert(ActorHandle::new(
+            0x4000_0010,
+            ActorKindTag::Npc,
+            128,
+            0,
+            npc,
+        ))
+        .await;
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 0x4000_0010,
+                kind: ActorKind::Npc,
+                position: Vector3::new(3.0, 0.0, 3.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world.send_instance_update(&registry, None, 1, 1).await;
+
+    let mut saw_event_status = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_SET_EVENT_STATUS {
+                saw_event_status = true;
+            }
+        }
+    }
+    assert!(
+        saw_event_status,
+        "send_instance_update must emit a SetEventStatus (0x0136) enabling the talkDefault condition",
+    );
+}
+
+/// Garlemald-Server #46 live test round 2 — the runtime/resume drain
+/// (apply_runtime_lua_command) must APPLY PlayerSetNpcLs, not drop it.
+/// man0l1's Baderon talk parks on a coroutine, so NewNpcLsMsg's
+/// PlayerSetNpcLs(ALERT) glow is drained here on the EventUpdate
+/// resume; before FIX B the runtime drain had no arm and dropped it, so
+/// the linkpearl never glowed. Asserts the pearl-glow SetActorProperty
+/// (0x0137) reaches the client.
+#[tokio::test]
+async fn runtime_drain_applies_player_set_npc_ls_glow() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LC;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.unwrap());
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (1, 0, 0, 0, 'Pearl Tester')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let chara = Character::new(1);
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 133, 1, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    world.upsert_session(MapSession::new(1)).await;
+
+    let handled = crate::runtime::quest_apply::apply_runtime_lua_command(
+        LC::PlayerSetNpcLs {
+            player_id: 1,
+            npc_ls_id: 1,
+            state: 3, // NPCLS_ALERT — glow
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(handled, "runtime drain must handle PlayerSetNpcLs");
+
+    let mut saw_property = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_SET_ACTOR_PROPERTY {
+                saw_property = true;
+            }
+        }
+    }
+    assert!(
+        saw_property,
+        "PlayerSetNpcLs(ALERT) must emit the playerWork.npcLinkshellChat pearl-glow property",
+    );
+
+    // The in-memory CharaState must also be synced (npc_ls_id 1 → zero-based
+    // 0, calling). The zone-in bundle's pearl re-emit reads
+    // chara.npc_linkshells, so without this sync the pearl is lost on a
+    // SAME-SESSION warp (the man0l1 Baderon beat) and the NPC-linkshell read
+    // never fires → softlock. (Garlemald-Server #46.)
+    let handle = registry.get(1).await.expect("actor present");
+    let c = handle.character.read().await;
+    assert!(
+        c.chara
+            .npc_linkshells
+            .iter()
+            .any(|e| e.npc_ls_id == 0 && e.is_calling && e.is_extra),
+        "PlayerSetNpcLs(ALERT) must sync chara.npc_linkshells (id 0, calling+extra) so the \
+         post-warp zone-in re-emit restores the pearl; got {:?}",
+        c.chara.npc_linkshells,
+    );
+}
+
+/// Garlemald-Server #46 live test round 2 — drive the REAL
+/// `AetheryteParent.lua` through `call_npc_on_event_started` (FIX A's
+/// helper). It must load, run onEventStarted -> doNormalMenu, and emit
+/// the `eventAetheryteParentSelect` menu round-trip (RunEventFunction)
+/// — proof the new non-quest NPC/object dispatch opens the aetheryte
+/// menu. Before the fix, clicking the aetheryte hit only the quest-hook
+/// fan-out (no-op for a non-quest object) and nothing happened.
+#[test]
+fn real_aetheryte_parent_on_event_started_opens_menu() {
+    use crate::lua::LuaEngine;
+    use crate::lua::userdata::PlayerSnapshot;
+
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+    let script_path = root.join("base/chara/npc/object/aetheryte/AetheryteParent.lua");
+    assert!(script_path.exists());
+    let engine = LuaEngine::new(root);
+
+    let npc_spec = crate::lua::LuaNpcSpec {
+        actor_id: 0x4400_0001,
+        name: "camp_beardedrock_aetheryte".to_string(),
+        class_name: "AetheryteParent".to_string(),
+        class_path: "/Chara/Npc/Object/Aetheryte/AetheryteParent".to_string(),
+        unique_id: String::new(),
+        zone_id: 128,
+        zone_name: "sea0Field01".to_string(),
+        state: 0,
+        pos: (0.0, 0.0, 0.0),
+        rotation: 0.0,
+        actor_class_id: 1_280_002,
+        quest_graphic: 0,
+    };
+    let snapshot = PlayerSnapshot {
+        actor_id: 1,
+        ..Default::default()
+    };
+    let result = engine.call_npc_on_event_started(
+        &script_path,
+        snapshot,
+        npc_spec,
+        "talkDefault".to_string(),
+        1,
+        Vec::new(),
+    );
+    assert!(
+        result.error.is_none(),
+        "AetheryteParent onEventStarted errored: {:?}",
+        result.error,
+    );
+    assert!(
+        result.commands.iter().any(|c| matches!(
+            c,
+            crate::lua::LuaCommandKind::RunEventFunction { function_name, .. }
+                if function_name == "eventAetheryteParentSelect"
+        )),
+        "expected the aetheryte teleport menu round-trip; got {:?}",
+        result.commands,
+    );
+}
+
+/// Garlemald-Server #46 live test round 2 — attuning the Camp Bearded
+/// Rock aetheryte while on man0l1 SEQ_003 advances the quest: the ported
+/// AetheryteParent.lua Main-Scenario-Intro block fires processEvent025
+/// (delegateEvent) + StartSequence(SEQ_005). Drives the real script with
+/// a man0l1@SEQ_003 snapshot. Depends on GetQuest("Man0l1") resolving to
+/// 110002 (the second-quest name-table entry added with this fix).
+#[test]
+fn real_aetheryte_parent_attunement_advances_man0l1() {
+    use crate::lua::LuaEngine;
+    use crate::lua::userdata::{PlayerSnapshot, QuestStateSnapshot};
+
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+    let script_path = root.join("base/chara/npc/object/aetheryte/AetheryteParent.lua");
+    let engine = LuaEngine::new(root);
+
+    let npc_spec = crate::lua::LuaNpcSpec {
+        actor_id: 0x4400_0001,
+        name: "camp_beardedrock_aetheryte".to_string(),
+        class_name: "AetheryteParent".to_string(),
+        class_path: "/Chara/Npc/Object/Aetheryte/AetheryteParent".to_string(),
+        unique_id: String::new(),
+        zone_id: 128,
+        zone_name: "sea0Field01".to_string(),
+        state: 0,
+        pos: (0.0, 0.0, 0.0),
+        rotation: 0.0,
+        actor_class_id: 1_280_002,
+        quest_graphic: 0,
+    };
+    let snapshot = PlayerSnapshot {
+        actor_id: 1,
+        active_quests: vec![110_002],
+        active_quest_states: vec![QuestStateSnapshot {
+            quest_id: 110_002,
+            sequence: 3, // SEQ_003
+            flags: 0,
+            counters: [0; 4],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }],
+        ..Default::default()
+    };
+    let result = engine.call_npc_on_event_started(
+        &script_path,
+        snapshot,
+        npc_spec,
+        "talkDefault".to_string(),
+        1,
+        Vec::new(),
+    );
+    assert!(
+        result.error.is_none(),
+        "AetheryteParent (man0l1 SEQ_003) errored: {:?}",
+        result.error,
+    );
+    // The block fires `callClientFunction(processEvent025)` (which parks
+    // the coroutine on _WAIT_EVENT) THEN StartSequence(SEQ_005) on the
+    // EventUpdate resume — so the first slice carries only the
+    // processEvent025 delegate. Its presence proves the man0l1 SEQ_003
+    // branch ran: GetQuest("Man0l1") resolved to 110002 AND
+    // GetSequence()==SEQ_003 matched (else the branch is skipped). The
+    // quest actor in the delegate args (0xA0F1ADB2 = man0l1) confirms it.
+    assert!(
+        result.commands.iter().any(|c| matches!(
+            c,
+            crate::lua::LuaCommandKind::RunEventFunction { function_name, args, .. }
+                if function_name == "delegateEvent"
+                    && args.iter().any(|a| matches!(
+                        a,
+                        crate::lua::command::LuaCommandArg::String(s) if s == "processEvent025"
+                    ))
+        )),
+        "attunement at man0l1 SEQ_003 must fire processEvent025; got {:?}",
+        result.commands,
     );
 }

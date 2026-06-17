@@ -250,6 +250,19 @@ impl PacketProcessor {
         self.world.register_client(session_id, client.clone()).await;
         let mut session = Session::new(session_id);
         session.current_zone_id = zone_id;
+        // Restore the saved private area (a quest Echo / PrivateAreaMasterPast
+        // instance) so a relog INSIDE one lands the player back in it rather
+        // than the public zone. Without this a player who saved in man0l1's
+        // Fisherman's-Guild echo (PrivateAreaMasterPast type 5, zone 230)
+        // reloads into public zone 230 — they see the public guild populace but
+        // the echo-only quest NPCs (e.g. Sisipu, class 1000155, which has no
+        // public spawn row) are absent and the quest can't advance. The login
+        // zone-change below threads this through. (Garlemald-Server #46.)
+        let login_private_area =
+            (!loaded.current_private_area.is_empty()).then(|| loaded.current_private_area.clone());
+        let login_private_area_type = loaded.current_private_area_type;
+        session.current_private_area_name = login_private_area.clone();
+        session.current_private_area_level = login_private_area_type;
         session.destination_x = spawn.x;
         session.destination_y = spawn.y;
         session.destination_z = spawn.z;
@@ -357,6 +370,10 @@ impl PacketProcessor {
         // registry-reachable state. EquipAbility/UnequipAbility/
         // SwapAbilities apply paths mutate this vec in-place.
         character.chara.hotbar = loaded.hotbar.clone();
+        // Owned NPC linkshells — hydrated for the zone-in pearl re-emit
+        // (Garlemald-Server #46). The PlayerSetNpcLs apply path keeps
+        // the DB row authoritative; this mirror is read-only at zone-in.
+        character.chara.npc_linkshells = loaded.npc_linkshells.clone();
         // SNpc / Path Companion hydration — same registry-reachability
         // motivation. The SetSNpc apply path mutates these in-place +
         // persists via db.save_snpc.
@@ -388,6 +405,7 @@ impl PacketProcessor {
                     row.counter1,
                     row.counter2,
                     row.counter3,
+                    row.counter4,
                     row.npc_ls_from,
                     row.npc_ls_msg_step,
                 ));
@@ -461,7 +479,15 @@ impl PacketProcessor {
         if !is_login {
             if let Err(e) = self
                 .world
-                .do_zone_change(actor_id, session_id, zone_id, spawn, rotation)
+                .do_zone_change_with_private_area(
+                    actor_id,
+                    session_id,
+                    zone_id,
+                    login_private_area.clone(),
+                    login_private_area_type,
+                    spawn,
+                    rotation,
+                )
                 .await
             {
                 tracing::error!(error = %e, actor = actor_id, "zone change failed");
@@ -625,18 +651,34 @@ impl PacketProcessor {
         // position with the cutscene-canonical coordinates, and the
         // zone change needs the updated values to stage the player at
         // the right spot before `send_zone_in_bundle` renders them.
-        let (spawn, rotation) = if let Some(snap) = self.world.session(session_id).await {
-            (
-                Vector3::new(snap.destination_x, snap.destination_y, snap.destination_z),
-                snap.destination_rot,
-            )
-        } else {
-            (Vector3::default(), 0.0)
-        };
+        let (spawn, rotation, login_private_area, login_private_area_type) =
+            if let Some(snap) = self.world.session(session_id).await {
+                (
+                    Vector3::new(snap.destination_x, snap.destination_y, snap.destination_z),
+                    snap.destination_rot,
+                    // Restored in handle_session_begin from the saved
+                    // currentPrivateArea — route the login zone-in into the
+                    // saved Echo / private-area instance so relogging inside
+                    // one (e.g. man0l1's FSH-guild echo) lands the player back
+                    // in it with its echo-only NPCs. (Garlemald-Server #46.)
+                    snap.current_private_area_name.clone(),
+                    snap.current_private_area_level,
+                )
+            } else {
+                (Vector3::default(), 0.0, None, 0)
+            };
 
         if let Err(e) = self
             .world
-            .do_zone_change(actor_id, session_id, zone, spawn, rotation)
+            .do_zone_change_with_private_area(
+                actor_id,
+                session_id,
+                zone,
+                login_private_area,
+                login_private_area_type,
+                spawn,
+                rotation,
+            )
             .await
         {
             tracing::error!(error = %e, actor = actor_id, "login zone change failed");
@@ -763,6 +805,35 @@ impl PacketProcessor {
                     );
                 }
             }
+        }
+
+        // Arm quest ENPC state on login / relog. A continuous playthrough sets
+        // up each sequence's talk/push ENPC flags via StartSequence ->
+        // onStateChange (and quest:UpdateENPCs on talk). But a RELOG loads the
+        // quest at its saved sequence/counters WITHOUT a StartSequence, so
+        // onStateChange never re-runs: the ENPC flags (e.g. man0l1 SEQ_007's
+        // MSK_TRIGGER `pushDefault` + Isandorel-off at subseqMSK==1) are never
+        // armed, AND `state.current` stays empty — so the is_quest_enpc guard
+        // in dispatch_event_start_to_npc misfires and prematurely resumes the
+        // first talk's parked cutscene ("first talk did nothing"). Re-run
+        // onStateChange for every active quest now that the zone-in NPCs are
+        // spawned (find_npc_by_class_id can resolve them). apply_quest_update
+        // _enpcs is idempotent — begin_sequence_swap + onStateChange + diff
+        // broadcast + stale-clear — so a freshly-StartSequence'd opener (the
+        // man0l0 boat) just re-derives the same state (no spurious re-broadcast
+        // / clear). Mirrors Meteor re-establishing quest ENPC state per zone-in.
+        // (Garlemald-Server #46 — SEQ_007 relog soft-lock + premature resume.)
+        let active_quest_ids: Vec<u32> = {
+            let c = handle.character.read().await;
+            c.quest_journal
+                .slots
+                .iter()
+                .flatten()
+                .map(|q| q.quest_id())
+                .collect()
+        };
+        for quest_id in active_quest_ids {
+            self.apply_quest_update_enpcs(actor_id, quest_id).await;
         }
 
         Ok(())
@@ -1336,25 +1407,17 @@ impl PacketProcessor {
                 .await;
             }
             LC::AddGil { actor_id, amount } => {
-                if amount == 0 {
-                    return;
-                }
-                match self.db.add_gil(actor_id, amount).await {
-                    Ok(total) => {
-                        tracing::info!(actor = actor_id, delta = amount, total, "AddGil applied",);
-                        // Currency-package inventory refresh packet emission
-                        // deferred — the next zone-in / explicit inventory
-                        // resync reflects the new balance.
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            actor = actor_id,
-                            delta = amount,
-                            err = %e,
-                            "AddGil: DB persist failed",
-                        );
-                    }
-                }
+                // Shared applier: DB persist + the currency-package
+                // delta bracket and 25246 "You obtain" toast to the
+                // owning client (Garlemald-Server #46).
+                crate::runtime::quest_apply::apply_add_gil(
+                    actor_id,
+                    amount,
+                    &self.registry,
+                    Some(&self.world),
+                    &self.db,
+                )
+                .await;
             }
             LC::Die { actor_id } => {
                 let Some(zone) = self.world.zone(handle.zone_id).await else {
@@ -1399,6 +1462,8 @@ impl PacketProcessor {
                     item_package,
                     item_id,
                     quantity,
+                    &self.registry,
+                    Some(&self.world),
                     &self.db,
                 )
                 .await;
@@ -1423,6 +1488,7 @@ impl PacketProcessor {
                     player_id,
                     leve_id,
                     &self.registry,
+                    Some(&self.world),
                     &self.db,
                     self.lua.as_ref(),
                 )
@@ -1499,12 +1565,37 @@ impl PacketProcessor {
                 text_owner_id,
                 text_id,
                 log_type,
+                params,
             } => {
                 crate::runtime::quest_apply::apply_send_game_message(
                     actor_id,
                     text_owner_id,
                     text_id,
                     log_type,
+                    &params,
+                    &self.registry,
+                    &self.world,
+                )
+                .await;
+            }
+            // The NPC-linkshell narration line, drained on the onNpcLS
+            // fan-out (which routes through this login applier).
+            // (Garlemald-Server #46 live test.)
+            LC::SendGameMessageLocalizedDisplayName {
+                player_id,
+                text_owner_actor_id,
+                text_id,
+                log_type,
+                display_id,
+                params,
+            } => {
+                crate::runtime::quest_apply::apply_send_game_message_localized_display_name(
+                    player_id,
+                    text_owner_actor_id,
+                    text_id,
+                    log_type,
+                    display_id,
+                    &params,
                     &self.registry,
                     &self.world,
                 )
@@ -1861,6 +1952,23 @@ impl PacketProcessor {
             // runtime applier so the equip + 0x014E refresh actually run.
             // (Garlemald-Server #28.)
             cmd @ LC::EquipFromPackage { .. } => {
+                crate::runtime::quest_apply::apply_runtime_lua_command(
+                    cmd,
+                    &self.registry,
+                    &self.db,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
+            }
+            // `player:SendDataPacket(n)` from a quest/NPC hook drained on
+            // the login path — most importantly `endTutorialMode` =
+            // SendDataPacket(7), fired from man0l1/man0g1 onNpcLS. The
+            // runtime drain owns this command (apply_send_data_packet)
+            // but the login drain had no arm, so the tutorial-mode exit
+            // was silently dropped on the onNpcLS fan-out, leaving the
+            // client masked. (Garlemald-Server #46 live test.)
+            cmd @ LC::SendDataPacket { .. } => {
                 crate::runtime::quest_apply::apply_runtime_lua_command(
                     cmd,
                     &self.registry,
@@ -2326,20 +2434,26 @@ impl PacketProcessor {
         {
             let mut zone = zone_arc.write().await;
             let mut ob = crate::zone::outbox::AreaOutbox::new();
+            let spawn_pos =
+                common::Vector3::new(spawn.position_x, spawn.position_y, spawn.position_z);
             zone.core.add_actor(
                 crate::zone::area::StoredActor {
                     actor_id,
                     kind: crate::zone::area::ActorKind::BattleNpc,
-                    position: common::Vector3::new(
-                        spawn.position_x,
-                        spawn.position_y,
-                        spawn.position_z,
-                    ),
+                    position: spawn_pos,
                     grid: (0, 0),
                     is_alive: true,
                 },
                 &mut ob,
             );
+            // Project into the correct spatial-grid cell. `add_actor` stores
+            // grid (0,0); `actors_around` / `broadcast_around_actor` read the
+            // grid cell, not the raw position — so without this the NPC sits in
+            // cell (0,0) and the post-warp content reveal's spawn_bundle_fanout
+            // finds no nearby player and the NPC never renders (until its first
+            // MoveActorToPosition happens to fix the cell). (Garlemald-Server #46.)
+            zone.core
+                .update_actor_position(actor_id, spawn_pos, &mut ob);
         }
 
         // 6. Register the live Character in the ActorRegistry.
@@ -2899,6 +3013,14 @@ impl PacketProcessor {
         let session_id = handle.session_id;
         let actor_id = handle.actor_id;
 
+        // Capture the player's CURRENT zone before step 1 overwrites it —
+        // the same-region bundle-pacing decision further down compares against
+        // it.
+        let old_zone_id = {
+            let c = handle.character.read().await;
+            c.base.zone_id
+        };
+
         // 1. Update character position so subsequent reads + the zone-in
         //    bundle's `CreateSpawnPositionPacket` see the new coords.
         //    Also purge LOSE_ON_ZONING status effects — content-area
@@ -2957,6 +3079,20 @@ impl PacketProcessor {
                 "DoZoneChangeContent: do_zone_change_with_private_area failed",
             );
             return;
+        }
+
+        // Project the PLAYER into the correct spatial-grid cell. The helper
+        // re-inserts the player at grid (0,0); broadcast_around_actor (the
+        // post-warp content reveal) keys on the grid CELL, so without this the
+        // player sits in cell (0,0) while the escort NPCs are at the gate, and
+        // the reveal's spawn_bundle_fanout finds no nearby player → the NPCs
+        // never render. Normal warps self-correct via the deferred bundle / the
+        // player's first position update, but the instant spawnType-0x16 warp
+        // reveals immediately on RX 0x0007, before that happens. (Garlemald #46.)
+        if let Some(zone_arc) = self.world.zone(parent_zone_id).await {
+            let mut zw = zone_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            zw.core.update_actor_position(actor_id, spawn, &mut ob);
         }
 
         // 3. Update the session's spawn_type / destination fields. The
@@ -3182,60 +3318,135 @@ impl PacketProcessor {
             client.send_bytes(msg.to_bytes()).await;
         }
 
-        // DeleteAllActors + 0x00E2(0x10) — THE same-zone reload trigger.
-        //
-        // These two were previously sent UNTAGGED (`target_id == 0`), and
-        // every map-server subpacket crosses the world-server proxy, whose
-        // fan-out drops untargeted subpackets (`if target == 0 { continue; }`,
-        // world-server/src/server.rs). So the client never received either
-        // packet: no actor wipe, and — critically — no 0x00E2. The decompiled
-        // client (FUN_0058cca0, case 0x00E2) sets the MapLayoutElement's
-        // force-reload latch [+0xbc]=1 for any subcode except 0x15/0x16; the
-        // SetMap handler (FUN_0059ced0) then schedules a scene reload when
-        // `latch != 0 OR region != resident [+0x94]`. With the 0x00E2 dropped,
-        // a same-region SetMap(106) took the no-op arm and "Now Loading" hung
-        // forever — which is what the high-16 region tag (now removed, see
-        // send_zone_in_bundle) was papering over by forcing the
-        // region-mismatch arm at the cost of committing an invalid resident
-        // region. Tagging the pair delivers the latch, so the unmodified
-        // parent region reloads exactly like pmeteor's capture.
-        // (Garlemald-Server #28.)
-        {
-            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
-            wipe.set_target_id(session_id);
-            client.send_bytes(wipe.to_bytes()).await;
-            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
-            e2.set_target_id(session_id);
-            client.send_bytes(e2.to_bytes()).await;
-        }
-
-        // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
-        //    the session + character we just updated, so the bundle
-        //    spawns the player at the content-area coords.
-        self.world
-            .send_zone_in_bundle(
-                &self.registry,
-                &self.db,
-                self.lua.as_ref(),
-                session_id,
-                spawn_type as u16,
-                // Content warps keep their pmeteor-verified shape: the
-                // bare 0x0007 wipe ahead of this bundle (see above) is
-                // load-bearing for the same-zone content transition, so
-                // no trailing keep-list commit is added on top.
-                /* commit_keep_list */
-                false,
-            )
-            .await;
-
-        // The bundle has now AddActor'd + state-synced the content NPCs on
-        // the client; lift the pre-warp suppression of roster broadcasts
-        // (see `ActiveContentScript::warp_complete`).
-        if let Some(mut snap) = self.world.session(session_id).await {
-            if let Some(active) = snap.active_content_script.as_mut() {
-                active.warp_complete = true;
+        // The content-warp reload has TWO completely separate shapes, picked
+        // by spawnType. Everything below this point until the onZoneIn hook is
+        // shape-specific, so we branch the WHOLE tail rather than scatter
+        // per-line gates (which is what regressed the man0l0 opening tutorial:
+        // the #46 escort work rewrote this shared path and the original
+        // non-escort reload was only partly restored). (Garlemald-Server #46.)
+        if spawn_type == 0x16 {
+            // ===== man0l1 same-map escort (spawnType 0x16) =====
+            // NO 0x00E2 latch: the geometry is already resident so nothing ever
+            // clears MapLayoutElement [+0xb9] (decomp: captures/issue28-rca),
+            // and the entry cut's untimed `_waitForMapLoaded` would block on
+            // [+0xb9]==0 forever. Leave [+0xb9] at the clean post-login 0 and
+            // finish the zone-in instantly via the spawnType-0x16 0x00CE bypass.
+            // DeleteAllActors still fires to despawn the public-zone actors.
+            {
+                let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+                wipe.set_target_id(session_id);
+                client.send_bytes(wipe.to_bytes()).await;
             }
-            self.world.upsert_session(snap).await;
+
+            // Keep `content_warp_acked` FALSE through the warp: the bundle must
+            // be the PLAYER's reload ONLY (matching pmeteor's reference burst).
+            // Bundling the content NPC spawns into the warp (interleaved after
+            // the player's 0x00CE order-machine arm, mid-reload) crashes the
+            // client. The roster is revealed AFTER the client echoes its
+            // post-warp zone-in — see the RX 0x0007 handler, which flips
+            // `content_warp_acked` + `warp_complete` and fans the roster out.
+            if let Some(mut snap) = self.world.session(session_id).await {
+                snap.content_warp_acked = false;
+                self.world.upsert_session(snap).await;
+            }
+
+            // Same-region cross-zone changes need the ~6 s deferral (the
+            // 230 -> 133 Drowning Wench pacing); a same-zone change (old == new)
+            // takes the immediate flush. Either way commit_keep_list = true so
+            // the old zone's actors are cleaned via the trailing Mass-Delete
+            // keep-list trio.
+            let same_region = {
+                let old_region = match self.world.zone(old_zone_id).await {
+                    Some(z) => z.read().await.core.region_id,
+                    None => 0,
+                };
+                let new_region = match self.world.zone(parent_zone_id).await {
+                    Some(z) => z.read().await.core.region_id,
+                    None => u16::MAX,
+                };
+                old_region == new_region
+            };
+            let defer_same_region = same_region && old_zone_id != parent_zone_id;
+            if defer_same_region {
+                const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
+                let fire_at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+                    + RETAIL_ZONE_CHANGE_GAP_MS;
+                if let Some(mut snap) = self.world.session(session_id).await {
+                    snap.pending_zone_in = Some(crate::data::PendingZoneIn {
+                        fire_at_unix_ms,
+                        spawn_type: spawn_type as u16,
+                        commit_keep_list: true,
+                        notify_private_area: false,
+                    });
+                    self.world.upsert_session(snap).await;
+                }
+                tracing::info!(
+                    player = player_id,
+                    zone = parent_zone_id,
+                    old_zone = old_zone_id,
+                    "DoZoneChangeContent: zone-in bundle deferred (retail same-region pacing)",
+                );
+            } else {
+                self.world
+                    .send_zone_in_bundle(
+                        &self.registry,
+                        &self.db,
+                        self.lua.as_ref(),
+                        session_id,
+                        spawn_type as u16,
+                        /* commit_keep_list */ true,
+                    )
+                    .await;
+            }
+        } else {
+            // ===== man0l0 deck tutorial / man0g0 SEQ_005 (spawnType 0x10) =====
+            // The original pre-#46 reload, restored verbatim. These warps need a
+            // REAL scene reload: DeleteAllActors + the 0x00E2(0x10) force-reload
+            // latch. The decompiled client (FUN_0058cca0, case 0x00E2) sets the
+            // MapLayoutElement force-reload latch [+0xbc]=1 for any subcode
+            // except 0x15/0x16; the SetMap handler then schedules the reload.
+            // WITHOUT the latch a same-region SetMap takes the no-op arm and
+            // "Now Loading" hangs forever — exactly the man0l0 regression.
+            // Both subpackets MUST be target_id-tagged or the world-server
+            // proxy drops them. (Garlemald-Server #28.)
+            {
+                let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+                wipe.set_target_id(session_id);
+                client.send_bytes(wipe.to_bytes()).await;
+                let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+                e2.set_target_id(session_id);
+                client.send_bytes(e2.to_bytes()).await;
+            }
+
+            // Immediate bundle, commit_keep_list = false: the bare wipe above is
+            // load-bearing for the same-zone content transition, so no trailing
+            // keep-list commit is added on top (the pmeteor-verified shape). The
+            // content NPCs ride this bundle.
+            self.world
+                .send_zone_in_bundle(
+                    &self.registry,
+                    &self.db,
+                    self.lua.as_ref(),
+                    session_id,
+                    spawn_type as u16,
+                    /* commit_keep_list */ false,
+                )
+                .await;
+
+            // The bundle has now AddActor'd + state-synced the content NPCs on
+            // the client; lift the pre-warp suppression of roster broadcasts
+            // (`ActiveContentScript::warp_complete`) and unpark the onUpdate
+            // driver (`content_warp_acked`) — no RX-0x0007 reveal is needed.
+            if let Some(mut snap) = self.world.session(session_id).await {
+                if let Some(active) = snap.active_content_script.as_mut() {
+                    active.warp_complete = true;
+                }
+                snap.content_warp_acked = true;
+                self.world.upsert_session(snap).await;
+            }
         }
 
         // 5. B7 of the SEQ_005 unblock plan — fire the content
@@ -4720,95 +4931,18 @@ impl PacketProcessor {
     /// registry yet, so the client won't see the icon flip until
     /// they're plumbed through.
     async fn apply_player_set_npc_ls(&self, player_id: u32, npc_ls_id: u32, state: u8) {
-        if !(1..=40).contains(&npc_ls_id) {
-            tracing::debug!(
-                player = player_id,
-                npc_ls_id,
-                state,
-                "SetNpcLs: id out of valid range (1..=40)",
-            );
-            return;
-        }
-        let (is_calling, is_extra) = match state {
-            0 => (false, false), // NPCLS_GONE
-            1 => (false, true),  // NPCLS_INACTIVE
-            2 => (true, false),  // NPCLS_ACTIVE
-            3 => (true, true),   // NPCLS_ALERT
-            _ => {
-                tracing::debug!(
-                    player = player_id,
-                    npc_ls_id,
-                    state,
-                    "SetNpcLs: unknown state code",
-                );
-                return;
-            }
-        };
-        let zero_based = npc_ls_id - 1;
-
-        // C# `Player.AddNpcLs` first-add gate: if the player didn't
-        // own this NpcLs (both flags false OR the row didn't exist),
-        // fire the canonical "<NpcLs> linkpearl obtained." toast on
-        // the GONE → owned transition. We probe BEFORE the upsert so
-        // a re-add of an already-owned LS doesn't double-fire.
-        let was_owned: bool = match self.db.load_npc_ls_state(player_id, zero_based).await {
-            Ok(Some((c, e))) => c || e, // any flag true = owned
-            Ok(None) | Err(_) => false, // missing row OR error → treat as not-owned
-        };
-
-        if let Err(e) = self
-            .db
-            .save_npc_ls(player_id, zero_based, is_calling, is_extra)
-            .await
-        {
-            tracing::warn!(
-                player = player_id,
-                npc_ls_id,
-                state,
-                err = %e,
-                "SetNpcLs: DB persist failed",
-            );
-            return;
-        }
-        tracing::debug!(
-            player = player_id,
+        // Delegate to the shared free-fn so the flashing-pearl flow is
+        // identical on the login drain and the runtime/resume drain.
+        // (Garlemald-Server #46 live test round 2.)
+        crate::runtime::quest_apply::apply_player_set_npc_ls(
+            player_id,
             npc_ls_id,
             state,
-            is_calling,
-            is_extra,
-            "SetNpcLs persisted",
-        );
-
-        // First-add toast — fire only when transitioning from "not
-        // owned" to "owned". State 0 (GONE) is not an "ownership"
-        // state itself, so we also gate on the new state being
-        // anything-but-GONE (otherwise SetNpcLs(id, GONE) on a
-        // never-owned LS would fire spuriously).
-        let now_owned = is_calling || is_extra;
-        if !was_owned
-            && now_owned
-            && let Some(handle) = self.registry.get(player_id).await
-            && let Some(client) = self.world.client(handle.session_id).await
-        {
-            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                // Header source = WorldMaster (the client dispatches by
-                // header source; it must be an always-present static
-                // actor, never the player — Garlemald-Server #28 crash RCA).
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                /* text_id */ 25118,
-                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
-                /* prefer_alt */ false,
-            );
-            pkt.set_target_id(handle.session_id);
-            client.send_bytes(pkt.to_bytes()).await;
-            tracing::debug!(
-                player = player_id,
-                npc_ls_id,
-                "SetNpcLs first-add: 25118 'linkpearl obtained' toast fired",
-            );
-        }
+            &self.registry,
+            &self.db,
+            &self.world,
+        )
+        .await;
     }
 
     /// `player:EquipAbility(classId, commandId, hotbarSlot, _)` —
@@ -5710,90 +5844,39 @@ impl PacketProcessor {
     /// the migration-050 column. Silently no-ops if the player isn't
     /// in the registry or the quest isn't in their journal.
     async fn apply_quest_set_npc_ls_from(&self, player_id: u32, quest_id: u32, from: u32) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let slot = {
-            let mut c = handle.character.write().await;
-            let Some(slot) = c.quest_journal.slot_of(quest_id) else {
-                return;
-            };
-            if let Some(q) = c.quest_journal.slots[slot].as_mut() {
-                q.set_npc_ls_from(from);
-            }
-            slot as i32
-        };
-        if let Err(e) = self
-            .db
-            .save_quest_npc_ls(player_id, slot, from, /* msg_step preserved */ {
-                let c = handle.character.read().await;
-                c.quest_journal
-                    .get(quest_id)
-                    .map(|q| q.get_npc_ls_msg_step())
-                    .unwrap_or(0)
-            })
-            .await
-        {
-            tracing::warn!(
-                player = player_id, quest = quest_id, from, err = %e,
-                "QuestSetNpcLsFrom: DB persist failed",
-            );
-        }
+        crate::runtime::quest_apply::apply_quest_set_npc_ls_from(
+            player_id,
+            quest_id,
+            from,
+            &self.registry,
+            &self.db,
+            &self.world,
+        )
+        .await;
     }
 
     /// `quest:GetData():IncrementNpcLsMsgStep()` and the
     /// `LuaQuestHandle::ReadNpcLsMsg` first step.
     async fn apply_quest_increment_npc_ls_msg_step(&self, player_id: u32, quest_id: u32) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let (slot, npc_ls_from, new_step) = {
-            let mut c = handle.character.write().await;
-            let Some(slot) = c.quest_journal.slot_of(quest_id) else {
-                return;
-            };
-            let (from, step) = if let Some(q) = c.quest_journal.slots[slot].as_mut() {
-                let step = q.inc_npc_ls_msg_step();
-                (q.get_npc_ls_from(), step)
-            } else {
-                return;
-            };
-            (slot as i32, from, step)
-        };
-        if let Err(e) = self
-            .db
-            .save_quest_npc_ls(player_id, slot, npc_ls_from, new_step)
-            .await
-        {
-            tracing::warn!(
-                player = player_id, quest = quest_id, err = %e,
-                "QuestIncrementNpcLsMsgStep: DB persist failed",
-            );
-        }
+        crate::runtime::quest_apply::apply_quest_increment_npc_ls_msg_step(
+            player_id,
+            quest_id,
+            &self.registry,
+            &self.db,
+        )
+        .await;
     }
 
     /// `quest:GetData():ClearNpcLs()` and the
     /// `LuaQuestHandle::EndOfNpcLsMsgs` last step.
     async fn apply_quest_clear_npc_ls(&self, player_id: u32, quest_id: u32) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let slot = {
-            let mut c = handle.character.write().await;
-            let Some(slot) = c.quest_journal.slot_of(quest_id) else {
-                return;
-            };
-            if let Some(q) = c.quest_journal.slots[slot].as_mut() {
-                q.clear_npc_ls();
-            }
-            slot as i32
-        };
-        if let Err(e) = self.db.save_quest_npc_ls(player_id, slot, 0, 0).await {
-            tracing::warn!(
-                player = player_id, quest = quest_id, err = %e,
-                "QuestClearNpcLs: DB persist failed",
-            );
-        }
+        crate::runtime::quest_apply::apply_quest_clear_npc_ls(
+            player_id,
+            quest_id,
+            &self.registry,
+            &self.db,
+        )
+        .await;
     }
 
     async fn apply_add_seals(&self, player_id: u32, gc: u8, amount: i32) {
@@ -6198,7 +6281,12 @@ impl PacketProcessor {
             if q.is_dirty() {
                 let sequence = q.get_sequence();
                 let flags = q.get_flags();
-                let counters = [q.get_counter(0), q.get_counter(1), q.get_counter(2)];
+                let counters = [
+                    q.get_counter(0),
+                    q.get_counter(1),
+                    q.get_counter(2),
+                    q.get_counter(3),
+                ];
                 let actor_id = q.actor_id;
                 q.clear_dirty();
                 Some((slot as i32, actor_id, sequence, flags, counters))
@@ -6206,10 +6294,10 @@ impl PacketProcessor {
                 None
             }
         };
-        if let Some((slot, actor_id, sequence, flags, [c1, c2, c3])) = save_tuple
+        if let Some((slot, actor_id, sequence, flags, [c1, c2, c3, c4])) = save_tuple
             && let Err(e) = self
                 .db
-                .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3)
+                .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3, c4)
                 .await
         {
             tracing::warn!(
@@ -6592,7 +6680,7 @@ impl PacketProcessor {
         let (slot, actor_id) = save_tuple;
         if let Err(e) = self
             .db
-            .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0)
+            .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0, 0)
             .await
         {
             tracing::warn!(
@@ -6819,20 +6907,21 @@ impl PacketProcessor {
                         q.get_counter(0),
                         q.get_counter(1),
                         q.get_counter(2),
+                        q.get_counter(3),
                         q.get_npc_ls_from(),
                         q.get_npc_ls_msg_step(),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+                .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0));
             let handle = crate::lua::LuaQuestHandle {
                 player_id: snapshot.actor_id,
                 quest_id,
                 has_quest: c.quest_journal.has(quest_id),
                 sequence: quest.0,
                 flags: quest.1,
-                counters: [quest.2, quest.3, quest.4],
-                npc_ls_from: quest.5,
-                npc_ls_msg_step: quest.6,
+                counters: [quest.2, quest.3, quest.4, quest.5],
+                npc_ls_from: quest.6,
+                npc_ls_msg_step: quest.7,
                 queue: crate::lua::command::CommandQueue::new(),
             };
             (snapshot, handle)
@@ -6943,7 +7032,12 @@ impl PacketProcessor {
                 has_quest: true,
                 sequence: q.get_sequence(),
                 flags: q.get_flags(),
-                counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                counters: [
+                    q.get_counter(0),
+                    q.get_counter(1),
+                    q.get_counter(2),
+                    q.get_counter(3),
+                ],
                 npc_ls_from: q.get_npc_ls_from(),
                 npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 queue: crate::lua::command::CommandQueue::new(),
@@ -7012,7 +7106,30 @@ impl PacketProcessor {
         }
         // Drain non-event commands through the login-command pipeline
         // (quest-flag mutates, AddExp, UpdateENPCs, etc.).
+        //
+        // `RunEventFunction` / `EndEvent` are ALREADY on the wire from the
+        // EventOutbox bridge immediately above (`translate_lua_commands_into
+        // _outbox` matches exactly those two variants and `dispatch_event_
+        // event` sends them). `apply_login_lua_command`'s own RunEventFunction
+        // /EndEvent arm (processor.rs ~1847) re-runs the IDENTICAL translate+
+        // dispatch, so draining them here a second time double-emits the
+        // cutscene RPC: the 1.x client plays the cinematic twice and posts two
+        // EventUpdates, which corrupts its modal event layer — the man0l0
+        // Rostnsthal walk-up softlock (each `onPush` sent `processTtrNomal002`
+        // twice; after a couple of approaches the client went modal-silent).
+        // Skip those two here; the bridge owns them. This mirrors the existing
+        // KickEvent dedup (KickEvent is INTENTIONALLY excluded from the bridge
+        // — see lua_bridge.rs — and owned by the login arm; here the ownership
+        // is the reverse). Every other command (flag mutates, UpdateENPCs,
+        // SendMessage, …) still needs the login applier. (Garlemald-Server #46.)
         for cmd in result.commands {
+            if matches!(
+                cmd,
+                crate::lua::command::LuaCommand::RunEventFunction { .. }
+                    | crate::lua::command::LuaCommand::EndEvent { .. }
+            ) {
+                continue;
+            }
             Box::pin(self.apply_login_lua_command(handle, cmd)).await;
         }
 
@@ -7105,6 +7222,81 @@ impl PacketProcessor {
                     source = source,
                     "RX 0x0007 zone-in-complete signal (no-op pending dedicated handler)",
                 );
+                // Content-warp completion: the warp bundle ships the PLAYER's
+                // reload only; the content NPCs are deferred to here so they
+                // never ride the same flush as the order-machine reload (which
+                // crashes the client). On the client's first post-warp zone-in
+                // echo, flip `warp_complete`, reveal the content roster, and
+                // unpark the `onUpdate` driver. The code at sub.data+0x14 is
+                // 0xFFFFFFFF on the terminal echo and a progress value earlier;
+                // we only need the FIRST one here — the reveal/escort run in a
+                // separate flush from the reload either way. (Garlemald #46.)
+                let reveal = self.world.session(source).await.and_then(|snap| {
+                    if snap.content_warp_acked {
+                        return None;
+                    }
+                    snap.active_content_script.as_ref().map(|a| {
+                        (
+                            a.director_actor_id,
+                            a.parent_zone_id,
+                            snap.destination_spawn_type,
+                        )
+                    })
+                });
+                if let Some((director_actor_id, _parent_zone_id, dest_spawn_type)) = reveal {
+                    let roster = {
+                        let mut roster: Vec<u32> = Vec::new();
+                        if let Some(mut snap) = self.world.session(source).await {
+                            if let Some(active) = snap.active_content_script.as_mut() {
+                                active.warp_complete = true;
+                            }
+                            snap.content_warp_acked = true;
+                            roster = snap
+                                .transient_director_members
+                                .get(&director_actor_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.world.upsert_session(snap).await;
+                        }
+                        roster
+                    };
+                    // The deferred-reveal is SPECIFIC to the man0l1 same-map
+                    // escort (spawnType 0x16): its content NPCs were held out of
+                    // the warp bundle and are pushed here, on the post-warp
+                    // zone-in echo, via the proven push_npc_spawn path (direct
+                    // send to the player). Every OTHER content warp (man0l0
+                    // deck tutorial, man0g0 SEQ_005 — spawnType 0x10) already
+                    // shipped its NPCs IN the bundle, so it must NOT re-reveal
+                    // (that would double-spawn). We still flip
+                    // `content_warp_acked`/`warp_complete` above for ALL content
+                    // warps so the `onUpdate` driver unparks regardless.
+                    // (Garlemald #46.)
+                    if dest_spawn_type == 0x16 {
+                        // Skip the player's own actor and the non-renderable
+                        // director entry.
+                        let npc_ids: Vec<u32> = roster
+                            .into_iter()
+                            .filter(|&id| id != source && id != director_actor_id)
+                            .collect();
+                        self.world
+                            .reveal_content_npcs(
+                                &self.registry,
+                                self.lua.as_ref(),
+                                source,
+                                &npc_ids,
+                            )
+                            .await;
+                        tracing::info!(
+                            session = source,
+                            "content warp acked — roster revealed, onUpdate driver unparked",
+                        );
+                    } else {
+                        tracing::info!(
+                            session = source,
+                            "content warp acked — onUpdate driver unparked (NPCs were bundled)",
+                        );
+                    }
+                }
             }
             OP_RX_LOCK_TARGET => {
                 // 66 events/session. Wiki: "Target Locked". Client
@@ -7329,6 +7521,17 @@ impl PacketProcessor {
     /// sequence + journalInfo.
     const REQUEST_QUEST_JOURNAL_COMMAND: u32 = 0xA0F0_5E93;
 
+    /// `NpcLinkshellChatCommand` static-actor id — `0xA0F00000 | 0x5E95`
+    /// (decoded from `staticactors.bin`). The client fires `EventStart`
+    /// against this actor when the player opens an NPC-linkshell chat
+    /// (the flashing linkpearl); the first integer LuaParam is the
+    /// `npcLsId`. pmeteor routes it to `Player.HandleNpcLs`, which finds
+    /// the active quest whose `npcLsFrom == npcLsId` and fires its
+    /// `onNpcLS(player, quest, from, msgStep)` hook. (Garlemald-Server
+    /// #46 live test — the man0l1 SEQ_003 Path-Companion progression +
+    /// endTutorialMode ride this path.)
+    const NPC_LINKSHELL_CHAT_COMMAND: u32 = 0xA0F0_5E95;
+
     // `pub(crate)` so the #28 S3.2 integration test can drive a synthetic
     // retail-shaped 0x012D through the same parse + dispatch path the
     // socket reader uses.
@@ -7357,6 +7560,22 @@ impl PacketProcessor {
             );
             return Ok(());
         }
+
+        // DIAGNOSTIC (Garlemald-Server #46 walk-up): log EVERY inbound
+        // EventStart the client sends, BEFORE any dispatch/early-return, so a
+        // live test definitively shows whether the client emits a `talkDefault`
+        // (event_type=1) for an NPC the player is trying to talk to — vs. only
+        // emitting `pushDefault` (type=2) / `noticeEvent` (type=5). If no
+        // type=1 ever appears for the target, the block is the client not
+        // sending the talk (modal / non-talkable); if it appears but nothing
+        // happens, the block is server-side dispatch.
+        tracing::info!(
+            session = session_id,
+            owner = format!("0x{:08X}", pkt.owner_actor_id),
+            event_type = pkt.event_type,
+            event_name = %pkt.event_name,
+            "RX EventStart (inbound, pre-dispatch)",
+        );
 
         let Some(handle) = self.registry.by_session(session_id).await else {
             return Ok(());
@@ -7475,9 +7694,29 @@ impl PacketProcessor {
             0 => Some("onCommand"),
             _ => None,
         } {
-            self.fire_quest_hook_for_active_quests(&handle, owner_actor_id, hook_name)
-                .await;
+            self.fire_quest_hook_for_active_quests(
+                &handle,
+                owner_actor_id,
+                hook_name,
+                &event_name_for_cmd,
+            )
+            .await;
         }
+
+        // Non-quest NPC / object interaction — run the TARGET actor's OWN
+        // `onEventStarted` script (the aetheryte's teleport/homepoint/leve
+        // menu in AetheryteParent.lua, base populace dialogue, etc.).
+        // pmeteor runs this for EVERY EventStart target via
+        // LuaEngine.EventStarted -> CallLuaFunction(player, target,
+        // "onEventStarted"); garlemald only had quest-hook / command /
+        // journal / NpcLs / director routes, so clicking a plain NPC or
+        // the aetheryte did nothing (live-test round 2). Gated to a live
+        // Npc/object owner that ISN'T a command static actor, the journal
+        // / NpcLs commands, the active content director, or a current
+        // quest ENPC (those are handled by the quest-hook fan-out above —
+        // running their base script too would double-dispatch).
+        self.dispatch_event_start_to_npc(&handle, owner_actor_id, &event_name_for_cmd)
+            .await;
 
         // SEQ-005 content-tutorial handshake (UNRESOLVED — breadcrumb for
         // the next attempt). Packet-diff against the working pmeteor capture
@@ -7525,7 +7764,34 @@ impl PacketProcessor {
         if owner_actor_id == Self::REQUEST_QUEST_JOURNAL_COMMAND
             && event_name_for_match == "commandRequest"
         {
-            self.send_quest_journal_data(&handle, session_id).await;
+            self.send_quest_journal_data(&handle, session_id, &lua_params_for_cmd)
+                .await;
+        }
+
+        // NPC linkshell chat — the client opened the flashing linkpearl.
+        // Mirror pmeteor `Player.HandleNpcLs` (Player.cs:1975-1986):
+        // find the active quest whose `npcLsFrom == npcLsId` and fire its
+        // `onNpcLS(player, quest, from, msgStep)` hook (which drains the
+        // Path-Companion messages, advances the sequence, and — at
+        // man0l1 SEQ_003 — calls endTutorialMode). Routed by owner id,
+        // like the journal command above; the on-disk
+        // commands/NpcLinkshellChatCommand.lua is a stale revision and is
+        // deliberately bypassed. (Garlemald-Server #46 live test.)
+        if owner_actor_id == Self::NPC_LINKSHELL_CHAT_COMMAND {
+            // Diagnostic (Garlemald-Server #46): the NPC-linkshell read
+            // reaches here but `handle_npc_ls_chat` couldn't find the
+            // npcLsId param. Dump the raw EventStart payload + the parsed
+            // params so the exact wire encoding of the clicked linkshell id
+            // is visible in one live test.
+            tracing::debug!(
+                owner = format_args!("{owner_actor_id:#010x}"),
+                event = %event_name_for_cmd,
+                event_type = event_type_for_cmd,
+                params = ?lua_params_for_cmd,
+                "NpcLs chat EventStart received",
+            );
+            self.handle_npc_ls_chat(&handle, &lua_params_for_cmd).await;
+            return Ok(());
         }
 
         // Generic client-command dispatch — run `commands/<Name>.lua::
@@ -7719,15 +7985,82 @@ impl PacketProcessor {
     const ACTIVATE_COMMAND_A: u32 = 0xA0F0_5209;
     const ACTIVATE_COMMAND_B: u32 = 0xA0F0_520A;
 
+    /// Main-menu System command static actors, decoded from
+    /// `staticactors.bin` (`id | 0xA0F00000`): the client fires an
+    /// `EventStart` against these when the player clicks Exit / Teleport
+    /// / Return in the main menu. Without a dispatch arm the press falls
+    /// through `command_script_name` and the button does nothing — the
+    /// live-test "Exit game / Teleport don't work" report.
+    /// `TeleportCommand` (24220) backs BOTH the Teleport menu
+    /// (`isTeleport == 0`) and Return (`isTeleport == 1`); the on-disk
+    /// `commands/{LogoutCommand,TeleportCommand}.lua` scripts already
+    /// drive the `delegateCommand` confirm round-trip, which parks on
+    /// `_WAIT_EVENT` and resumes on the client's `0x012E EventUpdate`
+    /// exactly like quest `delegateEvent`. (Garlemald-Server #46 live
+    /// test.)
+    const LOGOUT_COMMAND: u32 = 0xA0F0_5E9B;
+    const TELEPORT_COMMAND: u32 = 0xA0F0_5E9C;
+
+    /// `EmoteStandardCommand` static actor — the client fires an EventStart
+    /// against this (eventName "commandRequest") for every one-shot emote from
+    /// the emote menu / `/bow` etc., carrying the emote id (101=Surprised ..
+    /// 105=Bow ..) + a showText flag in the LuaParams. Without a dispatch arm
+    /// the press falls through `command_script_name` and the emote never plays
+    /// outside a quest's scripted `player:DoEmote`. Id observed in the live
+    /// EventStart log. (Garlemald-Server #46.)
+    const EMOTE_STANDARD_COMMAND: u32 = 0xA0F0_5E26;
+
     /// SetTarget's `attackTarget` "no attack target" sentinel — the value the
     /// 1.x client writes when the player has no locked combat target (pmeteor
     /// `SetTargetPacket.attackTarget` "Usually 0xE0000000"). Same constant as
     /// `actor_battle::NO_ENMITY_TARGET`. (Garlemald-Server #28.)
     const SET_TARGET_NONE: u32 = 0xE000_0000;
 
+    /// Does a resumed quest/director coroutine burst (drained on the
+    /// 0x012E EventUpdate) need the LOGIN command applier rather than the
+    /// runtime drain? `apply_runtime_lua_command` has no arms for the
+    /// content-area / quest-handoff / director-staging commands and would
+    /// silently drop them (its `_ => false` catch-all); only
+    /// `apply_login_lua_command` creates content areas, registers
+    /// directors, captures the post-warp KickEvent into the zone-in
+    /// bundle, etc. Each variant here marks a burst that MUST route
+    /// through login:
+    ///  * `CreateContentArea` / `DoZoneChangeContent` — the SEQ_005
+    ///    content warp (man0l0 doExitDoor);
+    ///  * `AddQuest` / `CompleteQuest` — the quest-handoff burst
+    ///    (man0l0 Hob → man0l1);
+    ///  * `Logout` / `QuitGame` — the Exit-game confirm;
+    ///  * `SetLoginDirector` — the after-quest-warp director staging
+    ///    (man0l1 Baderon → AfterQuestWarpDirector): without login
+    ///    routing the director is never created/registered/spawned and
+    ///    its `noticeEvent` kick is direct-dispatched to an unspawned
+    ///    owner the client drops, so the post-warp cutscene desktop-
+    ///    widget mode never clears and the menu / linkpearl / aetheryte
+    ///    stay dead. `SetLoginDirector` appears ONLY in director-staged
+    ///    warp bursts, so it's a precise tell with no false positives.
+    ///    (Round-3 live test — Baderon breaks the menu.)
+    fn is_login_scoped_burst(cmds: &[crate::lua::command::LuaCommand]) -> bool {
+        use crate::lua::command::LuaCommand;
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                LuaCommand::CreateContentArea { .. }
+                    | LuaCommand::DoZoneChangeContent { .. }
+                    | LuaCommand::AddQuest { .. }
+                    | LuaCommand::CompleteQuest { .. }
+                    | LuaCommand::Logout { .. }
+                    | LuaCommand::QuitGame { .. }
+                    | LuaCommand::SetLoginDirector { .. }
+            )
+        })
+    }
+
     fn command_script_name(owner_actor_id: u32) -> Option<&'static str> {
         match owner_actor_id {
             Self::ACTIVATE_COMMAND_A | Self::ACTIVATE_COMMAND_B => Some("ActivateCommand"),
+            Self::LOGOUT_COMMAND => Some("LogoutCommand"),
+            Self::TELEPORT_COMMAND => Some("TeleportCommand"),
+            Self::EMOTE_STANDARD_COMMAND => Some("EmoteStandardCommand"),
             _ => None,
         }
     }
@@ -8122,56 +8455,227 @@ impl PacketProcessor {
         .await;
     }
 
+    /// Port of pmeteor `Player.HandleNpcLs` (Player.cs:1975-1986): the
+    /// client opened an NPC-linkshell chat (`npcLsId` = first integer
+    /// LuaParam). Find the first active quest whose `npcLsFrom ==
+    /// npcLsId` and fire its `onNpcLS(player, quest, from, msgStep)`
+    /// hook via `fire_quest_event_hook` (which builds the LuaQuestHandle
+    /// with the npc-ls scratchpad fields and bridges the script's own
+    /// `player:EndEvent()` through the EventOutbox). If no quest claims
+    /// the id, mirror the script's else-branch by closing the event so
+    /// the client doesn't soft-lock in the LS window.
+    async fn handle_npc_ls_chat(
+        &self,
+        handle: &ActorHandle,
+        lua_params: &[common::luaparam::LuaParam],
+    ) {
+        use common::luaparam::LuaParam;
+        // The clicked linkshell id MAY arrive as the first integer LuaParam
+        // (Int32 0x0 / UInt32 0x1 / Byte 0xC / Short 0x1B / Actor 0x6), but
+        // the 1.x client's NpcLinkshellChatCommand EventStart param tail is
+        // UNRELIABLE: across live runs the same click produced
+        // [Int32(0), …] one time and an empty tail the next (the command is
+        // fired via executePlayerCommandLocal whose serialized args vary).
+        // So treat the id as a best-effort HINT for disambiguation only —
+        // never the sole key. (Garlemald-Server #46.)
+        let npc_ls_id_hint = lua_params.iter().find_map(|p| match p {
+            LuaParam::Int32(v) => u32::try_from(*v).ok(),
+            LuaParam::UInt32(v) => Some(*v),
+            LuaParam::Byte(v) => Some(*v as u32),
+            LuaParam::Short(v) => Some(*v as u32),
+            LuaParam::Actor(v) => Some(*v),
+            _ => None,
+        });
+        // The linkshell window only lists pearls with a PENDING message, so a
+        // click means "read the pending one". Find the player's quest(s) with
+        // an active NpcLs (npcLsFrom != 0). Prefer one whose npcLsFrom matches
+        // the client hint — the client speaks ZERO-BASED (it mirrors the
+        // playerWork.npcLinkshellChatCalling[N] index that SetNpcLs stores
+        // zero-based: NewNpcLsMsg(1) → Calling[0]), while the quest stores the
+        // RAW 1-based value NewNpcLsMsg(from) was given (which onNpcLS needs:
+        // man0l1 branches on `from == 1`). So a hint H matches stored H+1 (or
+        // H raw, defensively). When the hint is absent/garbage, fall back to
+        // the sole pending NpcLs quest. (Garlemald-Server #46.)
+        let matched = {
+            let c = handle.character.read().await;
+            let pending: Vec<(u32, u32, u8)> = c
+                .quest_journal
+                .slots
+                .iter()
+                .flatten()
+                .filter(|q| q.get_npc_ls_from() != 0)
+                .map(|q| (q.quest_id(), q.get_npc_ls_from(), q.get_npc_ls_msg_step()))
+                .collect();
+            npc_ls_id_hint
+                .and_then(|id| {
+                    pending
+                        .iter()
+                        .find(|(_, from, _)| *from == id + 1 || *from == id)
+                        .copied()
+                })
+                .or_else(|| pending.first().copied())
+        };
+        let Some((quest_id, from, msg_step)) = matched else {
+            tracing::debug!(
+                player = handle.actor_id,
+                ?npc_ls_id_hint,
+                "NpcLs chat: no pending quest NpcLs — closing event",
+            );
+            self.end_command_event(handle).await;
+            return;
+        };
+        tracing::debug!(
+            player = handle.actor_id,
+            quest = quest_id,
+            from,
+            msg_step,
+            "NpcLs chat → firing onNpcLS",
+        );
+        self.fire_quest_event_hook(
+            handle,
+            quest_id,
+            "onNpcLS",
+            vec![
+                crate::lua::QuestHookArg::Int(from as i64),
+                crate::lua::QuestHookArg::Int(msg_step as i64),
+            ],
+        )
+        .await;
+    }
+
     /// Mirror of pmeteor's `RequestQuestJournalCommand.lua::onEventStarted`
-    /// — emit one `0x0133 GenericDataPacket(["requestedData", "qtdata",
-    /// questId, sequence])` per active quest, then a single `EndEvent`.
-    /// The default empty journalInfo is fine for the man0g0 opener path
-    /// (and most quests that don't override `getJournalInformation`).
-    async fn send_quest_journal_data(&self, handle: &ActorHandle, session_id: u32) {
+    /// — the client's EventStart carries `(questId, mapCode)` LuaParams:
+    /// `mapCode == nil` is the journal text pane (reply `["requestedData",
+    /// "qtdata", questId, sequence, …getJournalInformation()]`), a present
+    /// mapCode is the journal MAP pane (reply `["requestedData", "qtmap",
+    /// questId, …getJournalMapMarkerList()]` — the marker ids select rows
+    /// in the client's quest_marker sheet). Both replies ride 0x0133
+    /// GenericDataPacket, then a single `EndEvent`. (Garlemald-Server #46.)
+    ///
+    /// When the request params don't parse (no numeric questId), fall back
+    /// to the previous behaviour — one default qtdata per active quest —
+    /// which is the shape the man0g0 opener path was validated against.
+    async fn send_quest_journal_data(
+        &self,
+        handle: &ActorHandle,
+        session_id: u32,
+        lua_params: &[common::luaparam::LuaParam],
+    ) {
+        use common::luaparam::LuaParam;
         let Some(client) = self.world.client(session_id).await else {
             return;
         };
         let actor_id = handle.actor_id;
 
-        let active_quests: Vec<(u32, u32)> = {
-            let c = handle.character.read().await;
-            c.quest_journal
-                .slots
-                .iter()
-                .flatten()
-                .map(|q| (q.quest_id(), q.get_sequence()))
-                .collect()
-        };
+        // (questId, mapCode) = the first two numeric params. The qtdata
+        // request ends after questId (mapCode rides as Nil/absent), the
+        // qtmap request carries the map sheet code second.
+        let mut nums = lua_params.iter().filter_map(|p| match p {
+            LuaParam::Int32(v) => Some(*v as i64),
+            LuaParam::UInt32(v) => Some(*v as i64),
+            _ => None,
+        });
+        let requested_quest_id = nums.next().and_then(|v| u32::try_from(v).ok());
+        let map_code = nums.next();
 
-        for (quest_id, sequence) in active_quests {
-            // Match pmeteor's exact param shape: [String, String, Int32,
-            // Int32, Nil] — pmeteor's lua tail does
-            // `unpack(journalInfo)` after the questId/sequence ints, and
-            // even with `journalInfo == {}` C# pads at least one Nil into
-            // the packet so the client's reader sees a 5-param payload.
-            let params = vec![
-                common::luaparam::LuaParam::String("requestedData".to_string()),
-                common::luaparam::LuaParam::String("qtdata".to_string()),
-                common::luaparam::LuaParam::Int32(quest_id as i32),
-                common::luaparam::LuaParam::Int32(sequence as i32),
-                common::luaparam::LuaParam::Nil,
-            ];
-            let mut pkt = crate::packets::send::player::build_generic_data(actor_id, &params);
-            // 1.x client silently drops event-flavoured subpackets where
-            // SubPacketHeader.target_id != receiving actor's session id.
-            // Pmeteor's queue dispatcher stamps `target_id = player.Id`
-            // for all queued packets; garlemald's `build_generic_data`
-            // leaves it 0, which makes the client ignore the qtdata
-            // payload and the journal pane never populates the
-            // description. Same gotcha as `broadcast_quest_enpc_update`.
-            pkt.set_target_id(actor_id);
-            client.send_bytes(pkt.to_bytes()).await;
-            tracing::debug!(
-                player = actor_id,
-                quest = quest_id,
-                sequence = sequence,
-                "RequestQuestJournalCommand → qtdata sent",
-            );
+        // Single-quest reply for a parseable request.
+        let mut replied = false;
+        if let Some(quest_id) = requested_quest_id {
+            let quest_state = {
+                let c = handle.character.read().await;
+                c.quest_journal.get(quest_id).map(|q| {
+                    (
+                        q.get_sequence(),
+                        crate::lua::LuaQuestHandle {
+                            player_id: actor_id,
+                            quest_id,
+                            has_quest: true,
+                            sequence: q.get_sequence(),
+                            flags: q.get_flags(),
+                            counters: [
+                                q.get_counter(0),
+                                q.get_counter(1),
+                                q.get_counter(2),
+                                q.get_counter(3),
+                            ],
+                            npc_ls_from: q.get_npc_ls_from(),
+                            npc_ls_msg_step: q.get_npc_ls_msg_step(),
+                            queue: crate::lua::command::CommandQueue::new(),
+                        },
+                    )
+                })
+            };
+            if let Some((sequence, quest_handle)) = quest_state {
+                let (tag, getter) = if map_code.is_none() {
+                    ("qtdata", "getJournalInformation")
+                } else {
+                    ("qtmap", "getJournalMapMarkerList")
+                };
+                let extra = self
+                    .call_journal_getter(handle, quest_id, getter, quest_handle)
+                    .await;
+                let mut params = vec![
+                    LuaParam::String("requestedData".to_string()),
+                    LuaParam::String(tag.to_string()),
+                    LuaParam::Int32(quest_id as i32),
+                ];
+                if tag == "qtdata" {
+                    params.push(LuaParam::Int32(sequence as i32));
+                }
+                if extra.is_empty() {
+                    // pmeteor's C# pads at least one Nil when the unpacked
+                    // table is empty, so the client's reader always sees a
+                    // tail param.
+                    params.push(LuaParam::Nil);
+                } else {
+                    params.extend(extra);
+                }
+                let mut pkt = crate::packets::send::player::build_generic_data(actor_id, &params);
+                // 1.x client silently drops event-flavoured subpackets
+                // where SubPacketHeader.target_id != receiving actor's
+                // session id (same gotcha as `broadcast_quest_enpc_update`).
+                pkt.set_target_id(actor_id);
+                client.send_bytes(pkt.to_bytes()).await;
+                tracing::debug!(
+                    player = actor_id,
+                    quest = quest_id,
+                    sequence,
+                    tag,
+                    "RequestQuestJournalCommand → reply sent",
+                );
+                replied = true;
+            }
+        }
+
+        if !replied && requested_quest_id.is_none() {
+            // Legacy fallback: default qtdata per active quest.
+            let active_quests: Vec<(u32, u32)> = {
+                let c = handle.character.read().await;
+                c.quest_journal
+                    .slots
+                    .iter()
+                    .flatten()
+                    .map(|q| (q.quest_id(), q.get_sequence()))
+                    .collect()
+            };
+            for (quest_id, sequence) in active_quests {
+                let params = vec![
+                    LuaParam::String("requestedData".to_string()),
+                    LuaParam::String("qtdata".to_string()),
+                    LuaParam::Int32(quest_id as i32),
+                    LuaParam::Int32(sequence as i32),
+                    LuaParam::Nil,
+                ];
+                let mut pkt = crate::packets::send::player::build_generic_data(actor_id, &params);
+                pkt.set_target_id(actor_id);
+                client.send_bytes(pkt.to_bytes()).await;
+                tracing::debug!(
+                    player = actor_id,
+                    quest = quest_id,
+                    sequence = sequence,
+                    "RequestQuestJournalCommand → qtdata sent (fallback)",
+                );
+            }
         }
 
         // Pmeteor's lua tail calls `player:EndEvent()` after queueing the
@@ -8188,6 +8692,60 @@ impl PacketProcessor {
         client.send_bytes(end.to_bytes()).await;
     }
 
+    /// Run `getJournalInformation` / `getJournalMapMarkerList` against the
+    /// quest's script and capture its returns (see
+    /// [`crate::lua::LuaEngine::call_quest_getter`]). Empty on any miss —
+    /// quests without the getter fall back to pmeteor's default-empty
+    /// journalInfo / marker list.
+    async fn call_journal_getter(
+        &self,
+        handle: &ActorHandle,
+        quest_id: u32,
+        getter_name: &'static str,
+        quest_handle: crate::lua::LuaQuestHandle,
+    ) -> Vec<common::luaparam::LuaParam> {
+        let Some(engine) = self.lua.as_ref() else {
+            return Vec::new();
+        };
+        let Some(script_name) = engine.catalogs().quest_script_name(quest_id) else {
+            return Vec::new();
+        };
+        let script_path = engine.resolver().quest(&script_name);
+        if !script_path.exists() {
+            return Vec::new();
+        }
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_from_character(&c)
+        };
+        let engine_clone = engine.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            engine_clone.call_quest_getter(&script_path, getter_name, snapshot, quest_handle)
+        })
+        .await;
+        match result {
+            Ok(Ok(values)) => values,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    quest = quest_id,
+                    getter = getter_name,
+                    err = %e,
+                    "journal getter failed",
+                );
+                Vec::new()
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    quest = quest_id,
+                    getter = getter_name,
+                    error = %join_err,
+                    "journal getter dispatch panicked",
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Look up the NPC's live state and fire `<hook_name>(player, quest, npc)`
     /// once per active quest in the player's journal. Properly bridges any
     /// event-flavoured commands the hook emits (`RunEventFunction` /
@@ -8196,6 +8754,199 @@ impl PacketProcessor {
     /// `callClientFunction(...)` lines would queue their commands but
     /// they'd be silently dropped at `apply_login_lua_command`.
     ///
+    /// Run a non-quest NPC/object's OWN `onEventStarted` script (port of
+    /// pmeteor's per-target `LuaEngine.EventStarted` dispatch). This is
+    /// what opens the aetheryte's menu (`AetheryteParent.lua`) and any
+    /// base populace dialogue — garlemald previously only routed quest
+    /// hooks / commands / journal / NpcLs / directors, so plain
+    /// NPC/object clicks did nothing. (Garlemald-Server #46 live test
+    /// round 2.)
+    ///
+    /// Guards (skip → leave to the existing routes):
+    ///  * command static actors (`0xA0F0xxxx`) — handled by
+    ///    `command_script_name` / journal / NpcLs above;
+    ///  * the active content director — `dispatch_event_start_to_content_director`;
+    ///  * a current quest ENPC — the quest-hook fan-out already ran its
+    ///    `onTalk`/`onPush`/etc.; running its base script too would
+    ///    double-open the event;
+    ///  * any owner not a live `Npc` in the registry.
+    ///
+    /// Mirrors the content-director resume pattern: try resuming a parked
+    /// coroutine first (the menu's `delegateCommand`/`callClientFunction`
+    /// round-trip parked on `_WAIT_EVENT`), only starting a fresh
+    /// `onEventStarted` when nothing was parked.
+    async fn dispatch_event_start_to_npc(
+        &self,
+        handle: &ActorHandle,
+        owner_actor_id: u32,
+        event_name: &str,
+    ) {
+        // Command static actors + journal/NpcLs are 0xA0F0xxxx; skip.
+        if (owner_actor_id & 0xFFF0_0000) == 0xA0F0_0000 {
+            return;
+        }
+        let Some(lua) = self.lua.as_ref() else {
+            return;
+        };
+        let actor_id = handle.actor_id;
+
+        // Skip the active content director (handled elsewhere).
+        if let Some(active) = self
+            .world
+            .session(handle.session_id)
+            .await
+            .and_then(|s| s.active_content_script)
+            && owner_actor_id == active.director_actor_id
+        {
+            return;
+        }
+
+        // Must be a live NPC actor in the registry.
+        let Some(owner_handle) = self.registry.get(owner_actor_id).await else {
+            return;
+        };
+        if !matches!(
+            owner_handle.kind,
+            crate::runtime::actor_registry::ActorKindTag::Npc
+        ) {
+            return;
+        }
+
+        // Skip current quest ENPCs — the quest-hook fan-out owns them.
+        let owner_class_id = {
+            let c = owner_handle.character.read().await;
+            c.chara.actor_class_id
+        };
+        let is_quest_enpc = {
+            let c = handle.character.read().await;
+            c.quest_journal.slots.iter().flatten().any(|q| {
+                q.state
+                    .current
+                    .values()
+                    .any(|e| e.actor_class_id == owner_class_id)
+            })
+        };
+        // DIAGNOSTIC (Garlemald-Server #46 walk-up): this non-quest NPC
+        // dispatch is the ONLY new server code in the push path this session
+        // (chained after the quest-hook fan-out in 9ff8a5c). For a quest ENPC
+        // like Rostnsthal the guard MUST skip here — otherwise the
+        // `fire_player_event_and_drain` below would prematurely resume the
+        // just-parked `onPush` coroutine (~1s EndEvent, tooltip torn down).
+        // Log the decision so a live test can prove the guard holds.
+        tracing::debug!(
+            owner = format!("0x{owner_actor_id:08X}"),
+            class = owner_class_id,
+            is_quest_enpc,
+            event = %event_name,
+            "dispatch_event_start_to_npc: quest-ENPC guard decision",
+        );
+        if is_quest_enpc {
+            return;
+        }
+
+        // First, try to resume a parked coroutine (the menu round-trip).
+        if let Some(cmds) = lua
+            .fire_player_event_and_drain(actor_id, &[])
+            .filter(|c| !c.is_empty())
+        {
+            self.apply_event_script_commands(handle, cmds).await;
+            return;
+        }
+
+        // Resolve the actor's script: unique override first, then the
+        // base class path (lowercased parents, leading '/' stripped —
+        // `resolver.base_class` joins `base/{path}.lua`).
+        let npc_spec = match self.build_npc_spec(owner_actor_id).await {
+            Some(s) => s,
+            None => return,
+        };
+        let zone_name = self
+            .world
+            .zone(npc_spec.zone_id)
+            .await
+            .map(|z| {
+                let zone = z.try_read();
+                zone.map(|z| z.core.zone_name.clone()).unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let unique_path = lua
+            .resolver()
+            .npc(&zone_name, &npc_spec.class_name, &npc_spec.unique_id);
+        let script_path = if !npc_spec.unique_id.is_empty() && unique_path.exists() {
+            unique_path
+        } else {
+            let base_rel = crate::world_manager::lowercase_class_path(&npc_spec.class_path);
+            let base_rel = base_rel.strip_prefix('/').unwrap_or(&base_rel);
+            lua.resolver().base_class(base_rel)
+        };
+        if !script_path.exists() {
+            tracing::debug!(
+                owner = format!("0x{owner_actor_id:08X}"),
+                class = owner_class_id,
+                script = %script_path.display(),
+                "NPC onEventStarted: no script on disk — releasing client with EndEvent",
+            );
+            // A live owner with no script still opened a modal event on the
+            // client (e.g. an object push trigger like the La Noscea→Limsa
+            // `seafld0_push_limsa_entrance`, classId 1090004, whose push
+            // fires whenever the player walks into it — only man0l1 SEQ_048
+            // actually claims it). Without an EndEvent the client stays modal
+            // and every further interaction is dropped → softlock. Release
+            // it. (Garlemald-Server #46 — Limsa-entrance push softlock.)
+            self.end_command_event(handle).await;
+            return;
+        }
+
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_from_character(&c)
+        };
+        let lua_clone = lua.clone();
+        let script_path_clone = script_path.clone();
+        let event_name_owned = event_name.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            lua_clone.call_npc_on_event_started(
+                &script_path_clone,
+                snapshot,
+                npc_spec,
+                event_name_owned,
+                0,
+                Vec::new(),
+            )
+        })
+        .await;
+        let partial = match result {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "NPC onEventStarted dispatch panicked");
+                return;
+            }
+        };
+        if let Some(e) = partial.error {
+            tracing::debug!(
+                owner = format!("0x{owner_actor_id:08X}"),
+                error = %e,
+                "NPC onEventStarted errored; applying partial commands",
+            );
+        }
+        // If the script defined no handler for this eventName it emits NO
+        // commands (and parks nothing — a parked callClientFunction would
+        // have queued a RunEventFunction). That's an inert trigger — e.g. an
+        // object push trigger whose `pushDefault` no quest claims at the
+        // current sequence. The client is sitting modal on the event; release
+        // it with EndEvent or it softlocks. (Garlemald-Server #46.)
+        if partial.commands.is_empty() {
+            tracing::debug!(
+                owner = format!("0x{owner_actor_id:08X}"),
+                event = %event_name,
+                "NPC onEventStarted: script emitted nothing — releasing client with EndEvent",
+            );
+            self.end_command_event(handle).await;
+            return;
+        }
+        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+    }
+
     /// No-ops if the NPC isn't in the registry, or the player has no
     /// active quests.
     async fn fire_quest_hook_for_active_quests(
@@ -8203,6 +8954,7 @@ impl PacketProcessor {
         handle: &ActorHandle,
         npc_actor_id: u32,
         hook_name: &'static str,
+        event_name: &str,
     ) {
         let active_quest_ids: Vec<u32> = {
             let c = handle.character.read().await;
@@ -8224,11 +8976,22 @@ impl PacketProcessor {
         };
 
         for quest_id in active_quest_ids {
+            // Pass the eventName as the hook's trailing arg —
+            // `onEmote(player, quest, npc, eventName)` /
+            // `onPush(.., eventName)` / `onCommand(.., eventName)` need it to
+            // tell WHICH condition fired (e.g. "emoteDefault1" = /bow). Omitting
+            // it left eventName nil, so man0l1 SEQ_040's hand-signal test never
+            // matched a branch — no DoEmote animation, no counter advance.
+            // Harmless for `onTalk` (3-arg), which ignores the extra value.
+            // (Garlemald-Server #46.)
             self.fire_quest_event_hook(
                 handle,
                 quest_id,
                 hook_name,
-                vec![crate::lua::QuestHookArg::Npc(npc_spec.clone())],
+                vec![
+                    crate::lua::QuestHookArg::Npc(npc_spec.clone()),
+                    crate::lua::QuestHookArg::Str(event_name.to_string()),
+                ],
             )
             .await;
         }
@@ -8334,15 +9097,46 @@ impl PacketProcessor {
             // flows) never emit these commands and keep the shared drain,
             // whose direct KickEvent dispatch `kickEventContinue` relies on.
             // (Garlemald-Server #25.)
-            let is_login_scoped_burst = cmds.iter().any(|c| {
-                matches!(
-                    c,
-                    crate::lua::command::LuaCommand::CreateContentArea { .. }
-                        | crate::lua::command::LuaCommand::DoZoneChangeContent { .. }
-                        | crate::lua::command::LuaCommand::AddQuest { .. }
-                        | crate::lua::command::LuaCommand::CompleteQuest { .. }
-                )
-            });
+            // `Logout` / `QuitGame` are the terminal commands of
+            // `LogoutCommand.lua`'s confirm round-trip (and the
+            // dead-Return path) — they are applied ONLY by
+            // `apply_login_lua_command` (processor.rs:1687-1692), never
+            // the runtime drain, so a resumed Exit-game confirm would be
+            // silently dropped on `apply_event_script_commands`. Route
+            // them (and the content/quest bursts) through the login
+            // command applier. (Garlemald-Server #46 live test.)
+            // 3. The after-quest warp burst (CreateDirector /
+            //    StartDirectorMain / SetLoginDirector / KickEvent /
+            //    DoZoneChange) — man0l1's Baderon talk (and every other
+            //    AfterQuestWarpDirector staging site: man0l0/man0g0/man0u0/
+            //    man0g1, the city populace miounne/momodi, the battle-zone
+            //    exit_door/exit_trigger/yda) parks on `processEvent020`
+            //    (`callClientFunction` → `_WAIT_EVENT`) and emits the whole
+            //    director-staging burst when this EventUpdate resumes it.
+            //    `SetLoginDirector` is the load-bearing tell: it ONLY appears
+            //    in director-staged-warp bursts. The runtime drain has NO arm
+            //    for CreateDirector / StartDirectorMain / SetLoginDirector
+            //    (all hit `apply_runtime_lua_command`'s `_ => false`), so the
+            //    director is never created/registered/login-set, never spawns
+            //    in the deferred zone-in bundle, and the runtime KickEvent arm
+            //    (`apply_kick_event`) direct-dispatches the `noticeEvent` kick
+            //    immediately — to an unspawned owner the client silently drops
+            //    (decomp: KickClientOrderEventReceiver gates on actor[+0x5c]).
+            //    `onEventStarted` → `quest:OnNotice` → man0l1 `onNotice(SEQ_003)`
+            //    → `EndEvent` then never runs, so the post-Baderon cutscene
+            //    desktop-widget mode is never cleared and the menu / linkpearl /
+            //    aetheryte stay dead. Routing through `apply_login_lua_command`
+            //    is the proven shape: it registers the director, refreshes the
+            //    session login-director spec, CAPTURES the kick into
+            //    `session.pending_kick_event` (emitted at the END of the
+            //    zone-in bundle, after the director spawn), and threads
+            //    DoZoneChange through the SAME `quest_apply::apply_do_zone_change`
+            //    helper the runtime arm uses. Every other command in the burst
+            //    (RunEventFunction / EndEvent / QuestSetNpcLsFrom / PlayerSetNpcLs /
+            //    QuestStartSequence / QuestUpdateEnpcs / SendMessage) has an
+            //    explicit login-applier arm, so nothing load-bearing falls into
+            //    the login catch-all. (Round-3 live test — Baderon breaks menu.)
+            let is_login_scoped_burst = Self::is_login_scoped_burst(&cmds);
             if is_login_scoped_burst {
                 for cmd in cmds {
                     Box::pin(self.apply_login_lua_command(&handle, cmd)).await;
@@ -8412,11 +9206,102 @@ impl PacketProcessor {
             .await;
 
         // 3. Seamless-boundary check — may trigger a zone change or
-        //    a zone merge behind the scenes.
-        let _ = self
-            .world
-            .seamless_check(actor_id, session_id, Vector3::new(pkt.x, pkt.y, pkt.z))
+        //    a zone merge behind the scenes. SKIPPED while the player is in a
+        //    content instance: the instance runs in a public field zone (the
+        //    man0l1 escort uses zone 141, sea0Field01a) and the instance warp
+        //    drops the player at a position that sits inside a public-world
+        //    seamless boundary box (the Zephyr Gate). Without this guard the
+        //    seamless check fires immediately after the cross-zone instance
+        //    warp and yanks the player straight back out (141 -> 128), undoing
+        //    the cross-zone load and hanging "Now Loading". A content instance
+        //    is an isolated copy, not the open world, so public-zone seamless
+        //    boundaries must not apply inside it. (Garlemald-Server #46.)
+        let in_content_instance = match self.world.session(session_id).await {
+            Some(s) => s
+                .active_content_script
+                .as_ref()
+                .is_some_and(|a| a.parent_zone_id == s.current_zone_id),
+            None => false,
+        };
+        let seamless = if in_content_instance {
+            crate::world_manager::SeamlessResult::None
+        } else {
+            self.world
+                .seamless_check(actor_id, session_id, Vector3::new(pkt.x, pkt.y, pkt.z))
+                .await
+        };
+        // 3a. On a seamless zone CHANGE the registry handle's zone_id
+        //     must follow (actors_in_zone / broadcast fan-out filter on
+        //     it) and the new position persisted so a relog lands in the
+        //     destination zone, not back at the old warp point. Mirrors
+        //     the warp path (quest_apply::apply_do_zone_change). The
+        //     instance list was already cleared by
+        //     do_seamless_zone_change, so step 3b streams the new zone.
+        let seamless_dest = if let crate::world_manager::SeamlessResult::ZoneChanged(dest) =
+            seamless
+        {
+            self.registry.reassign_zone(actor_id, dest).await;
+            {
+                let mut c = handle.character.write().await;
+                c.base.zone_id = dest;
+            }
+            let pa = self.world.session(session_id).await.and_then(|s| {
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level))
+            });
+            let (pa_name, pa_level) = pa.unwrap_or((String::new(), 0));
+            if let Err(e) = self
+                .db
+                .save_player_position(
+                    actor_id, dest, &pa_name, pa_level, 0, 0x10, pkt.x, pkt.y, pkt.z, pkt.rot,
+                )
+                .await
+            {
+                tracing::warn!(actor = actor_id, dest, err = %e, "seamless: position persist failed");
+            }
+            Some(dest)
+        } else {
+            None
+        };
+
+        // 3b. Continuous instance update — stream in any NPC/Ally/
+        //     BattleNpc that has walked within 50y since the last update
+        //     (the fix for "no NPCs at Camp Bearded Rock" — they sit far
+        //     past the Zephyr Gate warp point's one-shot scan).
+        self.world
+            .send_instance_update(&self.registry, self.lua.as_ref(), actor_id, session_id)
             .await;
+
+        // 3c. On a seamless zone CHANGE, re-establish the active quests' ENPC
+        //     conditions for the DESTINATION zone. Without this the only thing
+        //     arming a cross-zone quest push trigger (e.g. man0l1's Zephyr Gate
+        //     trigger 1090004, which lives in zone 128 but is enabled by an
+        //     onStateChange that ran while the player was still in town zone
+        //     133) is `send_instance_update`'s per-stream-in `push_enabled`
+        //     override — a single timing-fragile snapshot. Re-running the same
+        //     idempotent re-establish the login path uses (apply_quest_update
+        //     _enpcs → begin_sequence_swap + onStateChange + diff broadcast,
+        //     processor.rs:835) now that the destination zone is current
+        //     re-emits the enabling SetEventStatus + quest graphic via the
+        //     session-zone-aware `broadcast_quest_enpc_update`, so the push is
+        //     armed regardless of stream timing. Mirrors pmeteor re-arming
+        //     quest ENPCs per stream-in with NO zone predicate
+        //     (Session.UpdateInstance → GetQuestsForNpc). (Garlemald-Server #46.)
+        if seamless_dest.is_some() {
+            let active_quest_ids: Vec<u32> = {
+                let c = handle.character.read().await;
+                c.quest_journal
+                    .slots
+                    .iter()
+                    .flatten()
+                    .map(|q| q.quest_id())
+                    .collect()
+            };
+            for quest_id in active_quest_ids {
+                self.apply_quest_update_enpcs(actor_id, quest_id).await;
+            }
+        }
 
         // 4. Proximity-push dispatch is now CLIENT-SIDE. The
         //    `SetPushEventConditionWithCircle` packets emitted in the
@@ -9032,7 +9917,12 @@ pub(crate) fn build_player_snapshot_from_character(
             quest_id: q.quest_id(),
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
         })
@@ -9052,6 +9942,66 @@ pub(crate) fn build_player_snapshot_from_character(
         id => id,
     };
     snapshot
+}
+
+#[cfg(test)]
+mod login_burst_routing_tests {
+    use super::*;
+    use crate::lua::command::LuaCommand;
+
+    /// Round-3 live test — a resumed after-quest-warp burst (the man0l1
+    /// Baderon talk) must route through the LOGIN applier. `SetLoginDirector`
+    /// is the tell; without it the AfterQuestWarpDirector is never
+    /// created/spawned and its noticeEvent kick is dropped, leaving the
+    /// client stuck in the post-warp cutscene desktop-widget mode (dead
+    /// menu / linkpearl / aetheryte).
+    #[test]
+    fn set_login_director_burst_routes_to_login() {
+        let burst = vec![
+            LuaCommand::QuestStartSequence {
+                player_id: 1,
+                quest_id: 110_002,
+                sequence: 3,
+            },
+            LuaCommand::SetLoginDirector {
+                player_id: 1,
+                director_actor_id: 0x6428_0002,
+                class_name: "AfterQuestWarpDirector".to_string(),
+                class_path: "/Director/AfterQuestWarpDirector".to_string(),
+            },
+            LuaCommand::KickEvent {
+                player_id: 1,
+                actor_id: 0x6428_0002,
+                trigger: "noticeEvent".to_string(),
+                args: vec![],
+            },
+        ];
+        assert!(
+            PacketProcessor::is_login_scoped_burst(&burst),
+            "a burst containing SetLoginDirector must route through the login applier",
+        );
+    }
+
+    /// A plain combat-tutorial continuation (no content/quest-handoff/
+    /// director-staging command) stays on the runtime drain — the
+    /// SetLoginDirector tell must not over-match ordinary resume bursts.
+    #[test]
+    fn plain_resume_burst_stays_on_runtime() {
+        let burst = vec![
+            LuaCommand::SendSignal {
+                name: "battleComplete".to_string(),
+            },
+            LuaCommand::QuestStartSequence {
+                player_id: 1,
+                quest_id: 110_001,
+                sequence: 10,
+            },
+        ];
+        assert!(
+            !PacketProcessor::is_login_scoped_burst(&burst),
+            "ordinary resume bursts must NOT route through the login applier",
+        );
+    }
 }
 
 #[cfg(test)]

@@ -232,9 +232,41 @@ pub async fn apply_runtime_lua_command(
             text_owner_id,
             text_id,
             log_type,
+            params,
         } => {
-            apply_send_game_message(actor_id, text_owner_id, text_id, log_type, registry, world)
-                .await;
+            apply_send_game_message(
+                actor_id,
+                text_owner_id,
+                text_id,
+                log_type,
+                &params,
+                registry,
+                world,
+            )
+            .await;
+            true
+        }
+        // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
+        // linkshell narration line (0x0161 DispId-sender family).
+        LC::SendGameMessageLocalizedDisplayName {
+            player_id,
+            text_owner_actor_id,
+            text_id,
+            log_type,
+            display_id,
+            params,
+        } => {
+            apply_send_game_message_localized_display_name(
+                player_id,
+                text_owner_actor_id,
+                text_id,
+                log_type,
+                display_id,
+                &params,
+                registry,
+                world,
+            )
+            .await;
             true
         }
         LC::AddExp {
@@ -246,7 +278,44 @@ pub async fn apply_runtime_lua_command(
             true
         }
         LC::AddGil { actor_id, amount } => {
-            apply_add_gil(actor_id, amount, db).await;
+            apply_add_gil(actor_id, amount, registry, Some(world), db).await;
+            true
+        }
+        // NPC-linkshell scratchpad writes — these ride quest hooks that
+        // often park on a callClientFunction coroutine (man0l1 Baderon
+        // talk), so the NewNpcLsMsg / ReadNpcLsMsg / EndOfNpcLsMsgs burst
+        // is drained HERE on the EventUpdate resume. Without these arms
+        // the flashing-pearl glow (PlayerSetNpcLs) was dropped → onNpcLS
+        // unreachable → endTutorialMode never fired. (Garlemald-Server
+        // #46 live test round 2.)
+        LC::PlayerSetNpcLs {
+            player_id,
+            npc_ls_id,
+            state,
+        } => {
+            apply_player_set_npc_ls(player_id, npc_ls_id, state, registry, db, world).await;
+            true
+        }
+        LC::QuestSetNpcLsFrom {
+            player_id,
+            quest_id,
+            from,
+        } => {
+            apply_quest_set_npc_ls_from(player_id, quest_id, from, registry, db, world).await;
+            true
+        }
+        LC::QuestIncrementNpcLsMsgStep {
+            player_id,
+            quest_id,
+        } => {
+            apply_quest_increment_npc_ls_msg_step(player_id, quest_id, registry, db).await;
+            true
+        }
+        LC::QuestClearNpcLs {
+            player_id,
+            quest_id,
+        } => {
+            apply_quest_clear_npc_ls(player_id, quest_id, registry, db).await;
             true
         }
         LC::AddItem {
@@ -255,7 +324,16 @@ pub async fn apply_runtime_lua_command(
             item_id,
             quantity,
         } => {
-            apply_add_item(actor_id, item_package, item_id, quantity, db).await;
+            apply_add_item(
+                actor_id,
+                item_package,
+                item_id,
+                quantity,
+                registry,
+                Some(world),
+                db,
+            )
+            .await;
             // Tier 3 #13 — tick any accepted fieldcraft leves whose
             // objective targets this item. Runs after `apply_add_item`
             // so the DB write sequence is: inventory row → leve
@@ -301,7 +379,8 @@ pub async fn apply_runtime_lua_command(
             true
         }
         LC::HandInRegionalLeve { player_id, leve_id } => {
-            let _ = apply_regional_leve_hand_in(player_id, leve_id, registry, db, lua).await;
+            let _ = apply_regional_leve_hand_in(player_id, leve_id, registry, Some(world), db, lua)
+                .await;
             true
         }
         LC::AcceptRegionalLeve {
@@ -609,8 +688,119 @@ pub async fn apply_runtime_lua_command(
             apply_content_finished(parent_zone_id, &area_name, registry, world, lua).await;
             true
         }
+        // DoEmote reaches the runtime drain when a *command* script emits it —
+        // EmoteStandardCommand.lua's `player:doEmote(...)` for a free emote from
+        // the menu is dispatched via dispatch_command_script ->
+        // apply_event_script_commands -> here (NOT the login applier the quest
+        // onEmote hook uses). Without this arm the emote animation packet was
+        // dropped, so emotes only played inside a scripted quest interaction.
+        // Mirrors the processor's `apply_do_emote` fan-out. (Garlemald-Server #46.)
+        LC::DoEmote {
+            actor_id,
+            target_actor_id,
+            emote_id,
+            message_id,
+        } => {
+            if registry.get(actor_id).await.is_some() {
+                let bytes = crate::packets::send::actor::build_actor_do_emote(
+                    actor_id,
+                    emote_id,
+                    target_actor_id,
+                    message_id,
+                )
+                .to_bytes();
+                crate::runtime::dispatcher::send_to_self_if_player(
+                    registry,
+                    world,
+                    actor_id,
+                    bytes.clone(),
+                )
+                .await;
+                crate::runtime::dispatcher::broadcast_to_neighbours(
+                    world, registry, actor_id, bytes,
+                )
+                .await;
+            }
+            true
+        }
+        // WarpToPublicArea / WarpToPrivateArea resolve the destination from
+        // the player's CURRENT zone + position then funnel through the same
+        // `apply_do_zone_change` helper as `DoZoneChange` (mirrors the
+        // processor's `apply_warp_to_{public,private}_area`). These MUST live
+        // here too: a quest-talk coroutine that parks on `callClientFunction`
+        // and emits the warp on resume (man0l1 SEQ_007 — Isandorel's second
+        // cutscene ends with `WarpToPrivateArea("PrivateAreaMasterPast", 3)`)
+        // is drained through this runtime path, not the login applier. Without
+        // these arms the warp hit `_ => false` and was silently dropped, so
+        // the client finished the cutscene and sat on "Now Loading" forever.
+        // (Garlemald-Server #46.)
+        LC::WarpToPublicArea { player_id, target } => {
+            let Some(handle) = registry.get(player_id).await else {
+                tracing::warn!(player = player_id, "WarpToPublicArea: actor missing");
+                return true;
+            };
+            let (zone_id, x, y, z, rotation) = warp_origin(&handle, target).await;
+            apply_do_zone_change(
+                player_id, zone_id, None, 0, 15, x, y, z, rotation, registry, db, world, lua,
+            )
+            .await;
+            true
+        }
+        LC::WarpToPrivateArea {
+            player_id,
+            area_class,
+            area_index,
+            target,
+        } => {
+            let Some(handle) = registry.get(player_id).await else {
+                tracing::warn!(
+                    player = player_id,
+                    %area_class,
+                    area_index,
+                    "WarpToPrivateArea: actor missing"
+                );
+                return true;
+            };
+            let (zone_id, x, y, z, rotation) = warp_origin(&handle, target).await;
+            apply_do_zone_change(
+                player_id,
+                zone_id,
+                Some(area_class),
+                area_index,
+                15,
+                x,
+                y,
+                z,
+                rotation,
+                registry,
+                db,
+                world,
+                lua,
+            )
+            .await;
+            true
+        }
         _ => false,
     }
+}
+
+/// Resolve a warp's origin zone + spawn coordinates: an explicit
+/// `target` overrides, otherwise fall back to the actor's current zone and
+/// position (pmeteor `WarpTo{Public,Private}Area` with no coords reuses the
+/// player's current pos so the visible effect is just a loading flicker).
+async fn warp_origin(
+    handle: &ActorHandle,
+    target: Option<(f32, f32, f32, f32)>,
+) -> (u32, f32, f32, f32, f32) {
+    let c = handle.character.read().await;
+    let zone_id = c.base.zone_id;
+    let (x, y, z, rotation) = target.unwrap_or((
+        c.base.position_x,
+        c.base.position_y,
+        c.base.position_z,
+        c.base.rotation,
+    ));
+    (zone_id, x, y, z, rotation)
 }
 
 /// Phase C3 — port of C# `Controller::Engage(target)` /
@@ -1881,7 +2071,19 @@ pub(crate) async fn apply_do_zone_change(
         };
         old_region == new_region
     };
-    if same_region {
+    // Defer ONLY for a genuine cross-zone change within the same region (the
+    // 230 → 133 Drowning Wench case the pacing was added for). A SAME-zone warp
+    // — entering/leaving a private-area instance (WarpToPrivate/PublicArea, both
+    // 230 → 230) or an in-zone reposition (the MSK "go downstairs") — must flush
+    // immediately, exactly like a cold login does. The 6 s deferral on a
+    // same-zone warp leaves the client interactive in a half-transitioned state
+    // for 6 s; any input during that window (man0l1 SEQ_040: the player talks to
+    // Sisipu again after the hand-signal cutscene) corrupts the instance-exit and
+    // the client hangs on "Now Loading" — it never sends the 0x0007 zone-in-
+    // complete. pmeteor never defers; the deferral is "retail parity, not a
+    // proven client requirement". (Garlemald-Server #46.)
+    let defer_same_region = same_region && old_zone_id != zone_id;
+    if defer_same_region {
         const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
         let fire_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2101,7 +2303,12 @@ pub async fn apply_quest_mutation<F>(
         if q.is_dirty() {
             let sequence = q.get_sequence();
             let flags = q.get_flags();
-            let counters = [q.get_counter(0), q.get_counter(1), q.get_counter(2)];
+            let counters = [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ];
             let actor_id = q.actor_id;
             q.clear_dirty();
             Some((slot as i32, actor_id, sequence, flags, counters))
@@ -2109,9 +2316,9 @@ pub async fn apply_quest_mutation<F>(
             None
         }
     };
-    if let Some((slot, actor_id, sequence, flags, [c1, c2, c3])) = save_tuple
+    if let Some((slot, actor_id, sequence, flags, [c1, c2, c3, c4])) = save_tuple
         && let Err(e) = db
-            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3)
+            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3, c4)
             .await
     {
         tracing::warn!(
@@ -2168,7 +2375,7 @@ pub async fn apply_add_quest(
     };
     let (slot, actor_id) = save_tuple;
     if let Err(e) = db
-        .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0)
+        .save_quest(player_id, slot, actor_id, 0, 0, 0, 0, 0, 0)
         .await
     {
         tracing::warn!(
@@ -3003,6 +3210,8 @@ pub async fn apply_add_item(
     item_package: u16,
     item_id: u32,
     quantity: i32,
+    registry: &ActorRegistry,
+    world: Option<&WorldManager>,
     db: &Database,
 ) {
     if quantity <= 0 || item_id == 0 {
@@ -3014,7 +3223,7 @@ pub async fn apply_add_item(
     // scripts that incorrectly call `GetItemPackage(99):AddItem(1000001, 10)`
     // should still do the right thing.
     if item_package == crate::inventory::PKG_CURRENCY_CRYSTALS {
-        apply_add_gil(actor_id, quantity, db).await;
+        apply_add_gil(actor_id, quantity, registry, world, db).await;
         return;
     }
     // Everything else lands in NORMAL for the first cut. Key-items /
@@ -3380,7 +3589,7 @@ async fn advance_regional_leves(
     // Collect dirty-slot save work under the write lock, then drop
     // the lock before awaiting the DB so a slow disk write doesn't
     // hold the player's character lock.
-    let pending_saves: Vec<(i32, u32, u32, u32, [u16; 3], u32)> = {
+    let pending_saves: Vec<(i32, u32, u32, u32, [u16; 4], u32)> = {
         let mut c = handle.character.write().await;
         let mut saves = Vec::new();
         for &leve_id in leve_ids {
@@ -3407,6 +3616,7 @@ async fn advance_regional_leves(
                     quest.get_counter(0),
                     quest.get_counter(1),
                     quest.get_counter(2),
+                    quest.get_counter(3),
                 ];
                 let actor_id = quest.actor_id;
                 quest.clear_dirty();
@@ -3415,9 +3625,9 @@ async fn advance_regional_leves(
         }
         saves
     };
-    for (slot, actor_id, sequence, flags, [c1, c2, c3], leve_id) in pending_saves {
+    for (slot, actor_id, sequence, flags, [c1, c2, c3, c4], leve_id) in pending_saves {
         if let Err(e) = db
-            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3)
+            .save_quest(player_id, slot, actor_id, sequence, flags, c1, c2, c3, c4)
             .await
         {
             tracing::warn!(
@@ -3723,7 +3933,7 @@ pub async fn apply_accept_regional_leve(
     // (progress starts fresh), counter2 = band (difficulty),
     // counter3 = 0 (reserved).
     if let Err(e) = db
-        .save_quest(player_id, slot, actor_id, 0, flags, 0, band as u16, 0)
+        .save_quest(player_id, slot, actor_id, 0, flags, 0, band as u16, 0, 0)
         .await
     {
         tracing::warn!(
@@ -3796,6 +4006,7 @@ pub async fn apply_regional_leve_hand_in(
     player_id: u32,
     leve_id: u32,
     registry: &ActorRegistry,
+    world: Option<&WorldManager>,
     db: &Database,
     lua: Option<&Arc<LuaEngine>>,
 ) -> LeveHandInOutcome {
@@ -3855,7 +4066,7 @@ pub async fn apply_regional_leve_hand_in(
     // so the client's message log reads gil → item → seals.
     let gil = data.reward_gil.get(band).copied().unwrap_or(0);
     if gil > 0 {
-        apply_add_gil(player_id, gil, db).await;
+        apply_add_gil(player_id, gil, registry, world, db).await;
         outcome.gil_granted = gil;
     }
     let item_id = data.reward_item_id.get(band).copied().unwrap_or(0);
@@ -3909,13 +4120,30 @@ pub async fn apply_regional_leve_hand_in(
     outcome
 }
 
-pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
+/// `player:AddGil(amount)` — persist the delta, then push the new
+/// balance to the owning client so the currency UI updates without a
+/// re-zone (Garlemald-Server #46: the man0l1 CUL/FSH gil rewards were
+/// the first script-driven grants, and the DB-only applier left the
+/// client's gil display stale until the next login).
+///
+/// `world: None` keeps the DB-only behaviour for callers without a live
+/// zone (integration tests, the leve hand-in's test harness).
+pub async fn apply_add_gil(
+    actor_id: u32,
+    amount: i32,
+    registry: &ActorRegistry,
+    world: Option<&WorldManager>,
+    db: &Database,
+) {
     if amount == 0 {
         return;
     }
     match db.add_gil(actor_id, amount).await {
         Ok(total) => {
             tracing::info!(actor = actor_id, delta = amount, total, "AddGil applied",);
+            if let Some(world) = world {
+                send_gil_update(actor_id, amount, registry, world, db).await;
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -3925,6 +4153,90 @@ pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
                 "AddGil: DB persist failed",
             );
         }
+    }
+}
+
+/// Push the player's post-grant gil balance to their client as a
+/// currency-package delta bracket, then (for positive deltas) the
+/// retail "You obtain [item]." toast.
+///
+/// Bracket shape mirrors pmeteor's `Inventory.SendUpdatePackets` for a
+/// single dirty currency slot — the same sequence the live equip path
+/// emits through the `InventoryEvent` dispatcher arms:
+///   `InventoryBeginChange(no-wipe) 0x016D` →
+///   `InventorySetBegin(320, 99) 0x0146` → `InventoryListX01 0x0148` →
+///   `InventorySetEnd 0x0147` → `InventoryEndChange 0x016E`.
+///
+/// Wire rules (see `emit_exp_property_updates`): raw subpacket bytes
+/// (the writer task adds the BasePacket frame) and every self-bound
+/// subpacket stamped with the session id (the world proxy drops
+/// `target_id == 0` frames).
+///
+/// The item row is re-read from the DB after the grant so the wire
+/// carries the authoritative `unique_id` (`server_items.id`) — the
+/// client tracks item instances by unique id, and `add_gil` may have
+/// just created the row for a first-time grant.
+async fn send_gil_update(
+    actor_id: u32,
+    delta: i32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    const GIL_ITEM_ID: u32 = 1_000_001;
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let rows = db
+        .get_item_package(actor_id, crate::inventory::PKG_CURRENCY_CRYSTALS as u32)
+        .await
+        .unwrap_or_default();
+    let Some(gil_row) = rows.into_iter().find(|i| i.item_id == GIL_ITEM_ID) else {
+        return;
+    };
+    use crate::packets::send::actor_inventory as inv;
+    let subs = vec![
+        inv::build_inventory_begin_change(actor_id, false),
+        inv::build_inventory_set_begin(
+            actor_id,
+            crate::inventory::CAP_CURRENCY,
+            crate::inventory::PKG_CURRENCY_CRYSTALS,
+        ),
+        inv::build_inventory_list_x01(actor_id, &gil_row),
+        inv::build_inventory_set_end(actor_id),
+        inv::build_inventory_end_change(actor_id),
+    ];
+    for mut sub in subs {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+    // "You obtain [1,000,001 = gil] x[delta]." — worldMaster sheet 25246
+    // with `(itemId, quantity)` params, the exact shape pmeteor's quest
+    // scripts use for item grants (`etc1u2.lua: SendGameMessage(
+    // GetWorldMaster(), 25246, 0x20, OBJECTIVE_ITEMID, 1)`). Skipped for
+    // deductions — retail has separate "hand over" lines that the
+    // deducting script owns.
+    if delta > 0 {
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            25246,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[
+                common::luaparam::LuaParam::UInt32(GIL_ITEM_ID),
+                common::luaparam::LuaParam::UInt32(delta as u32),
+            ],
+            false,
+        );
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
     }
 }
 
@@ -4022,6 +4334,7 @@ pub(crate) async fn apply_send_game_message(
     text_owner_id: u32,
     text_id: u32,
     log_type: u8,
+    params: &[i64],
     registry: &ActorRegistry,
     world: &WorldManager,
 ) {
@@ -4037,21 +4350,325 @@ pub(crate) async fn apply_send_game_message(
     // owner made quest-sheet ids (man0l1's 320/321 on static actor
     // 0xA0F1ADB2) resolve as garbage and crashed the client at the
     // Hob handoff — 8-for-8 across the packet logs.
-    let mut sub = crate::packets::send::build_game_message_actor1(
-        text_owner_id,
-        actor_id,
-        text_owner_id,
-        text_id.min(u16::MAX as u32) as u16,
-        log_type,
-    );
+    let text_id_u16 = text_id.min(u16::MAX as u32) as u16;
+    let mut sub = if params.is_empty() {
+        crate::packets::send::build_game_message_actor1(
+            text_owner_id,
+            actor_id,
+            text_owner_id,
+            text_id_u16,
+            log_type,
+        )
+    } else {
+        // Params present (e.g. "You obtain <item>", text 25117 + item id):
+        // use the WITH-params builder (GameMessageWithActor2..5) so the
+        // client resolves the item name instead of rendering it blank.
+        // (Garlemald-Server #46.)
+        let lua_params: Vec<common::luaparam::LuaParam> = params
+            .iter()
+            .map(|&v| {
+                if (0..=u32::MAX as i64).contains(&v) && v > i32::MAX as i64 {
+                    common::luaparam::LuaParam::UInt32(v as u32)
+                } else {
+                    common::luaparam::LuaParam::Int32(v as i32)
+                }
+            })
+            .collect();
+        crate::packets::send::build_game_message_actor1_with_params(
+            text_owner_id,
+            actor_id,
+            text_owner_id,
+            text_id_u16,
+            log_type,
+            &lua_params,
+        )
+    };
     sub.set_target_id(session_id);
     client.send_bytes(sub.to_bytes()).await;
     tracing::debug!(
         actor = actor_id,
         text_id,
         log = format!("0x{log_type:02X}"),
+        params = params.len(),
         "SendGameMessage emitted",
     );
+}
+
+/// `player:SendGameMessageLocalizedDisplayName(...)` — port of C#
+/// `Player.SendGameMessageLocalizedDisplayName` (Player.cs:1004) →
+/// `GameMessagePacket.BuildPacket(worldMaster, textOwner.Id, textId,
+/// displayId, log)`, the 0x0161-0x0165 DispId-sender family. The
+/// SubPacket source is WorldMaster (matching the system-toast source);
+/// the body's `textOwnerActorId` is the TEXT-SHEET host (the quest's
+/// 0xA0F0xxxx static actor — `text_id` resolves against ITS sheet, the
+/// same load-bearing owner rule as `apply_send_game_message`), and the
+/// sender name shown to the player is `display_id`. Self-only, stamped
+/// (the proxy drops `target_id == 0`). (Garlemald-Server #46.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_send_game_message_localized_display_name(
+    player_id: u32,
+    text_owner_actor_id: u32,
+    text_id: u16,
+    log_type: u8,
+    display_id: u32,
+    params: &[common::luaparam::LuaParam],
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let mut sub = crate::packets::send::misc::build_text_sheet_dispid_auto(
+        crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+        display_id,
+        text_owner_actor_id,
+        text_id,
+        log_type,
+        params,
+    );
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        player = player_id,
+        text_id,
+        display_id,
+        owner = format!("0x{text_owner_actor_id:08X}"),
+        log = format!("0x{log_type:02X}"),
+        "SendGameMessageLocalizedDisplayName emitted (0x0161 DispId family)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NPC-linkshell scratchpad appliers (shared by the processor's login drain
+// AND the runtime drain). The flashing-pearl chain (quest:NewNpcLsMsg →
+// PlayerSetNpcLs + QuestSetNpcLsFrom) is emitted from quest hooks that often
+// PARK on a callClientFunction coroutine (man0l1's Baderon talk), so the
+// burst is drained on the EventUpdate-resume path → apply_runtime_lua_command.
+// Before these free-fns existed the runtime drain had no NpcLs arms and
+// silently dropped them, so the pearl never glowed → onNpcLS unreachable →
+// endTutorialMode never fired. (Garlemald-Server #46 live test round 2.)
+// ---------------------------------------------------------------------------
+
+/// `player:SetNpcLs(id, state)` / `AddNpcLs` / the NewNpcLsMsg ALERT glow.
+/// Persists the row + emits the `playerWork.npcLinkshellChat{Extra,Calling}`
+/// pearl-glow property and the 25118 first-add toast. Canonical impl;
+/// the processor method delegates here.
+pub(crate) async fn apply_player_set_npc_ls(
+    player_id: u32,
+    npc_ls_id: u32,
+    state: u8,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    if !(1..=40).contains(&npc_ls_id) {
+        tracing::debug!(
+            player = player_id,
+            npc_ls_id,
+            state,
+            "SetNpcLs: id out of range"
+        );
+        return;
+    }
+    let (is_calling, is_extra) = match state {
+        0 => (false, false),
+        1 => (false, true),
+        2 => (true, false),
+        3 => (true, true),
+        _ => {
+            tracing::debug!(
+                player = player_id,
+                npc_ls_id,
+                state,
+                "SetNpcLs: unknown state"
+            );
+            return;
+        }
+    };
+    let zero_based = npc_ls_id - 1;
+    let was_owned = match db.load_npc_ls_state(player_id, zero_based).await {
+        Ok(Some((c, e))) => c || e,
+        _ => false,
+    };
+    if let Err(e) = db
+        .save_npc_ls(player_id, zero_based, is_calling, is_extra)
+        .await
+    {
+        tracing::warn!(player = player_id, npc_ls_id, err = %e, "SetNpcLs: DB persist failed");
+        return;
+    }
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    // Keep the in-memory CharaState in sync with the DB row. The zone-in
+    // bundle's pearl re-emit (world_manager::send_zone_in_bundle) reads
+    // `chara.npc_linkshells`, which is otherwise only populated at LOGIN.
+    // Without this sync the re-emit restores the pearl after a relog but
+    // NOT after a SAME-SESSION warp — and NewNpcLsMsg's ALERT glow is
+    // immediately followed by a warp on the man0l1 Baderon beat
+    // (DoZoneChange 133→133). The warp re-inits the client's
+    // playerWork.npcLinkshellChat, the re-emit finds an empty in-memory
+    // list and skips it, so the client's `isNpcLinkshellChatCalling()`
+    // gate stays false and the NPC-linkshell read (the command's
+    // `canFire`) never fires → the player can never read Baderon's
+    // message → softlock. (Garlemald-Server #46.)
+    {
+        let mut c = handle.character.write().await;
+        let zb = zero_based as u16;
+        if let Some(e) = c
+            .chara
+            .npc_linkshells
+            .iter_mut()
+            .find(|e| e.npc_ls_id == zb)
+        {
+            e.is_calling = is_calling;
+            e.is_extra = is_extra;
+        } else {
+            c.chara
+                .npc_linkshells
+                .push(crate::gamedata::NpcLinkshellEntry {
+                    npc_ls_id: zb,
+                    is_calling,
+                    is_extra,
+                });
+        }
+    }
+    let Some(client) = world.client(handle.session_id).await else {
+        return;
+    };
+    // Pearl glow — EXTRA-then-CALLING (C# Player.cs:2042-2045).
+    let mut b = crate::packets::send::actor::ActorPropertyPacketBuilder::new(
+        player_id,
+        "playerWork/npcLinkshellChat",
+    );
+    b.add_byte(
+        &format!("playerWork.npcLinkshellChatExtra[{zero_based}]"),
+        is_extra as u8,
+    );
+    b.add_byte(
+        &format!("playerWork.npcLinkshellChatCalling[{zero_based}]"),
+        is_calling as u8,
+    );
+    for mut sub in b.done() {
+        sub.set_target_id(handle.session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+    // First-add "linkpearl obtained" toast.
+    if !was_owned && (is_calling || is_extra) {
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            25118,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
+            false,
+        );
+        pkt.set_target_id(handle.session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+}
+
+/// `quest:NewNpcLsMsg(from)` → set the quest's npc-ls scratchpad (from +
+/// msg_step=1) + persist + the 25119 "new message" toast.
+pub(crate) async fn apply_quest_set_npc_ls_from(
+    player_id: u32,
+    quest_id: u32,
+    from: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let (slot, step) = {
+        let mut c = handle.character.write().await;
+        let Some(slot) = c.quest_journal.slot_of(quest_id) else {
+            return;
+        };
+        let step = if let Some(q) = c.quest_journal.slots[slot].as_mut() {
+            q.set_npc_ls_from(from);
+            q.get_npc_ls_msg_step()
+        } else {
+            return;
+        };
+        (slot as i32, step)
+    };
+    if let Err(e) = db.save_quest_npc_ls(player_id, slot, from, step).await {
+        tracing::warn!(player = player_id, quest = quest_id, from, err = %e, "QuestSetNpcLsFrom: DB persist failed");
+    }
+    if let Some(client) = world.client(handle.session_id).await {
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            25119,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[common::luaparam::LuaParam::UInt32(from)],
+            false,
+        );
+        pkt.set_target_id(handle.session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+}
+
+/// `quest:ReadNpcLsMsg()` — bump the message step + persist.
+pub(crate) async fn apply_quest_increment_npc_ls_msg_step(
+    player_id: u32,
+    quest_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let (slot, from, step) = {
+        let mut c = handle.character.write().await;
+        let Some(slot) = c.quest_journal.slot_of(quest_id) else {
+            return;
+        };
+        let (from, step) = if let Some(q) = c.quest_journal.slots[slot].as_mut() {
+            let step = q.inc_npc_ls_msg_step();
+            (q.get_npc_ls_from(), step)
+        } else {
+            return;
+        };
+        (slot as i32, from, step)
+    };
+    if let Err(e) = db.save_quest_npc_ls(player_id, slot, from, step).await {
+        tracing::warn!(player = player_id, quest = quest_id, err = %e, "QuestIncrementNpcLsMsgStep: DB persist failed");
+    }
+}
+
+/// `quest:EndOfNpcLsMsgs()` — clear the npc-ls scratchpad + persist.
+pub(crate) async fn apply_quest_clear_npc_ls(
+    player_id: u32,
+    quest_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let slot = {
+        let mut c = handle.character.write().await;
+        let Some(slot) = c.quest_journal.slot_of(quest_id) else {
+            return;
+        };
+        if let Some(q) = c.quest_journal.slots[slot].as_mut() {
+            q.clear_npc_ls();
+        }
+        slot as i32
+    };
+    if let Err(e) = db.save_quest_npc_ls(player_id, slot, 0, 0).await {
+        tracing::warn!(player = player_id, quest = quest_id, err = %e, "QuestClearNpcLs: DB persist failed");
+    }
 }
 
 /// Used by the `LC::WarpToPosition` arm above — quest `onPush` bounce
@@ -4393,7 +5010,12 @@ pub async fn apply_quest_on_notice(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -4411,7 +5033,12 @@ pub async fn apply_quest_on_notice(
             has_quest: true,
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
@@ -4953,7 +5580,12 @@ async fn fire_quest_npc_hook_via_command(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -4968,7 +5600,12 @@ async fn fire_quest_npc_hook_via_command(
             has_quest: true,
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
@@ -5162,7 +5799,12 @@ pub async fn fire_quest_on_talk_via_command(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -5180,7 +5822,12 @@ pub async fn fire_quest_on_talk_via_command(
             has_quest: true,
             sequence: q.get_sequence(),
             flags: q.get_flags(),
-            counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+            counters: [
+                q.get_counter(0),
+                q.get_counter(1),
+                q.get_counter(2),
+                q.get_counter(3),
+            ],
             npc_ls_from: q.get_npc_ls_from(),
             npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
@@ -5345,7 +5992,12 @@ async fn fire_quest_hook(
                     quest_id: q.quest_id(),
                     sequence: q.get_sequence(),
                     flags: q.get_flags(),
-                    counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    counters: [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     npc_ls_from: q.get_npc_ls_from(),
                     npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 })
@@ -5360,12 +6012,17 @@ async fn fire_quest_hook(
                 (
                     q.get_sequence(),
                     q.get_flags(),
-                    [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
+                    [
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_counter(3),
+                    ],
                     q.get_npc_ls_from(),
                     q.get_npc_ls_msg_step(),
                 )
             })
-            .unwrap_or((0, 0, [0; 3], 0, 0));
+            .unwrap_or((0, 0, [0; 4], 0, 0));
         let handle = crate::lua::LuaQuestHandle {
             player_id: snap.actor_id,
             quest_id,

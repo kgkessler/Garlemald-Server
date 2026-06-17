@@ -89,14 +89,18 @@ pub fn quest_id_to_bit(quest_id: u32) -> Option<usize> {
 
 /// One quest's runtime state. Mirrors Meteor's `QuestData.cs` (post-
 /// redesign): a 32-bit flag bitfield the scripts address by bit index
-/// `0..=31`, three 16-bit counters (the schema persists three; Meteor's
-/// in-memory class has a vestigial fourth that never reaches the DB so
-/// we drop it), and the `Dirty` flag the engine uses to decide whether
-/// a `UpdateENPCs()` / DB write is needed.
+/// `0..=31`, four 16-bit counters (`counter1`..`counter4`, matching pmeteor's
+/// `IncCounter` `case 0..3` — man0l1's CNTR_SEQ40_FSH uses index 3), and the
+/// `Dirty` flag the engine uses to decide whether a `UpdateENPCs()` / DB write
+/// is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QuestData {
     flags: u32,
-    counters: [u16; 3],
+    // 4 counters (counter1..counter4), matching pmeteor's QuestData
+    // (counter1..4, IncCounter `case 0..3`). man0l1 uses index 3
+    // (CNTR_SEQ40_FSH) for the Fisherman's-Guild hand-signal test — a 3-slot
+    // array silently dropped that increment. (Garlemald-Server #46.)
+    counters: [u16; 4],
     /// Per-quest NpcLs scratchpad, mirrored from C# `QuestData.npcLsFrom`.
     /// 0 = no chain active. Set by `Quest::NewNpcLsMsg`, read by
     /// `ReadNpcLsMsg` / `EndOfNpcLsMsgs` to know which NPC linkshell
@@ -116,19 +120,25 @@ impl QuestData {
     pub const fn new() -> Self {
         Self {
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
             dirty: false,
         }
     }
 
-    /// Hydrate from DB columns (`flags`, `counter1`, `counter2`, `counter3`).
+    /// Hydrate from DB columns (`flags`, `counter1`..`counter4`).
     /// Loading is not a mutation, so `Dirty` stays `false`.
-    pub const fn from_parts(flags: u32, counter1: u16, counter2: u16, counter3: u16) -> Self {
+    pub const fn from_parts(
+        flags: u32,
+        counter1: u16,
+        counter2: u16,
+        counter3: u16,
+        counter4: u16,
+    ) -> Self {
         Self {
             flags,
-            counters: [counter1, counter2, counter3],
+            counters: [counter1, counter2, counter3, counter4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
             dirty: false,
@@ -142,12 +152,13 @@ impl QuestData {
         counter1: u16,
         counter2: u16,
         counter3: u16,
+        counter4: u16,
         npc_ls_from: u32,
         npc_ls_msg_step: u8,
     ) -> Self {
         Self {
             flags,
-            counters: [counter1, counter2, counter3],
+            counters: [counter1, counter2, counter3, counter4],
             npc_ls_from,
             npc_ls_msg_step,
             dirty: false,
@@ -167,9 +178,15 @@ impl QuestData {
     }
 
     /// `SetNpcLsFrom(from)` — flag a new NPC linkshell as driving
-    /// this quest's chain.
+    /// this quest's chain. Mirrors C# `QuestData.SetNpcLsFrom`
+    /// (`npcLsFrom = from; npcLsMessageStep = 1;`): the message step
+    /// starts at 1, NOT 0, because quest scripts index their message
+    /// packs 1-based (`NPCLS_MSGS[pack][msgStep]`, man0l1.lua) — leaving
+    /// it 0 nil-indexed the first onNpcLS line. (Garlemald-Server #46
+    /// live test.)
     pub fn set_npc_ls_from(&mut self, from: u32) {
         self.npc_ls_from = from;
+        self.npc_ls_msg_step = 1;
         self.dirty = true;
     }
 
@@ -194,7 +211,7 @@ impl QuestData {
     }
 
     pub const fn counter(self, idx: usize) -> u16 {
-        if idx < 3 { self.counters[idx] } else { 0 }
+        if idx < 4 { self.counters[idx] } else { 0 }
     }
 
     pub const fn counter1(self) -> u16 {
@@ -207,6 +224,10 @@ impl QuestData {
 
     pub const fn counter3(self) -> u16 {
         self.counters[2]
+    }
+
+    pub const fn counter4(self) -> u16 {
+        self.counters[3]
     }
 
     pub const fn is_dirty(self) -> bool {
@@ -246,7 +267,7 @@ impl QuestData {
     /// `IncCounter(num)` → new value. Matches Meteor's wrap-on-overflow
     /// behaviour (ushort++ in C# wraps at 65_536 without panicking).
     pub fn inc_counter(&mut self, idx: usize) -> u16 {
-        if idx >= 3 {
+        if idx >= 4 {
             return 0;
         }
         self.counters[idx] = self.counters[idx].wrapping_add(1);
@@ -256,7 +277,7 @@ impl QuestData {
 
     /// `DecCounter(num)` → new value. Wraps at 0 like the C#.
     pub fn dec_counter(&mut self, idx: usize) -> u16 {
-        if idx >= 3 {
+        if idx >= 4 {
             return 0;
         }
         self.counters[idx] = self.counters[idx].wrapping_sub(1);
@@ -266,7 +287,7 @@ impl QuestData {
 
     /// `SetCounter(num, value)`.
     pub fn set_counter(&mut self, idx: usize, value: u16) {
-        if idx >= 3 {
+        if idx >= 4 {
             return;
         }
         self.counters[idx] = value;
@@ -277,7 +298,7 @@ impl QuestData {
     /// next UpdateENPCs rebroadcasts.
     pub fn clear(&mut self) {
         self.flags = 0;
-        self.counters = [0; 3];
+        self.counters = [0; 4];
         self.npc_ls_from = 0;
         self.npc_ls_msg_step = 0;
         self.dirty = true;
@@ -487,6 +508,7 @@ impl Quest {
     /// Hydrate from a DB row (matches `characters_quest_scenario`'s new
     /// column layout). `QuestState` starts empty — it gets populated on
     /// first `onStateChange` call after login.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_db_row(
         actor_id: u32,
         name: impl Into<String>,
@@ -495,9 +517,10 @@ impl Quest {
         counter1: u16,
         counter2: u16,
         counter3: u16,
+        counter4: u16,
     ) -> Self {
         Self::from_db_row_with_npc_ls(
-            actor_id, name, sequence, flags, counter1, counter2, counter3, 0, 0,
+            actor_id, name, sequence, flags, counter1, counter2, counter3, counter4, 0, 0,
         )
     }
 
@@ -512,6 +535,7 @@ impl Quest {
         counter1: u16,
         counter2: u16,
         counter3: u16,
+        counter4: u16,
         npc_ls_from: u32,
         npc_ls_msg_step: u8,
     ) -> Self {
@@ -524,6 +548,7 @@ impl Quest {
                 counter1,
                 counter2,
                 counter3,
+                counter4,
                 npc_ls_from,
                 npc_ls_msg_step,
             ),
@@ -826,15 +851,27 @@ mod tests {
 
     #[test]
     fn questdata_counter_wraps_on_overflow() {
-        let mut d = QuestData::from_parts(0, 0xFFFF, 0, 0);
+        let mut d = QuestData::from_parts(0, 0xFFFF, 0, 0, 0);
         assert_eq!(d.inc_counter(0), 0);
         assert_eq!(d.dec_counter(1), 0xFFFF);
     }
 
     #[test]
-    fn questdata_counter_out_of_range_is_noop() {
+    fn questdata_counter_index_3_is_valid() {
+        // counter4 (index 3) is a real slot now — pmeteor parity, man0l1
+        // CNTR_SEQ40_FSH. (Garlemald-Server #46.)
         let mut d = QuestData::new();
-        assert_eq!(d.inc_counter(3), 0);
+        assert_eq!(d.inc_counter(3), 1);
+        assert_eq!(d.counter(3), 1);
+        assert_eq!(d.counter4(), 1);
+        assert!(d.is_dirty());
+    }
+
+    #[test]
+    fn questdata_counter_out_of_range_is_noop() {
+        // Index 4+ is still out of range (4 counters: 0..=3).
+        let mut d = QuestData::new();
+        assert_eq!(d.inc_counter(4), 0);
         d.set_counter(5, 42);
         assert_eq!(d.counter(0), 0);
         assert!(!d.is_dirty());

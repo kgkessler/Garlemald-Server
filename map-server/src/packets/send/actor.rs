@@ -242,13 +242,31 @@ pub fn build_reset_head(actor_id: u32) -> SubPacket {
     SubPacket::new(OP_RESET_HEAD, actor_id, body(0x28))
 }
 
-/// 0x00E1 ActorDoEmotePacket.
+/// 0x00E1 ActorDoEmotePacket — port of pmeteor `ActorDoEmotePacket.cs`.
+///
+/// `animation_id` is the bare emote id the script passes (e.g. 5 = /bow). The
+/// client expects it packed as `realAnimID = 0x5000000 | (animation_id << 12)`
+/// — writing the raw id makes the client resolve the description text (so the
+/// "You bow…" log line still prints) but play NO animation. Also mirrors
+/// pmeteor's `targetedActorId == 0` fallback (retarget to self + bump the
+/// description id, except the 10105 "generic" id). (Garlemald-Server #46.)
 pub fn build_actor_do_emote(
     actor_id: u32,
-    real_anim_id: u32,
+    animation_id: u32,
     targeted_actor_id: u32,
     description_id: u32,
 ) -> SubPacket {
+    let (targeted_actor_id, description_id) = if targeted_actor_id == 0 {
+        let desc = if description_id != 10105 {
+            description_id + 1
+        } else {
+            description_id
+        };
+        (actor_id, desc)
+    } else {
+        (targeted_actor_id, description_id)
+    };
+    let real_anim_id = 0x0500_0000 | (animation_id << 12);
     let mut data = body(0x30);
     let mut c = Cursor::new(&mut data[..]);
     c.write_u32::<LittleEndian>(real_anim_id).unwrap();
@@ -465,18 +483,20 @@ pub fn build_actor_event_status_packets(
             &cond.condition_name,
         ));
     }
-    // Meteor's C# branched on `push_enabled ?? condition.isEnabled`, but
-    // the garlemald `PushCircleCondition` / `PushFanCondition` /
-    // `PushBoxCondition` structs don't carry a per-condition enabled
-    // flag (they're treated as static wire-layout data). Fall back to
-    // `true` when the caller passed `None` so the packet enables the
-    // trigger by default — scripts that want it disabled pass
-    // `Some(false)`.
-    let push_flag = push_enabled.unwrap_or(true);
+    // Meteor's C# branched on `push_enabled ?? condition.isEnabled`
+    // (Map Server/Actors/Actor.cs::GetSetEventStatusPackets). The garlemald
+    // push-condition structs now carry that per-condition `is_enabled`, so
+    // we replicate the exact fallback: an explicit `Some(b)` from a
+    // `quest:SetENpc(..)` broadcast wins; otherwise each circle/fan/box
+    // streams in at its actor-class default (`isEnabled`, which is `false`
+    // for every quest trigger). Previously this defaulted to `true`, which
+    // force-enabled every streamed push trigger regardless of the owning
+    // quest's state — a trigger like man0l1's ECHO_EXIT could then fire the
+    // moment it streamed and warp the player out mid-sequence.
     for cond in &conditions.push_circle {
         out.push(build_set_event_status(
             actor_id,
-            push_flag,
+            push_enabled.unwrap_or(cond.is_enabled),
             2,
             &cond.condition_name,
         ));
@@ -484,7 +504,7 @@ pub fn build_actor_event_status_packets(
     for cond in &conditions.push_fan {
         out.push(build_set_event_status(
             actor_id,
-            push_flag,
+            push_enabled.unwrap_or(cond.is_enabled),
             2,
             &cond.condition_name,
         ));
@@ -492,7 +512,7 @@ pub fn build_actor_event_status_packets(
     for cond in &conditions.push_box {
         out.push(build_set_event_status(
             actor_id,
-            push_flag,
+            push_enabled.unwrap_or(cond.is_enabled),
             2,
             &cond.condition_name,
         ));
@@ -1132,6 +1152,111 @@ mod reset_head_tests {
         assert!(pkt.data.iter().all(|b| *b == 0));
         assert_eq!(pkt.game_message.opcode, OP_RESET_HEAD);
         assert_eq!(pkt.header.source_id, 0x44D0_35D5);
+    }
+}
+
+#[cfg(test)]
+mod do_emote_tests {
+    use super::*;
+
+    /// The bare emote id must be packed as `0x5000000 | (id << 12)` (pmeteor
+    /// `ActorDoEmotePacket`). Writing the raw id makes the client print the
+    /// description text but play no animation. (Garlemald-Server #46.)
+    #[test]
+    fn animation_id_is_packed() {
+        let pkt = build_actor_do_emote(0x0000_0001, 5, 0x4730_00D8, 21041);
+        assert_eq!(pkt.game_message.opcode, OP_ACTOR_DO_EMOTE);
+        let real = u32::from_le_bytes([pkt.data[0], pkt.data[1], pkt.data[2], pkt.data[3]]);
+        assert_eq!(real, 0x0500_0000 | (5u32 << 12), "realAnimID = 0x5005000");
+        // target + description pass through unchanged when target != 0.
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[4], pkt.data[5], pkt.data[6], pkt.data[7]]),
+            0x4730_00D8
+        );
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[8], pkt.data[9], pkt.data[10], pkt.data[11]]),
+            21041
+        );
+    }
+
+    /// target == 0 retargets to self and bumps the description id (pmeteor).
+    #[test]
+    fn target_zero_falls_back_to_self() {
+        let pkt = build_actor_do_emote(0x0000_0001, 5, 0, 21041);
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[4], pkt.data[5], pkt.data[6], pkt.data[7]]),
+            0x0000_0001,
+            "retargets to source actor"
+        );
+        assert_eq!(
+            u32::from_le_bytes([pkt.data[8], pkt.data[9], pkt.data[10], pkt.data[11]]),
+            21042,
+            "description id +1"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_status_push_tests {
+    use super::*;
+    use crate::actor::event_conditions::parse_event_conditions;
+
+    fn push_status(packets: &[SubPacket]) -> bool {
+        // Find the push (ty==2) SetEventStatus packet and read its enabled
+        // flag (u32 LE at body +0x00, type byte at +0x04).
+        let p = packets
+            .iter()
+            .find(|p| p.game_message.opcode == OP_SET_EVENT_STATUS && p.data[4] == 2)
+            .expect("a push SetEventStatus packet");
+        u32::from_le_bytes([p.data[0], p.data[1], p.data[2], p.data[3]]) != 0
+    }
+
+    /// A quest trigger ships `isEnabled=false`; with no explicit override the
+    /// streamed packet must come in DISABLED (Meteor `push ?? isEnabled`).
+    /// This is the guard against the pre-#46 default-true behavior that let
+    /// a streamed trigger fire the moment it appeared.
+    #[test]
+    fn push_none_honours_condition_disabled_default() {
+        let conds = parse_event_conditions(
+            r#"{"pushWithCircleEventConditions":[{"isEnabled":"false","radius":"6.0","conditionName":"pushDefault"}]}"#,
+        )
+        .unwrap();
+        let packets = build_actor_event_status_packets(0x4730_009D, &conds, true, true, None, true);
+        assert!(
+            !push_status(&packets),
+            "disabled trigger must stay disabled"
+        );
+    }
+
+    /// An explicit `Some(true)` from a `quest:SetENpc(.., QFLAG_PUSH)`
+    /// broadcast overrides the actor-class default and enables the circle.
+    #[test]
+    fn push_some_true_overrides_to_enabled() {
+        let conds = parse_event_conditions(
+            r#"{"pushWithCircleEventConditions":[{"isEnabled":"false","radius":"6.0","conditionName":"pushDefault"}]}"#,
+        )
+        .unwrap();
+        let packets =
+            build_actor_event_status_packets(0x4730_009D, &conds, true, true, Some(true), true);
+        assert!(
+            push_status(&packets),
+            "quest enable must win over isEnabled"
+        );
+    }
+
+    /// A condition whose data default is `isEnabled=true` enables on stream
+    /// even without an override.
+    #[test]
+    fn push_none_honours_condition_enabled_default() {
+        let conds = parse_event_conditions(
+            r#"{"pushWithCircleEventConditions":[{"isEnabled":"true","radius":"6.0","conditionName":"pushDefault"}]}"#,
+        )
+        .unwrap();
+        let packets = build_actor_event_status_packets(0x4730_009D, &conds, true, true, None, true);
+        assert!(
+            push_status(&packets),
+            "enabled-by-default trigger streams enabled"
+        );
     }
 }
 

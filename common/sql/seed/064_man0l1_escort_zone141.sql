@@ -1,0 +1,28 @@
+-- Garlemald-Server #46 (Man0l1 "Treasures of the Main" — Zephyr Gate
+-- escort): make the escort instance a REAL separate zone so the entry warp
+-- is a genuine CROSS-zone load.
+--
+-- Root cause (confirmed via packet log + client decomp): the escort content
+-- area shared the player's current zone id (128), so DoZoneChangeContent was
+-- a SAME-zone warp. The 1.x client only does the real scene load that
+-- dismisses "Now Loading" when the SetMap presents a zone it must actually
+-- load (zone-actor != resident) — a same-zone warp never triggers it, so the
+-- overlay hung even though the zone-in handshake otherwise matched the
+-- working cross-zone teleport (no leading DeleteAllActors, 0x00E2 subcode
+-- 0x02, keep-list commit — see processor.rs apply_do_zone_change_content).
+--
+-- Fix: route the escort content area through zone 141 (sea0Field01a, region
+-- 101, the SAME "Lower La Noscea" ZoneMasterSeaS0 map as zone 128 — a
+-- loaded, dependency-free field zone with no quest/spawn references). The
+-- startMan0l1Content script now creates the content area on GetArea(141), so
+-- the player warps 128 -> 141 (cross-zone, same region) — structurally
+-- identical to the working teleport. The Zephyr Gate trigger (1090004) STAYS
+-- in zone 128: the player triggers it in the public field BEFORE the warp.
+--
+-- This migration re-homes the escort BattleNpc groups (Sisipu = 11, ankle
+-- biters = 12) from zone 128 to 141 so their seed rows agree with the
+-- content area's new parent zone.
+--
+-- Idempotent UPDATE; no schema change.
+
+UPDATE "server_battlenpc_groups" SET "zoneId" = 141 WHERE "groupId" IN (11, 12);

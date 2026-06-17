@@ -82,6 +82,9 @@ pub enum QuestHookArg {
     Int(i64),
     Bool(bool),
     Nil,
+    /// An owned string — e.g. the `eventName` passed to
+    /// `onEmote`/`onPush`/`onCommand` (`"emoteDefault1"`, `"pushDefault"`, …).
+    Str(String),
     /// Materialise a fresh `LuaNpc` userdata inside the script VM.
     Npc(LuaNpcSpec),
 }
@@ -111,6 +114,7 @@ impl QuestHookArg {
             QuestHookArg::Int(i) => Value::Integer(i as mlua::Integer),
             QuestHookArg::Bool(b) => Value::Boolean(b),
             QuestHookArg::Nil => Value::Nil,
+            QuestHookArg::Str(s) => Value::String(lua.create_string(&s)?),
             QuestHookArg::Npc(spec) => {
                 let npc = userdata::LuaNpc {
                     base: userdata::LuaActor {
@@ -499,6 +503,68 @@ impl LuaEngine {
         PartialLuaCallResult { commands, error }
     }
 
+    /// Call a quest-script *getter* — `getJournalInformation` /
+    /// `getJournalMapMarkerList` — and capture its return values as wire
+    /// LuaParams. Direct call, no coroutine: pmeteor routes these through
+    /// `LuaEngine.CallLuaFunctionForReturn` and the getters are pure
+    /// `(player, quest) → values` lookups (no `callClientFunction`
+    /// yields). A missing getter returns an empty list (most quests don't
+    /// override them); conversion stops at the first nil, matching Lua's
+    /// `unpack` semantics in pmeteor's
+    /// `RequestQuestJournalCommand.lua::onEventStarted`. Commands the
+    /// getter happens to enqueue are dropped — the journal pane is a
+    /// read-only view. (Garlemald-Server #46.)
+    pub fn call_quest_getter(
+        &self,
+        script_path: &Path,
+        getter_name: &str,
+        player_snapshot: userdata::PlayerSnapshot,
+        quest_handle: userdata::LuaQuestHandle,
+    ) -> anyhow::Result<Vec<common::luaparam::LuaParam>> {
+        use common::luaparam::LuaParam;
+        let (lua, queue) = self.load_script(script_path)?;
+        let quest_handle = userdata::LuaQuestHandle {
+            queue: queue.clone(),
+            ..quest_handle
+        };
+        let globals = lua.globals();
+        let f: Function = match globals.get(getter_name) {
+            Ok(f) => f,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let player_ud = lua
+            .create_userdata(userdata::LuaPlayer {
+                snapshot: player_snapshot,
+                queue: queue.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+        let quest_ud = lua
+            .create_userdata(quest_handle)
+            .map_err(|e| anyhow::anyhow!("create_userdata(LuaQuestHandle): {e}"))?;
+        let call = f.call::<MultiValue>((player_ud, quest_ud));
+        let dropped = CommandQueue::drain(&queue);
+        if !dropped.is_empty() {
+            tracing::debug!(
+                getter = getter_name,
+                dropped = dropped.len(),
+                "quest getter enqueued commands — dropped (read-only view)",
+            );
+        }
+        let values = call.map_err(|e| anyhow::anyhow!("{getter_name}: {e}"))?;
+        let mut out = Vec::new();
+        for v in values {
+            match v {
+                Value::Integer(i) => out.push(LuaParam::Int32(i as i32)),
+                Value::Number(n) => out.push(LuaParam::Int32(n as i32)),
+                Value::Boolean(true) => out.push(LuaParam::True),
+                Value::Boolean(false) => out.push(LuaParam::False),
+                Value::String(s) => out.push(LuaParam::String(s.to_string_lossy().to_string())),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// NPC-specific helper: try the unique-override script first, then fall
     /// back to the base-class script. Mirrors the C# `CallLuaFunctionNpc`.
     pub fn call_npc(
@@ -705,7 +771,10 @@ impl LuaEngine {
         player_snapshot: userdata::PlayerSnapshot,
         command_actor_id: u32,
         event_name: String,
-        event_type: u8,
+        // Wire field kept for signature symmetry with the director path, but
+        // NOT forwarded to command scripts (they take triggerName, not
+        // eventType — see the arg-push block below). (Garlemald-Server #46.)
+        _event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
     ) -> PartialLuaCallResult {
         let owner_player_id = player_snapshot.actor_id;
@@ -739,7 +808,96 @@ impl LuaEngine {
             let mut mv = MultiValue::new();
             mv.push_back(Value::UserData(player_ud));
             mv.push_back(Value::UserData(command_ud));
-            mv.push_back(Value::Integer(event_type as mlua::Integer));
+            // Command scripts take `onEventStarted(player, command, triggerName,
+            // ...params)` — triggerName IS the event_name string (e.g.
+            // "commandRequest"), and the real LuaParams (emoteId, showText, …)
+            // follow. Unlike pmeteor (whose command scripts carry an extra
+            // leading `eventType`), garlemald's ported command scripts in
+            // scripts/lua/commands/*.lua drop it, so we must NOT push
+            // `event_type` here: doing so shifted triggerName→eventType(0) and
+            // emoteId→event_name("commandRequest"), which made
+            // EmoteStandardCommand.lua's `string.format("%d", emoteId)` crash on
+            // a string and every free emote silently no-op. The director path
+            // (call_director_on_event_started) keeps eventType — directors DO
+            // declare it. (Garlemald-Server #46.)
+            let event_name_lua = lua
+                .create_string(&event_name)
+                .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
+            mv.push_back(Value::String(event_name_lua));
+            for p in lua_params {
+                let v = lua_param_to_value(lua, p)
+                    .map_err(|e| anyhow::anyhow!("lua_param_to_value: {e}"))?;
+                mv.push_back(v);
+            }
+            Ok(mv)
+        })
+    }
+
+    /// Run a plain (non-quest, non-command) NPC/object's own
+    /// `onEventStarted(player, npc, eventType, eventName, ...params)` —
+    /// the path that opens the aetheryte's teleport/homepoint/leve menu
+    /// (`AetheryteParent.lua`) and any base populace dialogue. Mirror of
+    /// pmeteor `LuaEngine.EventStarted` -> `CallLuaFunction(player,
+    /// target, "onEventStarted", ...)` on the TARGET ACTOR's script.
+    /// Builds a `LuaNpc` (not a bare `LuaActor`) so the script's
+    /// `npc:GetActorClassId()` returns the real class id (AetheryteParent
+    /// keys `aetheryteParentLinks` on it). Yielding menus park on
+    /// `_WAIT_EVENT` and resume on the client's 0x012E EventUpdate, exactly
+    /// like command / quest delegate round-trips. (Garlemald-Server #46
+    /// live test round 2.)
+    pub fn call_npc_on_event_started(
+        &self,
+        script_path: &Path,
+        player_snapshot: userdata::PlayerSnapshot,
+        npc_spec: LuaNpcSpec,
+        event_name: String,
+        // Like the command path: NPC/object scripts take
+        // `onEventStarted(player, npc, triggerName, …)` (triggerName = the
+        // event_name string), NOT eventType. Kept for signature symmetry only.
+        // (Garlemald-Server #46.)
+        _event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) -> PartialLuaCallResult {
+        let owner_player_id = player_snapshot.actor_id;
+        self.spawn_director_on_event_started(script_path, owner_player_id, |lua, queue| {
+            let player = userdata::LuaPlayer {
+                snapshot: player_snapshot,
+                queue: queue.clone(),
+            };
+            let npc = userdata::LuaNpc {
+                base: userdata::LuaActor {
+                    actor_id: npc_spec.actor_id,
+                    name: npc_spec.name,
+                    class_name: npc_spec.class_name,
+                    class_path: npc_spec.class_path,
+                    unique_id: npc_spec.unique_id,
+                    zone_id: npc_spec.zone_id,
+                    zone_name: npc_spec.zone_name,
+                    state: npc_spec.state,
+                    pos: npc_spec.pos,
+                    rotation: npc_spec.rotation,
+                    queue: queue.clone(),
+                    is_engaged: false,
+                    speed: 5.0,
+                    target_actor_id: 0,
+                },
+                actor_class_id: npc_spec.actor_class_id,
+                quest_graphic: npc_spec.quest_graphic,
+            };
+            let player_ud = lua
+                .create_userdata(player)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+            let npc_ud = lua
+                .create_userdata(npc)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaNpc): {e}"))?;
+            let mut mv = MultiValue::new();
+            mv.push_back(Value::UserData(player_ud));
+            mv.push_back(Value::UserData(npc_ud));
+            // No eventType push — base NPC/object scripts compare their 3rd arg
+            // (triggerName) to STRING literals like "talkDefault" / "pushDefault"
+            // / "caution" / "exit". Pushing the eventType integer here made
+            // those comparisons silently always-false (number != string).
+            // (Garlemald-Server #46.)
             let event_name_lua = lua
                 .create_string(&event_name)
                 .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
@@ -1269,7 +1427,23 @@ impl LuaEngine {
             }
         }
         let resume_result = parked.thread.resume::<MultiValue>(args);
+        let parked_queue_ptr = format!("{:p}", std::sync::Arc::as_ptr(&parked.queue));
         let commands = CommandQueue::drain(&parked.queue);
+        // DIAGNOSTIC (Garlemald-Server #46): show exactly which commands a
+        // resumed coroutine drained + the queue ptr it drained from, so a live
+        // Isandorel-talk repro reveals whether `QuestIncCounter` is present
+        // (queue/apply bug) or absent because the binding pushed to a DIFFERENT
+        // queue (compare against the IncCounter binding's logged queue_ptr).
+        // Temporary triage.
+        if !commands.is_empty() {
+            tracing::debug!(
+                player = player_id,
+                count = commands.len(),
+                drained_queue_ptr = %parked_queue_ptr,
+                commands = ?commands,
+                "fire_player_event_and_drain: resumed coroutine drained these commands",
+            );
+        }
         match resume_result {
             Ok(value) => {
                 if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
@@ -1323,6 +1497,7 @@ pub struct PartialLuaCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lua::command::LuaCommandArg;
 
     fn tmpdir() -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1371,7 +1546,7 @@ mod tests {
                 quest_id: 110_001,
                 sequence: 0,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
             }],
@@ -1386,7 +1561,7 @@ mod tests {
             has_quest: true,
             sequence: 0,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
             queue,
@@ -1492,6 +1667,259 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Garlemald-Server #46 — `call_quest_getter` captures the journal
+    /// getters' return values: integers convert to Int32, conversion
+    /// stops at the first nil (Lua `unpack` semantics), a missing getter
+    /// is an empty list, and commands the getter enqueues are dropped.
+    #[test]
+    fn call_quest_getter_captures_returns_and_stops_at_nil() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("quests/man")).unwrap();
+        std::fs::write(
+            root.join("quests/man/man0l0.lua"),
+            r#"
+                function getJournalMapMarkerList(player, quest)
+                    quest:SetQuestFlag(9) -- read-only view: must be dropped
+                    return 11000101, 11000102, nil, 11000103
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("quests/man/man0l0.lua");
+        let values = engine
+            .call_quest_getter(
+                &script_path,
+                "getJournalMapMarkerList",
+                sample_snapshot(),
+                sample_quest_handle(CommandQueue::new()),
+            )
+            .expect("getter should run");
+        assert_eq!(
+            values,
+            vec![
+                common::luaparam::LuaParam::Int32(11_000_101),
+                common::luaparam::LuaParam::Int32(11_000_102),
+            ],
+            "two ids before the nil, nothing after",
+        );
+
+        let missing = engine
+            .call_quest_getter(
+                &script_path,
+                "getJournalInformation",
+                sample_snapshot(),
+                sample_quest_handle(CommandQueue::new()),
+            )
+            .expect("missing getter is a quiet empty");
+        assert!(missing.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Garlemald-Server #46 — the man0l1 SEQ_003 `onNotice` hook (fired
+    /// server-driven by the AfterQuestWarpDirector kick after the Baderon
+    /// talk) must drive the client-side `processEventTu_001` (the NPC-linkshell
+    /// tutorial) to lift the desktopWidgetMode-16 mask processEvent020 leaves
+    /// the client in. Only `processEventTu_001` calls
+    /// `cancelDesktopWidgetMode(16)` (→ mode 120, which the menu gate allows);
+    /// `endTutorialMode` = SendDataPacket(7) cancels mode 120, NOT 16.
+    ///
+    /// CRUCIAL ordering invariant (the round-5 softlock regression): the hook
+    /// must emit it with the RAW non-parking `player:RunEventFunction`, NOT
+    /// `callClientFunction`. `callClientFunction` parks on
+    /// `coroutine.yield("_WAIT_EVENT")` waiting for a client EventUpdate that
+    /// `processEventTu_001` (a synchronous UI mask) never sends — so the
+    /// trailing `player:EndEvent()` would never run, the noticeEvent would
+    /// stay open, and the client would be event-locked (softlock). This test
+    /// asserts BOTH the RunEventFunction AND the EndEvent are emitted in the
+    /// same (non-parking) drain — if a future edit reintroduces
+    /// `callClientFunction` here, the hook parks and the EndEvent vanishes,
+    /// failing this test.
+    #[test]
+    fn real_man0l1_on_notice_seq003_unmasks_menu() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0l1.lua");
+        let engine = LuaEngine::new(root);
+
+        let quest_handle = userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence: 3, // SEQ_003
+            flags: 0,
+            counters: [0; 4],
+            npc_ls_from: 1,
+            npc_ls_msg_step: 1,
+            queue: CommandQueue::new(),
+        };
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onNotice",
+            sample_snapshot(),
+            quest_handle,
+            vec![QuestHookArg::Nil],
+        );
+        assert!(
+            result.error.is_none(),
+            "onNotice errored: {:?}",
+            result.error
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::RunEventFunction { function_name, args, .. }
+                    if function_name == "delegateEvent"
+                        && args.iter().any(|a| matches!(
+                            a,
+                            LuaCommandArg::String(s) if s == "processEventTu_001"
+                        ))
+            )),
+            "man0l1 onNotice(SEQ_003) must drive processEventTu_001 (RunEventFunction) \
+             to cancel desktopWidgetMode 16; got {:?}",
+            result.commands,
+        );
+        // Non-parking invariant: the EndEvent MUST be emitted in the same
+        // drain. If onNotice parks on `callClientFunction` (the round-5
+        // softlock), the hook yields before reaching EndEvent and this fails.
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            "man0l1 onNotice(SEQ_003) must also emit EndEvent in the same drain \
+             (proves it did NOT park on callClientFunction); got {:?}",
+            result.commands,
+        );
+    }
+
+    /// Garlemald-Server #46 live test — drive the REAL `man0l1.lua`
+    /// `onNpcLS` hook at SEQ_003 (from=1, msgStep=1), the Path-Companion
+    /// linkshell beat that ends tutorial mode. Asserts the hook (a)
+    /// emits the localized-display-name narration line (msg 339 from
+    /// pack 1, sender display 1000015) via the new 0x0161 path, and (b)
+    /// delivers `endTutorialMode` = SendDataPacket(7) — the belt-and-
+    /// braces menu unlock. Before the fix `onNpcLS` was unreachable (no
+    /// HandleNpcLs dispatch) and SendDataPacket was dropped on the
+    /// quest-hook drain.
+    #[test]
+    fn real_man0l1_on_npc_ls_seq003_ends_tutorial() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0l1.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        let quest_handle = userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence: 3, // SEQ_003
+            flags: 0,
+            counters: [0; 4],
+            npc_ls_from: 1,
+            npc_ls_msg_step: 1,
+            queue: CommandQueue::new(),
+        };
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onNpcLS",
+            sample_snapshot(),
+            quest_handle,
+            vec![QuestHookArg::Int(1), QuestHookArg::Int(1)],
+        );
+        assert!(
+            result.error.is_none(),
+            "onNpcLS errored: {:?}",
+            result.error
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessageLocalizedDisplayName {
+                    text_id: 339,
+                    display_id: 1_000_015,
+                    ..
+                }
+            )),
+            "expected the Path-Companion narration line (msg 339, sender 1000015); got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendDataPacket { .. })),
+            "expected endTutorialMode → SendDataPacket(7); got {:?}",
+            result.commands,
+        );
+    }
+
+    /// Garlemald-Server #46 — drive the REAL `man0l1.lua` journal
+    /// getters. Pins the marker beat-map (`getJournalMapMarkerList`) and
+    /// the counter-derived journal info (`getJournalInformation`) against
+    /// the production script, which also syntax-checks the whole file.
+    #[test]
+    fn real_man0l1_journal_getters() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0l1.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        let handle_at = |sequence: u32, counters: [u16; 4]| userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence,
+            flags: 0,
+            counters,
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+            queue: CommandQueue::new(),
+        };
+        let markers = |sequence: u32, counters: [u16; 4]| {
+            engine
+                .call_quest_getter(
+                    &script_path,
+                    "getJournalMapMarkerList",
+                    sample_snapshot(),
+                    handle_at(sequence, counters),
+                )
+                .expect("marker getter should run")
+        };
+        use common::luaparam::LuaParam::Int32;
+
+        // SEQ_003: Camp Bearded Rock attunement → base+2.
+        assert_eq!(markers(3, [0; 4]), vec![Int32(11_000_102)]);
+        // SEQ_007 fresh: both guild errands outstanding → CUL + MSK.
+        assert_eq!(
+            markers(7, [0; 4]),
+            vec![Int32(11_000_103), Int32(11_000_104)],
+        );
+        // SEQ_007 after the Balloonfish sale (CUL counter=1, slot 1) and
+        // the MSK Echo exit (MSK counter=4, slot 2): no markers left.
+        assert_eq!(markers(7, [0, 1, 4, 0]), vec![]);
+        // SEQ_048: Zephyr Gate muster → base+6.
+        assert_eq!(markers(48, [0; 4]), vec![Int32(11_000_106)]);
+        // SEQ_050 (escort instance) and SEQ_070 (linkshell beat): none.
+        assert_eq!(markers(50, [0; 4]), vec![]);
+        assert_eq!(markers(70, [0; 4]), vec![]);
+        // SEQ_092: back to Baderon → base+1.
+        assert_eq!(markers(92, [0; 4]), vec![Int32(11_000_101)]);
+
+        // getJournalInformation: (0, CUL*5, MSK*5) from the SEQ_007
+        // counters.
+        let info = engine
+            .call_quest_getter(
+                &script_path,
+                "getJournalInformation",
+                sample_snapshot(),
+                handle_at(7, [0, 1, 4, 0]),
+            )
+            .expect("info getter should run");
+        assert_eq!(info, vec![Int32(0), Int32(5), Int32(20)]);
+    }
+
     #[test]
     fn call_quest_hook_with_npc_arg_materialises_lua_userdata() {
         let root = tmpdir();
@@ -1549,6 +1977,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `npc.Id` must expose the actor INSTANCE id (distinct from the class id
+    /// via `GetActorClassId`). onEmote passes `npc.Id` to `player:DoEmote` as
+    /// the target — a nil there errors the binding (`target_actor_id: u32`)
+    /// and unwinds the hook. (Garlemald-Server #46.)
+    #[test]
+    fn lua_npc_exposes_instance_id_field() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("quests/man")).unwrap();
+        std::fs::write(
+            root.join("quests/man/man0l0.lua"),
+            r#"
+                function onTalk(player, quest, npc)
+                    if npc.Id == 0x12345 and npc:GetActorClassId() == 1000155 then
+                        quest:SetQuestFlag(6)
+                    end
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("quests/man/man0l0.lua");
+        let npc_spec = LuaNpcSpec {
+            actor_id: 0x12345,
+            name: "Sisipu".to_string(),
+            class_name: "PopulaceStandard".to_string(),
+            class_path: "/Chara/Npc/Populace/PopulaceStandard".to_string(),
+            unique_id: "sisipu".to_string(),
+            zone_id: 230,
+            zone_name: "test".to_string(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            actor_class_id: 1_000_155,
+            quest_graphic: 0,
+        };
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onTalk",
+            sample_snapshot(),
+            sample_quest_handle(CommandQueue::new()),
+            vec![QuestHookArg::Npc(npc_spec)],
+        );
+        assert!(result.error.is_none(), "onTalk errored: {:?}", result.error);
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::QuestSetFlag { bit: 6, .. })),
+            "npc.Id (instance) / GetActorClassId (class) mismatch; got {:?}",
+            result.commands
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn call_quest_hook_receives_extra_args_after_player_and_quest() {
         let root = tmpdir();
@@ -1585,6 +2069,53 @@ mod tests {
         assert!(
             seen,
             "script didn't see sequence=10; got {:?}",
+            result.commands
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: a `QuestHookArg::Str` reaches the hook as its positional
+    /// arg. `onEmote(player, quest, npc, eventName)` needs the eventName
+    /// string ("emoteDefault1" = /bow) to pick the right branch — the
+    /// dispatcher previously passed only the npc, leaving eventName nil so
+    /// man0l1 SEQ_040's hand-signal test never matched. (Garlemald-Server #46.)
+    #[test]
+    fn call_quest_hook_passes_string_event_name_arg() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("quests/man")).unwrap();
+        std::fs::write(
+            root.join("quests/man/man0l1.lua"),
+            r#"
+                function onEmote(player, quest, npc, eventName)
+                    if eventName == "emoteDefault1" then
+                        quest:StartSequence(77)
+                    end
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("quests/man/man0l1.lua");
+        let result = engine.call_quest_hook(
+            &script_path,
+            "onEmote",
+            sample_snapshot(),
+            sample_quest_handle(CommandQueue::new()),
+            // [npc, eventName] — npc is unused by this hook so Nil stands in.
+            vec![
+                QuestHookArg::Nil,
+                QuestHookArg::Str("emoteDefault1".to_string()),
+            ],
+        );
+        assert!(result.error.is_none(), "hook errored: {:?}", result.error);
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::QuestStartSequence { sequence: 77, .. })),
+            "onEmote didn't receive the eventName string; got {:?}",
             result.commands
         );
 
@@ -1782,6 +2313,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Garlemald-Server #46 live test — drive the REAL main-menu
+    /// command scripts (`LogoutCommand.lua`, `TeleportCommand.lua`)
+    /// through `call_command_on_event_started`. Both must load without
+    /// error and emit the `delegateCommand` confirm round-trip
+    /// (`RunEventFunction` with function_name "delegateCommand"), which
+    /// parks the coroutine on `_WAIT_EVENT` — the proof that the new
+    /// dispatch arms (Exit / Teleport buttons) reach a working script.
+    /// Before the fix these EventStarts fell through `command_script_name`
+    /// and the buttons did nothing.
+    #[test]
+    fn real_main_menu_command_scripts_park_on_delegate() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let engine = LuaEngine::new(root);
+        for script in ["LogoutCommand", "TeleportCommand"] {
+            let script_path = root.join(format!("commands/{script}.lua"));
+            assert!(script_path.exists(), "{script} must be on disk");
+            let result = engine.call_command_on_event_started(
+                &script_path,
+                sample_snapshot(),
+                0xA0F0_5E9B, // command static actor (id is cosmetic here)
+                "commandRequest".to_string(),
+                0,
+                Vec::new(),
+            );
+            assert!(
+                result.error.is_none(),
+                "{script} onEventStarted errored: {:?}",
+                result.error,
+            );
+            assert!(
+                result.commands.iter().any(|c| matches!(
+                    c,
+                    LuaCommand::RunEventFunction { function_name, .. }
+                        if function_name == "delegateCommand"
+                )),
+                "{script} must fire a delegateCommand round-trip; got {:?}",
+                result.commands,
+            );
+        }
+    }
+
+    /// Garlemald-Server #46 regression — a FREE emote (the emote menu /
+    /// `/bow`) fires an EventStart against the EmoteStandardCommand static
+    /// actor carrying `event_name="commandRequest"` + LuaParams
+    /// `[emoteId, showText]`. The command script signature is
+    /// `onEventStarted(player, actor, triggerName, emoteId, showText, …)` —
+    /// NO eventType. Before the fix, `call_command_on_event_started` pushed a
+    /// spurious `event_type` integer, so `emoteId` received the STRING
+    /// "commandRequest" → `emoteTable[emoteId]` was nil → the script hit
+    /// `string.format("%d", emoteId)` and CRASHED, and no emote ever played
+    /// outside a scripted quest interaction. Assert the real numeric emoteId
+    /// reaches the script: Bow (105) → `player:doEmote(0, animId 5, descId
+    /// 21041)` → a `LuaCommand::DoEmote { emote_id: 5, message_id: 21041 }`.
+    #[test]
+    fn real_emote_standard_command_plays_emote() {
+        use common::luaparam::LuaParam;
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let engine = LuaEngine::new(root);
+        let script_path = root.join("commands/EmoteStandardCommand.lua");
+        assert!(script_path.exists(), "EmoteStandardCommand must be on disk");
+        let result = engine.call_command_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            0xA0F0_5E26, // EmoteStandardCommand static actor
+            "commandRequest".to_string(),
+            0, // event_type — now ignored on the command path
+            vec![LuaParam::Int32(105), LuaParam::Int32(1)], // emoteId=Bow, showText=1
+        );
+        assert!(
+            result.error.is_none(),
+            "EmoteStandardCommand onEventStarted errored (arg shift?): {:?}",
+            result.error,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::DoEmote { emote_id, message_id, .. }
+                    if *emote_id == 5 && *message_id == 21041
+            )),
+            "Bow must produce DoEmote(animId 5, descId 21041); got {:?}",
+            result.commands,
+        );
+    }
+
     /// #28 S0.4 — drive the REAL `SimpleContent30010.lua::onUpdate`
     /// with an engaged player + an unengaged ally and assert the
     /// `SetMod(modifiersGlobal.MovementSpeed, 8)` line reaches the
@@ -1873,6 +2488,186 @@ mod tests {
             "ally engage must follow the speed mod; got {:?}",
             result.commands,
         );
+    }
+
+    /// Garlemald-Server #46 — drive the REAL
+    /// `SimpleContentMan0l101.lua` escort through its lifecycle:
+    /// onCreate spawns Sisipu (bnpc 16) + the 8 ankle biters (17-24),
+    /// then onUpdate (1) walks the escort toward the first waypoint on
+    /// a clear road, (2) holds the walk + pulls mobs when an ankle
+    /// biter is close, and (3) fires `sendSignal("escortComplete")`
+    /// after the final waypoint is reached with the road cleared. Also
+    /// syntax-checks the script.
+    #[test]
+    fn real_man0l1_escort_content_walks_holds_and_signals() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("content/SimpleContentMan0l101.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        // onCreate: spawns + roster + locks. The escortState entry for
+        // player 42 (sample_snapshot) arms the onUpdate machine in the
+        // process-cached VM.
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_content_hook(
+            &script_path,
+            "onCreate",
+            sample_snapshot(),
+            sample_content_area(dummy_queue.clone()),
+            sample_director(dummy_queue.clone()),
+        );
+        assert!(
+            result.error.is_none(),
+            "onCreate errored: {:?}",
+            result.error
+        );
+        let spawn_ids: Vec<u32> = result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::SpawnBattleNpcById { bnpc_id, .. } => Some(*bnpc_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spawn_ids,
+            (16..=24).collect::<Vec<u32>>(),
+            "onCreate must spawn Sisipu (16) + 8 ankle biters (17-24)",
+        );
+
+        let escort_actor =
+            |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
+                actor_id: 0x4008_0001,
+                name: "sisipu".to_string(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 128,
+                zone_name: String::new(),
+                state: 2,
+                pos,
+                rotation: 0.0,
+                queue,
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
+            };
+        let mob_actor =
+            |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
+                actor_id: 0x4008_0011,
+                name: "ankle_biter".to_string(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 128,
+                zone_name: String::new(),
+                state: 2,
+                pos,
+                rotation: 0.0,
+                queue,
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
+            };
+
+        // Tick 1 — road clear (the only live mob is the far third
+        // cluster): the escort takes a walking step toward waypoint 1
+        // (south = +Z).
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(sample_snapshot());
+        area.allies
+            .push(escort_actor((-60.0, 33.15, 170.0), q.clone()));
+        area.monsters
+            .push(mob_actor((-17.0, 33.15, 308.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 1, area);
+        assert!(result.error.is_none(), "tick1: {:?}", result.error);
+        let step = result.commands.iter().find_map(|c| match c {
+            LuaCommand::MoveActorToPosition {
+                actor_id: 0x4008_0001,
+                z,
+                ..
+            } => Some(*z),
+            _ => None,
+        });
+        assert!(
+            step.is_some_and(|z| z > 170.0),
+            "clear road must step the escort south; got {:?}",
+            result.commands,
+        );
+
+        // Tick 2 — ambush: a live ankle biter inside the hold radius
+        // freezes the walk and pulls the mob onto the escort party.
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(sample_snapshot());
+        area.allies
+            .push(escort_actor((-60.0, 33.15, 170.0), q.clone()));
+        area.monsters
+            .push(mob_actor((-58.0, 33.15, 180.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 2, area);
+        assert!(result.error.is_none(), "tick2: {:?}", result.error);
+        assert!(
+            !result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::MoveActorToPosition { .. })),
+            "ambush must hold the walk; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::ActorEngage { .. })),
+            "ambush must pull the mob/escort into combat; got {:?}",
+            result.commands,
+        );
+
+        // Ticks 3-6 — sequential waypoint arrivals on a cleared road,
+        // ending with the completion signal at the final waypoint.
+        let waypoints = [
+            (-52.0f32, 210.0f32),
+            (-36.0, 255.0),
+            (-20.0, 300.0),
+            (-8.0, 340.0),
+        ];
+        let mut signaled = false;
+        for (i, (wx, wz)) in waypoints.iter().enumerate() {
+            let q = CommandQueue::new();
+            let mut area = sample_content_area(q.clone());
+            area.players.push(sample_snapshot());
+            area.allies.push(escort_actor((*wx, 33.15, *wz), q.clone()));
+            let result = engine.call_content_on_update(&script_path, 3 + i as u64, area);
+            assert!(
+                result.error.is_none(),
+                "arrival tick {i}: {:?}",
+                result.error
+            );
+            signaled = result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete"));
+        }
+        assert!(
+            signaled,
+            "final waypoint with a clear road must fire escortComplete",
+        );
+    }
+
+    /// Garlemald-Server #46 — the rewritten QuestDirectorMan0l101
+    /// loads (syntax check incl. its `require("quests/man/man0l1")`)
+    /// and `init()` returns the director class path.
+    #[test]
+    fn real_quest_director_man0l101_loads() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("directors/Quest/QuestDirectorMan0l101.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+        let (lua, _q) = engine.load_script(&script_path).expect("director loads");
+        let init: Function = lua.globals().get("init").expect("init defined");
+        let path: String = init.call(()).expect("init runs");
+        assert_eq!(path, "/Director/Quest/QuestDirectorMan0l101");
     }
 
     /// B7: `call_content_hook(.., "onZoneIn", ..)` runs a script's
@@ -3131,7 +3926,7 @@ mod tests {
             quest_id: 110_005,
             sequence: 5,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }];
@@ -3398,7 +4193,7 @@ mod tests {
             quest_id: 110_001,
             sequence: 10, // SEQ_010 — Limsa port, talking to Hob
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }];
@@ -3428,7 +4223,7 @@ mod tests {
                 has_quest: true,
                 sequence: 10,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
                 queue: CommandQueue::new(),
@@ -3471,7 +4266,7 @@ mod tests {
             quest_id: 110_002,
             sequence: 0,
             flags: 0,
-            counters: [0; 3],
+            counters: [0; 4],
             npc_ls_from: 0,
             npc_ls_msg_step: 0,
         }];
@@ -3485,7 +4280,7 @@ mod tests {
                 has_quest: true,
                 sequence: 0,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
                 queue: CommandQueue::new(),
@@ -3542,7 +4337,7 @@ mod tests {
                 quest_id,
                 sequence: 0,
                 flags: 0,
-                counters: [0; 3],
+                counters: [0; 4],
                 npc_ls_from: 0,
                 npc_ls_msg_step: 0,
             }];
@@ -3556,7 +4351,7 @@ mod tests {
                     has_quest: true,
                     sequence: 0,
                     flags: 0,
-                    counters: [0; 3],
+                    counters: [0; 4],
                     npc_ls_from: 0,
                     npc_ls_msg_step: 0,
                     queue: CommandQueue::new(),

@@ -80,6 +80,14 @@ pub struct PushCircleCondition {
     pub radius: f32,
     pub outwards: bool,
     pub silent: bool,
+    /// The actor-class default enable state (`"isEnabled"` in the JSON).
+    /// Mirrors Meteor's per-condition flag: a streamed push trigger comes
+    /// in at this state and only flips when a `quest:SetENpc(..)` broadcast
+    /// overrides it. Defaults to `false` (disabled) when the field is
+    /// absent — the canonical data for every quest trigger ships
+    /// `"isEnabled": "false"`, so the circle stays inert until the owning
+    /// quest enables it.
+    pub is_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +96,8 @@ pub struct PushFanCondition {
     pub radius: f32,
     pub outwards: bool,
     pub silent: bool,
+    /// See [`PushCircleCondition::is_enabled`].
+    pub is_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +108,8 @@ pub struct PushBoxCondition {
     pub layout: u32,
     pub outwards: bool,
     pub silent: bool,
+    /// See [`PushCircleCondition::is_enabled`].
+    pub is_enabled: bool,
 }
 
 /// Parse Meteor's nested `EventList` JSON. Returns an empty list if the
@@ -210,6 +222,8 @@ struct PushCircleRaw {
     outwards: JsonBool,
     #[serde(default)]
     silent: JsonBool,
+    #[serde(default, rename = "isEnabled")]
+    is_enabled: JsonBool,
 }
 impl From<PushCircleRaw> for PushCircleCondition {
     fn from(r: PushCircleRaw) -> Self {
@@ -218,6 +232,7 @@ impl From<PushCircleRaw> for PushCircleCondition {
             radius: r.radius.0,
             outwards: r.outwards.0,
             silent: r.silent.0,
+            is_enabled: r.is_enabled.0,
         }
     }
 }
@@ -232,6 +247,8 @@ struct PushFanRaw {
     outwards: JsonBool,
     #[serde(default)]
     silent: JsonBool,
+    #[serde(default, rename = "isEnabled")]
+    is_enabled: JsonBool,
 }
 impl From<PushFanRaw> for PushFanCondition {
     fn from(r: PushFanRaw) -> Self {
@@ -240,6 +257,7 @@ impl From<PushFanRaw> for PushFanCondition {
             radius: r.radius.0,
             outwards: r.outwards.0,
             silent: r.silent.0,
+            is_enabled: r.is_enabled.0,
         }
     }
 }
@@ -258,6 +276,8 @@ struct PushBoxRaw {
     outwards: JsonBool,
     #[serde(default)]
     silent: JsonBool,
+    #[serde(default, rename = "isEnabled")]
+    is_enabled: JsonBool,
 }
 impl From<PushBoxRaw> for PushBoxCondition {
     fn from(r: PushBoxRaw) -> Self {
@@ -268,6 +288,7 @@ impl From<PushBoxRaw> for PushBoxCondition {
             layout: r.layout.0,
             outwards: r.outwards.0,
             silent: r.silent.0,
+            is_enabled: r.is_enabled.0,
         }
     }
 }
@@ -379,5 +400,37 @@ mod tests {
     fn empty_blob_is_empty_list() {
         assert!(parse_event_conditions("").unwrap().is_empty());
         assert!(parse_event_conditions("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn push_circle_is_enabled_parses_from_canonical_data() {
+        // The canonical project-meteor-server trigger data ships
+        // `"isEnabled": "false"` (stringified) — the trigger streams in
+        // disabled and only its owning quest enables it. (Garlemald-Server #46.)
+        let blob = r#"{
+            "pushWithCircleEventConditions": [
+                {"isEnabled": "false", "radius": "6.0", "outwards": "false",
+                 "silent": "false", "conditionName": "pushDefault"}
+            ]
+        }"#;
+        let list = parse_event_conditions(blob).unwrap();
+        assert_eq!(list.push_circle.len(), 1);
+        assert!(!list.push_circle[0].is_enabled);
+    }
+
+    #[test]
+    fn push_circle_is_enabled_true_and_absent() {
+        let enabled = parse_event_conditions(
+            r#"{"pushWithCircleEventConditions":[{"isEnabled":"true","conditionName":"p"}]}"#,
+        )
+        .unwrap();
+        assert!(enabled.push_circle[0].is_enabled);
+
+        // Numeric-format conditions (no isEnabled field) coerce to false.
+        let absent = parse_event_conditions(
+            r#"{"pushWithCircleEventConditions":[{"radius":3.0,"conditionName":"p"}]}"#,
+        )
+        .unwrap();
+        assert!(!absent.push_circle[0].is_enabled);
     }
 }

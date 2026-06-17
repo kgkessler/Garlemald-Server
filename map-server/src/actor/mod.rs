@@ -263,6 +263,13 @@ pub struct CharaState {
     /// snapshot build time, so `FindFirstCommandSlotById` and the
     /// `charaWork.command[N]` accessor see the live equipped state.
     pub hotbar: Vec<crate::gamedata::HotbarEntry>,
+    /// Owned NPC linkshells (`characters_npclinkshell`), hydrated at
+    /// session-begin so the zone-in bundle can re-emit the
+    /// `playerWork.npcLinkshellChat{Calling,Extra}[N]` pearl-state
+    /// properties on login — without this the flashing-pearl cue for a
+    /// pending NPC-linkshell message is lost across a relog (the
+    /// `SetNpcLs` delta only fires live). (Garlemald-Server #46.)
+    pub npc_linkshells: Vec<crate::gamedata::NpcLinkshellEntry>,
     /// "Standard NPC" / Path Companion scratchpad — set by C#
     /// `Player.SetSNpc(nickname, actorClassId, classType)` in the
     /// man200 MSQ branch. Persisted to migration-051 columns
@@ -349,6 +356,7 @@ impl Default for CharaState {
             homepoint: 0,
             homepoint_inn: 0,
             hotbar: Vec::new(),
+            npc_linkshells: Vec::new(),
             snpc_nickname: String::new(),
             snpc_skin: 0,
             snpc_personality: 0,

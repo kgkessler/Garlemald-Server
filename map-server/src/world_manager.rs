@@ -291,7 +291,7 @@ fn push_master_spawn(
 /// Turns `/Chara/Npc/Populace/PopulaceStandard` (what our gamedata
 /// stores) into `/chara/npc/populace/PopulaceStandard` (what Meteor
 /// sends on the wire and the 1.x client's script loader expects).
-fn lowercase_class_path(path: &str) -> String {
+pub(crate) fn lowercase_class_path(path: &str) -> String {
     if let Some(last_slash) = path.rfind('/') {
         let prefix = &path[..last_slash];
         let tail = &path[last_slash..];
@@ -395,12 +395,31 @@ pub fn build_retainer_spawn_bundle(
     zone_name: &str,
 ) -> Vec<common::subpacket::SubPacket> {
     let mut out = Vec::new();
-    push_npc_spawn(&mut out, character, zone_name, 0, false, None, None);
+    push_npc_spawn(&mut out, character, zone_name, 0, false, None, None, None);
     out
 }
 
+/// Snapshot the receiving player's quest-driven push-trigger states:
+/// `actor_class_id → is_push_enabled` across every active quest's current
+/// ENPC set. A streamed actor whose class is in this map is a quest
+/// trigger the player's journal already has an explicit enable/disable for,
+/// so the spawn bundle should honour that state rather than the actor-class
+/// `isEnabled` default — this is what lets a trigger enabled by a far-away
+/// `onStateChange` still arrive enabled when the player finally walks into
+/// streaming range (e.g. man0l1's Zephyr Gate), and conversely keeps a
+/// quest-disabled trigger (man0l1's ECHO_EXIT before its sequence) silent.
+fn quest_push_overrides(character: &crate::actor::Character) -> HashMap<u32, bool> {
+    let mut map = HashMap::new();
+    for quest in character.quest_journal.slots.iter().flatten() {
+        for (class_id, enpc) in &quest.state.current {
+            map.insert(*class_id, enpc.is_push_enabled);
+        }
+    }
+    map
+}
+
 #[allow(clippy::too_many_arguments)]
-fn push_npc_spawn(
+pub(crate) fn push_npc_spawn(
     subpackets: &mut Vec<common::subpacket::SubPacket>,
     character: &crate::actor::Character,
     zone_name: &str,
@@ -417,6 +436,13 @@ fn push_npc_spawn(
     // the legacy populace-pipeline behavior (bit-2 mask + hateType 0
     // for `/Monster/` class paths).
     battle_kind: Option<crate::runtime::actor_registry::ActorKindTag>,
+    // Per-actor push-trigger enable override for the receiving player.
+    // `Some(b)` when this actor is a current quest ENPC for the player
+    // (the owning quest's `quest:SetENpc(.., QFLAG_PUSH)` state) — that
+    // wins over the actor-class `isEnabled` default. `None` for plain
+    // populace / objects, leaving each push condition at its data default
+    // (disabled for quest triggers). See `build_actor_event_status_packets`.
+    push_enabled: Option<bool>,
 ) {
     let actor_id = character.base.actor_id;
     // Meteor's `Actor.CreateNamePacket` (Map Server/Actors/Actor.cs:153)
@@ -655,16 +681,20 @@ fn push_npc_spawn(
     // player walks into the circle, and proximity-driven cinematics like
     // `man0g0::onPush(YDA)` never reach the player.
     //
-    // Defaults match Meteor's signature `(talkEnabled=true, emoteEnabled=true,
-    // pushEnabled=null → unwrap_or(true), noticeEnabled=true)`. A subsequent
-    // `quest:SetENpc(...)` broadcast can flip `pushEnabled=false` if the
-    // current sequence wants the trigger silent.
+    // talk / emote / notice match Meteor's `(talkEnabled=true,
+    // emoteEnabled=true, noticeEnabled=true)`. Push is `push_enabled`:
+    // `Some(b)` from the caller when this actor is a current quest ENPC
+    // for the receiving player (so a stream-after-enable trigger arrives in
+    // the state the quest already chose), otherwise `None` so each push
+    // condition falls back to its actor-class `isEnabled` default (disabled
+    // for quest triggers). A later `quest:SetENpc(...)` broadcast still
+    // overrides for already-streamed actors.
     subpackets.extend(crate::packets::send::build_actor_event_status_packets(
         actor_id,
         &character.base.event_conditions,
         true,
         true,
-        None,
+        push_enabled,
         true,
     ));
 
@@ -1253,6 +1283,76 @@ impl WorldManager {
         Ok(())
     }
 
+    /// Stream a set of already-spawned content NPCs into one player's view
+    /// via the proven `push_npc_spawn` path (the exact builder
+    /// `send_zone_in_bundle` uses for neighbours — full ActorInstantiate +
+    /// appearance/name/state tail that actually RENDERS), sent DIRECTLY to the
+    /// player's client (target-tagged), independent of the spatial grid.
+    ///
+    /// Used by the man0l1 escort's post-warp content reveal: the escort NPCs
+    /// (Sisipu + ankle biters) are kept out of the warp bundle and revealed
+    /// here once the client has zoned back in from the entry cutscene, so they
+    /// stream in AFTER the player (matching retail). Replaces
+    /// `spawn_bundle_fanout`, whose `build_add_actor(flag 0)` grid-broadcast
+    /// never rendered them. (Garlemald-Server #46.)
+    pub async fn reveal_content_npcs(
+        &self,
+        registry: &ActorRegistry,
+        lua: Option<&Arc<crate::lua::LuaEngine>>,
+        session_id: u32,
+        npc_ids: &[u32],
+    ) {
+        let Some(client) = self.client(session_id).await else {
+            return;
+        };
+        let Some(player_handle) = registry.by_session(session_id).await else {
+            return;
+        };
+        let zone_id = { player_handle.character.read().await.base.zone_id };
+        let Some(zone_arc) = self.zone(zone_id).await else {
+            return;
+        };
+        let zone_name = { zone_arc.read().await.core.zone_name.clone() };
+        let mut revealed: Vec<u32> = Vec::new();
+        for &npc_id in npc_ids {
+            let Some(handle) = registry.get(npc_id).await else {
+                continue;
+            };
+            let mut npc_bundle = Vec::new();
+            {
+                let character = handle.character.read().await;
+                push_npc_spawn(
+                    &mut npc_bundle,
+                    &character,
+                    &zone_name,
+                    /* priv_level */ 0,
+                    /* in_private_area */ false,
+                    lua,
+                    Some(handle.kind),
+                    /* push_enabled */ None,
+                );
+            }
+            for mut sub in npc_bundle {
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+            revealed.push(npc_id);
+        }
+        // Mark them present so the continuous `send_instance_update` streaming
+        // doesn't re-AddActor them on the first walk-tick.
+        if !revealed.is_empty() {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                s.actor_instance_list.extend(revealed.iter().copied());
+            }
+        }
+        tracing::info!(
+            session = session_id,
+            count = revealed.len(),
+            "content NPCs revealed to player via push_npc_spawn (direct send)",
+        );
+    }
+
     /// Port of `Player.SendZoneInPackets(world, spawnType)`. This is the
     /// bundle the client waits on before leaving "Now loading…": zoning
     /// clear, music/weather/map, the player's self-spawn, an empty
@@ -1430,6 +1530,19 @@ impl WorldManager {
                 c.chara.gc_rank_gridania,
                 c.chara.gc_rank_uldah,
             )
+        };
+        // Owned NPC linkshells with a pending/owned state — re-emitted as
+        // `playerWork.npcLinkshellChat{Calling,Extra}[N]` below so the
+        // flashing-pearl cue survives a relog (Garlemald-Server #46). Ids
+        // are stored zero-based (the SetNpcLs apply path decremented).
+        let npc_linkshells: Vec<(u16, bool, bool)> = {
+            let c = actor_handle.character.read().await;
+            c.chara
+                .npc_linkshells
+                .iter()
+                .filter(|e| e.is_calling || e.is_extra)
+                .map(|e| (e.npc_ls_id, e.is_calling, e.is_extra))
+                .collect()
         };
         let (zone_actor_id, region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
             let z = zone_arc.read().await;
@@ -1764,6 +1877,27 @@ impl WorldManager {
             &active_quests,
             &hotbar_props,
         ));
+        // NPC-linkshell pearl state — re-emit each owned linkshell's
+        // `playerWork.npcLinkshellChat{Calling,Extra}[N]` so a pending
+        // message's flashing pearl survives a relog (the live SetNpcLs
+        // delta only fires in-session). Mirrors C# GetInitPackets'
+        // Calling-then-Extra ordering (Player.cs:577-582). Skipped
+        // entirely for a player with no owned NPC linkshells (the common
+        // case), so this adds nothing to the bundle pre-Baderon.
+        // (Garlemald-Server #46.)
+        if !npc_linkshells.is_empty() {
+            let mut b =
+                tx::actor::ActorPropertyPacketBuilder::new(actor_id, "playerWork/npcLinkshellChat");
+            for (id, is_calling, is_extra) in &npc_linkshells {
+                if *is_calling {
+                    b.add_byte(&format!("playerWork.npcLinkshellChatCalling[{id}]"), 1);
+                }
+                if *is_extra {
+                    b.add_byte(&format!("playerWork.npcLinkshellChatExtra[{id}]"), 1);
+                }
+            }
+            subpackets.extend(b.done());
+        }
         // Post-init property emission — C# `PostUpdate` drives these on
         // the first tick after spawn, but the client's
         // `DepictionJudge:judgeNameplate` runs BEFORE that tick lands
@@ -2091,9 +2225,26 @@ impl WorldManager {
                     .into_iter()
                     .filter(|a| a.actor_id != actor_id)
                     .filter(|a| {
+                        // The player-only-bundle / deferred-reveal split is
+                        // SPECIFIC to the man0l1 same-map escort (spawnType
+                        // 0x16): there the bundle must be the player's reload
+                        // ONLY — bundling the content NPC spawns into the same
+                        // flush as the order-machine reload crashes the client,
+                        // so they're revealed in a separate flush on the
+                        // client's post-warp zone-in echo (RX 0x0007 →
+                        // `content_warp_acked`; see the handler's
+                        // reveal_content_npcs). Every OTHER content warp
+                        // (man0l0 deck tutorial, man0g0 SEQ_005 — spawnType
+                        // 0x10) does a real scene reload behind the 0x00E2
+                        // latch and expects its content NPCs IN the bundle, the
+                        // original pre-#46 behaviour; gating on
+                        // `destination_spawn_type == 0x16` keeps those intact.
+                        // (Garlemald #46.)
                         !in_content_instance
+                            || session.destination_spawn_type != 0x16
                             || matches!(a.kind, crate::zone::area::ActorKind::Player)
-                            || (a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
+                            || ((a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
+                                && session.content_warp_acked)
                     })
                     .map(|a| (a.actor_id, a.kind))
                     .collect(),
@@ -2133,6 +2284,10 @@ impl WorldManager {
         // (opening_jelly, opening_yshtola, opening_stahlmann) go
         // through the same populace pipeline.
         let mut spawned_npc_ids: Vec<u32> = Vec::new();
+        // Snapshot the player's quest-driven push-trigger states once so
+        // each spawned trigger arrives in the state its owning quest chose
+        // (rather than the actor-class default). (Garlemald-Server #46.)
+        let quest_push = quest_push_overrides(&*actor_handle.character.read().await);
         for (neighbour_id, kind) in neighbours {
             use crate::zone::area::ActorKind;
             if !matches!(
@@ -2150,6 +2305,7 @@ impl WorldManager {
             }
             emitted += 1;
             spawned_npc_ids.push(neighbour_id);
+            let push_enabled = quest_push.get(&character.chara.actor_class_id).copied();
             let mut npc_bundle = Vec::new();
             push_npc_spawn(
                 &mut npc_bundle,
@@ -2165,10 +2321,22 @@ impl WorldManager {
                 private_area_bind.is_some(),
                 lua,
                 Some(handle.kind),
+                push_enabled,
             );
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
                 client.send_bytes(sub.to_bytes()).await;
+            }
+        }
+        // Seed the session's actor-instance list with everything this
+        // bundle just spawned, so the continuous `send_instance_update`
+        // (per-movement streaming) doesn't re-AddActor them on the first
+        // walk-tick. Reset to exactly the bundle's set: a fresh zone-in
+        // is the client's new ground truth. (Garlemald-Server #46.)
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                s.actor_instance_list = spawned_npc_ids.iter().copied().collect();
             }
         }
 
@@ -2542,11 +2710,24 @@ impl WorldManager {
             );
         }
 
-        // Update session bookkeeping.
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&session_id) {
-            session.current_zone_id = destination_zone_id;
+        // Update session bookkeeping. Clear the merged-zone latch and
+        // the instance list: the destination zone has a different actor
+        // set, so the next `send_instance_update` must stream it fresh.
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.current_zone_id = destination_zone_id;
+                session.merged_zone_id = None;
+                session.actor_instance_list.clear();
+            }
         }
+        tracing::info!(
+            actor = format!("0x{actor_id:08X}"),
+            session = session_id,
+            from = old_zone_id,
+            to = destination_zone_id,
+            "seamless zone change",
+        );
         Ok(())
     }
 
@@ -2557,7 +2738,7 @@ impl WorldManager {
     pub async fn merge_zones(
         &self,
         actor_id: u32,
-        _session_id: u32,
+        session_id: u32,
         merged_zone_id: u32,
         position: Vector3,
     ) -> Result<()> {
@@ -2577,6 +2758,20 @@ impl WorldManager {
             },
             &mut ob,
         );
+        // Record the merge so `seamless_check` doesn't re-fire it every
+        // position tick (C# `player.zone2` / the `zoneId2 != 0` guard).
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.merged_zone_id = Some(merged_zone_id);
+            }
+        }
+        tracing::info!(
+            actor = format!("0x{actor_id:08X}"),
+            session = session_id,
+            merged = merged_zone_id,
+            "seamless zone merge",
+        );
         Ok(())
     }
 
@@ -2593,15 +2788,19 @@ impl WorldManager {
         session_id: u32,
         position: Vector3,
     ) -> SeamlessResult {
-        // Which region is this player in?
-        let (region_id, current_zone_id) = match self.session(session_id).await {
+        // Which region is this player in? Also read the merged-zone
+        // latch so the per-tick check has an "already there" early-out
+        // (mirror C# `WorldManager.SeamlessCheck`'s `zoneId2 == 0` /
+        // `zoneId2 == merged` guards — without them every position
+        // packet in a boundary box re-fires the change/merge).
+        let (region_id, current_zone_id, merged_zone_id) = match self.session(session_id).await {
             Some(s) => {
                 let zone = self.zone(s.current_zone_id).await;
                 let region = match zone {
                     Some(z) => z.read().await.core.region_id as u32,
                     None => return SeamlessResult::None,
                 };
-                (region, s.current_zone_id)
+                (region, s.current_zone_id, s.merged_zone_id)
             }
             None => return SeamlessResult::None,
         };
@@ -2611,7 +2810,16 @@ impl WorldManager {
             if check_pos_in_bounds(
                 position.x, position.z, b.zone1_x1, b.zone1_y1, b.zone1_x2, b.zone1_y2,
             ) {
+                if current_zone_id == b.zone_id_1 && merged_zone_id.is_none() {
+                    return SeamlessResult::InsideZoneOne;
+                }
                 if current_zone_id == b.zone_id_1 {
+                    // Primary already correct; just drop the merge latch
+                    // (we walked from the strip back into our own box).
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.merged_zone_id = None;
+                    }
                     return SeamlessResult::InsideZoneOne;
                 }
                 let _ = self
@@ -2622,7 +2830,14 @@ impl WorldManager {
             if check_pos_in_bounds(
                 position.x, position.z, b.zone2_x1, b.zone2_y1, b.zone2_x2, b.zone2_y2,
             ) {
+                if current_zone_id == b.zone_id_2 && merged_zone_id.is_none() {
+                    return SeamlessResult::InsideZoneTwo;
+                }
                 if current_zone_id == b.zone_id_2 {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.merged_zone_id = None;
+                    }
                     return SeamlessResult::InsideZoneTwo;
                 }
                 let _ = self
@@ -2638,6 +2853,10 @@ impl WorldManager {
                 } else {
                     b.zone_id_1
                 };
+                // Already merged with this neighbour — don't re-fire.
+                if merged_zone_id == Some(merged) {
+                    return SeamlessResult::ZoneMerged(merged);
+                }
                 let _ = self
                     .merge_zones(actor_id, session_id, merged, position)
                     .await;
@@ -2645,6 +2864,146 @@ impl WorldManager {
             }
         }
         SeamlessResult::None
+    }
+
+    /// Continuous actor-instance update — the per-movement spawn stream
+    /// (port of C# `Session.UpdateInstance` / `Player.SendInstanceUpdate`,
+    /// PacketProcessor.cs:163). garlemald previously emitted populace
+    /// spawns ONLY once, in `send_zone_in_bundle`'s warp-time
+    /// `actors_around(50)` scan — so any actor more than 50y from a warp
+    /// point (the whole Camp Bearded Rock approach after the Zephyr Gate
+    /// seamless crossing) never reached the client. This fans in the
+    /// actors that have walked into range since the last update.
+    ///
+    /// ADD-ONLY first cut: it spawns newly-in-range actors and records
+    /// them in `session.actor_instance_list`, but does NOT despawn
+    /// actors the player walks away from (pmeteor sends RemoveActor on
+    /// the diff). Add-only deliberately avoids fighting the warp-time
+    /// mass-delete keep-list and quest `SetENpc` broadcasts that assume
+    /// an NPC stays in the client's table; the cost is that distant
+    /// actors linger client-side, which is benign at 1.x zone scale.
+    /// Despawn-on-distance is a follow-up.
+    ///
+    /// Scoped to ROOT-zone walking: private-area instances get their
+    /// full population at zone-in (no radius scan) and content instances
+    /// are bounded + AI-managed, so both are skipped here.
+    pub async fn send_instance_update(
+        &self,
+        registry: &crate::runtime::actor_registry::ActorRegistry,
+        lua: Option<&std::sync::Arc<crate::lua::LuaEngine>>,
+        actor_id: u32,
+        session_id: u32,
+    ) {
+        let Some(session) = self.session(session_id).await else {
+            return;
+        };
+        // Skip private-area + content-instance routing (full / bounded
+        // populations handled elsewhere).
+        if session.current_private_area_name.is_some() {
+            return;
+        }
+        if session
+            .active_content_script
+            .as_ref()
+            .is_some_and(|a| session.current_zone_id == a.parent_zone_id)
+        {
+            return;
+        }
+        let Some(zone_arc) = self.zone(session.current_zone_id).await else {
+            return;
+        };
+        let Some(client) = self.client(session_id).await else {
+            return;
+        };
+
+        // Collect in-range NPC/Ally/BattleNpc neighbours the client does
+        // NOT already have, holding the zone read-lock only for the scan.
+        let new_ids: Vec<u32> = {
+            let z = zone_arc.read().await;
+            z.core
+                .actors_around(actor_id, 50.0)
+                .into_iter()
+                .filter(|a| a.actor_id != actor_id)
+                .filter(|a| {
+                    matches!(
+                        a.kind,
+                        crate::zone::area::ActorKind::Npc
+                            | crate::zone::area::ActorKind::BattleNpc
+                            | crate::zone::area::ActorKind::Ally
+                    )
+                })
+                .map(|a| a.actor_id)
+                .filter(|id| !session.actor_instance_list.contains(id))
+                .collect()
+        };
+        if new_ids.is_empty() {
+            return;
+        }
+
+        let zone_name = { zone_arc.read().await.core.zone_name.clone() };
+        // Snapshot the player's quest-driven push-trigger states so a
+        // trigger that streams in AFTER its owning quest enabled it (the
+        // player walked into range from afar — e.g. man0l1's Zephyr Gate)
+        // still arrives enabled, and a quest-disabled trigger near the
+        // player (man0l1's ECHO_EXIT before its sequence) stays silent.
+        // (Garlemald-Server #46.)
+        let quest_push = match registry.get(actor_id).await {
+            Some(h) => quest_push_overrides(&*h.character.read().await),
+            None => HashMap::new(),
+        };
+        let mut added: Vec<u32> = Vec::new();
+        for neighbour_id in new_ids {
+            let Some(handle) = registry.get(neighbour_id).await else {
+                continue;
+            };
+            let character = handle.character.read().await;
+            let push_enabled = quest_push.get(&character.chara.actor_class_id).copied();
+            let mut npc_bundle = Vec::new();
+            // push_npc_spawn registers every event condition AND emits the
+            // SetEventStatus enable-flags (talk/emote/notice = true; push =
+            // `push_enabled` ?? the condition's actor-class `isEnabled`).
+            // pmeteor's Session.UpdateInstance does the same right after the
+            // spawn bundle (Session.cs:139/161); without the enable the 1.x
+            // client treats the NPC as non-talkable and never fires an
+            // EventStart. Quest push triggers in the root zone are the one
+            // case where the enable must NOT be unconditional — hence the
+            // per-player `push_enabled` override above.
+            push_npc_spawn(
+                &mut npc_bundle,
+                &character,
+                &zone_name,
+                0,     // root zone: no private-area level suffix
+                false, // root zone: not a private-area bind
+                lua,
+                Some(handle.kind),
+                push_enabled,
+            );
+            drop(character);
+            for mut sub in npc_bundle {
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+            added.push(neighbour_id);
+        }
+        if added.is_empty() {
+            return;
+        }
+        // Record the newly-streamed actors so the next tick skips them.
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                for id in &added {
+                    s.actor_instance_list.insert(*id);
+                }
+            }
+        }
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            session = session_id,
+            zone = session.current_zone_id,
+            streamed = added.len(),
+            "send_instance_update: streamed newly-in-range actors",
+        );
     }
 
     /// Move an actor *within* its current zone — updates the spatial

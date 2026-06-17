@@ -2069,7 +2069,7 @@ impl Database {
             .call_db(move |c| {
                 let mut stmt = c.prepare(
                     r"SELECT slot, questId, sequence, flags, counter1, counter2, counter3,
-                              npc_ls_from, npc_ls_msg_step
+                              counter4, npc_ls_from, npc_ls_msg_step
                       FROM characters_quest_scenario WHERE characterId = :cid",
                 )?;
                 let rows: Vec<QuestScenarioEntry> = stmt
@@ -2082,8 +2082,9 @@ impl Database {
                             counter1: r.get::<_, u16>(4).unwrap_or_default(),
                             counter2: r.get::<_, u16>(5).unwrap_or_default(),
                             counter3: r.get::<_, u16>(6).unwrap_or_default(),
-                            npc_ls_from: r.get::<_, u32>(7).unwrap_or_default(),
-                            npc_ls_msg_step: r.get::<_, u8>(8).unwrap_or_default(),
+                            counter4: r.get::<_, u16>(7).unwrap_or_default(),
+                            npc_ls_from: r.get::<_, u32>(8).unwrap_or_default(),
+                            npc_ls_msg_step: r.get::<_, u8>(9).unwrap_or_default(),
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -2369,6 +2370,7 @@ impl Database {
         counter1: u16,
         counter2: u16,
         counter3: u16,
+        counter4: u16,
     ) -> Result<()> {
         let qid = 0xF_FFFFu32 & quest_actor_id;
         self.conn
@@ -2376,16 +2378,17 @@ impl Database {
                 c.execute(
                     r"INSERT INTO characters_quest_scenario
                         (characterId, slot, questId, sequence, flags,
-                         counter1, counter2, counter3)
+                         counter1, counter2, counter3, counter4)
                       VALUES (:cid, :slot, :qid, :seq, :flags,
-                              :c1, :c2, :c3)
+                              :c1, :c2, :c3, :c4)
                       ON CONFLICT(characterId, slot) DO UPDATE SET
                         questId  = excluded.questId,
                         sequence = excluded.sequence,
                         flags    = excluded.flags,
                         counter1 = excluded.counter1,
                         counter2 = excluded.counter2,
-                        counter3 = excluded.counter3",
+                        counter3 = excluded.counter3,
+                        counter4 = excluded.counter4",
                     named_params! {
                         ":cid": chara_id,
                         ":slot": slot,
@@ -2395,6 +2398,7 @@ impl Database {
                         ":c1": counter1,
                         ":c2": counter2,
                         ":c3": counter3,
+                        ":c4": counter4,
                     },
                 )?;
                 Ok(())
@@ -4529,6 +4533,93 @@ mod battle_npc_spawn_tests {
         assert_eq!(row.pool_id, 2);
         assert_eq!(row.actor_class_id, 2_201_407);
         assert_eq!(row.script_name, "bloodthirsty_wolf");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Garlemald-Server #46 — migration 056 seeds the Man0l1 Zephyr
+    /// Gate escort: Sisipu (bnpcId=16, ally) + the ankle-biter packs
+    /// (17-24, Chigoe genus), plus the un-stripped actor classes the
+    /// spawn path requires (2290007 Sisipu / 2205603 ankle biter /
+    /// 1090004 ZEPHYR_TRIGGER with its r=12 push circle).
+    #[tokio::test]
+    async fn load_battle_npc_spawn_man0l1_escort() {
+        use common::db::ConnCallExt;
+        let path = tempdb("escort");
+        let db = Database::open(&path).await.expect("open db");
+
+        let sisipu = db
+            .load_battle_npc_spawn(16)
+            .await
+            .expect("query")
+            .expect("sisipu row");
+        assert_eq!(sisipu.group_id, 11);
+        assert_eq!(sisipu.actor_class_id, 2_290_007);
+        assert_eq!(sisipu.script_name, "sisipu");
+        assert_eq!(sisipu.allegiance, 1, "sisipu escorts as an ally");
+        // Re-homed to zone 128 by migration 065: the escort runs OPEN-FIELD in
+        // the player's current zone (no instance warp), reverting 064's 141.
+        // (Garlemald-Server #46.)
+        assert_eq!(sisipu.zone_id, 128);
+
+        let biter = db
+            .load_battle_npc_spawn(17)
+            .await
+            .expect("query")
+            .expect("ankle biter row");
+        assert_eq!(biter.actor_class_id, 2_205_603);
+        assert_eq!(biter.allegiance, 0);
+        assert_eq!(biter.zone_id, 128);
+
+        // The migration's UPDATEs filled the stripped class rows.
+        let sisipu_class = db
+            .load_actor_class(2_290_007)
+            .await
+            .expect("query")
+            .expect("sisipu class");
+        assert_eq!(
+            sisipu_class.class_path,
+            "/Chara/Npc/Monster/Fighter/FighterAllyOpeningAttacker",
+        );
+        let biter_class = db
+            .load_actor_class(2_205_603)
+            .await
+            .expect("query")
+            .expect("biter class");
+        assert_eq!(
+            biter_class.class_path,
+            "/Chara/Npc/Monster/Chigoe/ChigoeLesserStandard",
+        );
+        let trigger_class = db
+            .load_actor_class(1_090_004)
+            .await
+            .expect("query")
+            .expect("trigger class");
+        assert_eq!(
+            trigger_class.class_path,
+            "/Chara/Npc/Populace/PopulaceStandard",
+        );
+        assert!(
+            trigger_class
+                .event_conditions
+                .contains("pushWithCircleEventConditions"),
+            "ZEPHYR_TRIGGER must carry the r=12 push circle",
+        );
+
+        // And the zone-128 trigger spawn row exists.
+        let spawn_count: i64 = db
+            .conn_for_test()
+            .call_db(|c| {
+                c.query_row(
+                    r"SELECT COUNT(*) FROM server_spawn_locations
+                      WHERE actorClassId = 1090004 AND zoneId = 128
+                        AND uniqueId = 'seafld0_push_limsa_entrance'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(spawn_count, 1);
         let _ = std::fs::remove_file(&path);
     }
 
