@@ -2225,15 +2225,23 @@ impl WorldManager {
                     .into_iter()
                     .filter(|a| a.actor_id != actor_id)
                     .filter(|a| {
-                        // In a content instance the INITIAL warp bundle must be
-                        // the player's reload ONLY — bundling the content NPC
-                        // spawns into the same flush as the order-machine reload
-                        // crashes the client. They're revealed in a separate
-                        // flush once the client echoes its post-warp zone-in
-                        // (RX 0x0007 → `content_warp_acked`; see the handler's
-                        // spawn_bundle_fanout). After the ack (e.g. a later
-                        // re-bundle) the content band is kept. (Garlemald #46.)
+                        // The player-only-bundle / deferred-reveal split is
+                        // SPECIFIC to the man0l1 same-map escort (spawnType
+                        // 0x16): there the bundle must be the player's reload
+                        // ONLY — bundling the content NPC spawns into the same
+                        // flush as the order-machine reload crashes the client,
+                        // so they're revealed in a separate flush on the
+                        // client's post-warp zone-in echo (RX 0x0007 →
+                        // `content_warp_acked`; see the handler's
+                        // reveal_content_npcs). Every OTHER content warp
+                        // (man0l0 deck tutorial, man0g0 SEQ_005 — spawnType
+                        // 0x10) does a real scene reload behind the 0x00E2
+                        // latch and expects its content NPCs IN the bundle, the
+                        // original pre-#46 behaviour; gating on
+                        // `destination_spawn_type == 0x16` keeps those intact.
+                        // (Garlemald #46.)
                         !in_content_instance
+                            || session.destination_spawn_type != 0x16
                             || matches!(a.kind, crate::zone::area::ActorKind::Player)
                             || ((a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
                                 && session.content_warp_acked)

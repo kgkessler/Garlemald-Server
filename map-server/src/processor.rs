@@ -3318,101 +3318,113 @@ impl PacketProcessor {
             client.send_bytes(msg.to_bytes()).await;
         }
 
-        // DeleteAllActors (despawn) ONLY — NO 0x00E2 force-reload latch.
-        //
-        // Decompiled in captures/issue28-rca: the 0x00E2 latch makes a
-        // same-region SetMap SCHEDULE a reload, which sets MapLayoutElement
-        // [+0xb9] (map-load-in-progress) = 1. For a SAME-MAP duty the geometry
-        // is already resident, so the client's level streamer never re-streams
-        // and NOTHING ever clears [+0xb9] back to 0 (there is no server packet
-        // that can — the only [+0xb9]=0 writers are world teardown). The order
-        // machine escapes its own [+0xb9] wait via a 30s timeout, but the entry
-        // cutscene's `_waitForMapLoaded` has NO timeout and blocks on [+0xb9]==0
-        // forever — THE "Now Loading" hang. So we must NOT schedule a reload:
-        // omit the latch, leave [+0xb9] at the clean post-login 0, and finish
-        // the zone-in instantly via the spawnType-0x16 0x00CE (see the
-        // Lua-side DoZoneChangeContent and the bundle below). DeleteAllActors
-        // still fires to despawn the public-zone actors for the cut.
-        // (Garlemald-Server #46.)
-        {
-            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
-            wipe.set_target_id(session_id);
-            client.send_bytes(wipe.to_bytes()).await;
-        }
+        // The content-warp reload has TWO completely separate shapes, picked
+        // by spawnType. Everything below this point until the onZoneIn hook is
+        // shape-specific, so we branch the WHOLE tail rather than scatter
+        // per-line gates (which is what regressed the man0l0 opening tutorial:
+        // the #46 escort work rewrote this shared path and the original
+        // non-escort reload was only partly restored). (Garlemald-Server #46.)
+        if spawn_type == 0x16 {
+            // ===== man0l1 same-map escort (spawnType 0x16) =====
+            // NO 0x00E2 latch: the geometry is already resident so nothing ever
+            // clears MapLayoutElement [+0xb9] (decomp: captures/issue28-rca),
+            // and the entry cut's untimed `_waitForMapLoaded` would block on
+            // [+0xb9]==0 forever. Leave [+0xb9] at the clean post-login 0 and
+            // finish the zone-in instantly via the spawnType-0x16 0x00CE bypass.
+            // DeleteAllActors still fires to despawn the public-zone actors.
+            {
+                let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+                wipe.set_target_id(session_id);
+                client.send_bytes(wipe.to_bytes()).await;
+            }
 
-        // Keep `warp_complete` FALSE through the warp bundle: the bundle must
-        // be the PLAYER's reload ONLY (matching pmeteor's reference burst —
-        // SetMap → player AddActor/0x132×8/0x00D0/0x00CE → appearance/name).
-        // Bundling the 9 content NPC spawns into the warp (interleaved AFTER
-        // the player's 0x00CE order-machine arm, while the scene is mid-reload)
-        // crashes the client. The content roster is instead revealed AFTER the
-        // client finishes the load and echoes its post-warp zone-in — see the
-        // RX 0x0007 handler, which flips `warp_complete` + fans the roster out
-        // then. `content_warp_acked` also gates the escort `onUpdate` driver so
-        // it can't fire actor packets at a still-loading client.
-        // (Garlemald-Server #46.)
-        if let Some(mut snap) = self.world.session(session_id).await {
-            snap.content_warp_acked = false;
-            self.world.upsert_session(snap).await;
-        }
-
-        // 4. Dispatch the zone-in bundle — retail-paced, mirroring the WORKING
-        //    cross-zone warp (`apply_do_zone_change` / quest_apply.rs:2044).
-        //    `commit_keep_list = true` so the old zone's actors are cleaned up
-        //    via the trailing Mass-Delete keep-list trio (the retail shape)
-        //    instead of a fatal up-front bare wipe.
-        //
-        //    A content instance shares its parent zone's REGION (man0l1's
-        //    escort: 128 -> 141, both region 101), so this is a SAME-REGION
-        //    cross-zone change — exactly the case the working warp DEFERS the
-        //    bundle ~6 s behind the 0x00E2 latch for (the 230 -> 133 Drowning
-        //    Wench pacing). The deferral parks `pending_zone_in` on the session
-        //    (the game ticker fires the bundle) and, while parked, the position
-        //    handler holds the client's stale OLD-zone (128) coordinate reports
-        //    off the character so they can't relocate the warp destination
-        //    mid-load. Sending the bundle IMMEDIATELY for a same-region change
-        //    is the one combination that hangs "Now Loading": the client echoes
-        //    RX 0x0007 but never fires the cinematic EventStart and the overlay
-        //    never dismisses (live-verified — the 128 -> 141 escort warp hung on
-        //    immediate dispatch, while the 128 -> 230 / 230 -> 133 same-region
-        //    warps clear only WITH the deferral). A SAME-zone content change
-        //    (man0g0 SEQ_005: old == new) is excluded by `old != new` and keeps
-        //    the immediate flush. (Garlemald-Server #46.)
-        let same_region = {
-            let old_region = match self.world.zone(old_zone_id).await {
-                Some(z) => z.read().await.core.region_id,
-                None => 0,
-            };
-            let new_region = match self.world.zone(parent_zone_id).await {
-                Some(z) => z.read().await.core.region_id,
-                None => u16::MAX,
-            };
-            old_region == new_region
-        };
-        let defer_same_region = same_region && old_zone_id != parent_zone_id;
-        if defer_same_region {
-            const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
-            let fire_at_unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-                + RETAIL_ZONE_CHANGE_GAP_MS;
+            // Keep `content_warp_acked` FALSE through the warp: the bundle must
+            // be the PLAYER's reload ONLY (matching pmeteor's reference burst).
+            // Bundling the content NPC spawns into the warp (interleaved after
+            // the player's 0x00CE order-machine arm, mid-reload) crashes the
+            // client. The roster is revealed AFTER the client echoes its
+            // post-warp zone-in — see the RX 0x0007 handler, which flips
+            // `content_warp_acked` + `warp_complete` and fans the roster out.
             if let Some(mut snap) = self.world.session(session_id).await {
-                snap.pending_zone_in = Some(crate::data::PendingZoneIn {
-                    fire_at_unix_ms,
-                    spawn_type: spawn_type as u16,
-                    commit_keep_list: true,
-                    notify_private_area: false,
-                });
+                snap.content_warp_acked = false;
                 self.world.upsert_session(snap).await;
             }
-            tracing::info!(
-                player = player_id,
-                zone = parent_zone_id,
-                old_zone = old_zone_id,
-                "DoZoneChangeContent: zone-in bundle deferred (retail same-region pacing)",
-            );
+
+            // Same-region cross-zone changes need the ~6 s deferral (the
+            // 230 -> 133 Drowning Wench pacing); a same-zone change (old == new)
+            // takes the immediate flush. Either way commit_keep_list = true so
+            // the old zone's actors are cleaned via the trailing Mass-Delete
+            // keep-list trio.
+            let same_region = {
+                let old_region = match self.world.zone(old_zone_id).await {
+                    Some(z) => z.read().await.core.region_id,
+                    None => 0,
+                };
+                let new_region = match self.world.zone(parent_zone_id).await {
+                    Some(z) => z.read().await.core.region_id,
+                    None => u16::MAX,
+                };
+                old_region == new_region
+            };
+            let defer_same_region = same_region && old_zone_id != parent_zone_id;
+            if defer_same_region {
+                const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
+                let fire_at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+                    + RETAIL_ZONE_CHANGE_GAP_MS;
+                if let Some(mut snap) = self.world.session(session_id).await {
+                    snap.pending_zone_in = Some(crate::data::PendingZoneIn {
+                        fire_at_unix_ms,
+                        spawn_type: spawn_type as u16,
+                        commit_keep_list: true,
+                        notify_private_area: false,
+                    });
+                    self.world.upsert_session(snap).await;
+                }
+                tracing::info!(
+                    player = player_id,
+                    zone = parent_zone_id,
+                    old_zone = old_zone_id,
+                    "DoZoneChangeContent: zone-in bundle deferred (retail same-region pacing)",
+                );
+            } else {
+                self.world
+                    .send_zone_in_bundle(
+                        &self.registry,
+                        &self.db,
+                        self.lua.as_ref(),
+                        session_id,
+                        spawn_type as u16,
+                        /* commit_keep_list */ true,
+                    )
+                    .await;
+            }
         } else {
+            // ===== man0l0 deck tutorial / man0g0 SEQ_005 (spawnType 0x10) =====
+            // The original pre-#46 reload, restored verbatim. These warps need a
+            // REAL scene reload: DeleteAllActors + the 0x00E2(0x10) force-reload
+            // latch. The decompiled client (FUN_0058cca0, case 0x00E2) sets the
+            // MapLayoutElement force-reload latch [+0xbc]=1 for any subcode
+            // except 0x15/0x16; the SetMap handler then schedules the reload.
+            // WITHOUT the latch a same-region SetMap takes the no-op arm and
+            // "Now Loading" hangs forever — exactly the man0l0 regression.
+            // Both subpackets MUST be target_id-tagged or the world-server
+            // proxy drops them. (Garlemald-Server #28.)
+            {
+                let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+                wipe.set_target_id(session_id);
+                client.send_bytes(wipe.to_bytes()).await;
+                let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+                e2.set_target_id(session_id);
+                client.send_bytes(e2.to_bytes()).await;
+            }
+
+            // Immediate bundle, commit_keep_list = false: the bare wipe above is
+            // load-bearing for the same-zone content transition, so no trailing
+            // keep-list commit is added on top (the pmeteor-verified shape). The
+            // content NPCs ride this bundle.
             self.world
                 .send_zone_in_bundle(
                     &self.registry,
@@ -3420,9 +3432,21 @@ impl PacketProcessor {
                     self.lua.as_ref(),
                     session_id,
                     spawn_type as u16,
-                    /* commit_keep_list */ true,
+                    /* commit_keep_list */ false,
                 )
                 .await;
+
+            // The bundle has now AddActor'd + state-synced the content NPCs on
+            // the client; lift the pre-warp suppression of roster broadcasts
+            // (`ActiveContentScript::warp_complete`) and unpark the onUpdate
+            // driver (`content_warp_acked`) — no RX-0x0007 reveal is needed.
+            if let Some(mut snap) = self.world.session(session_id).await {
+                if let Some(active) = snap.active_content_script.as_mut() {
+                    active.warp_complete = true;
+                }
+                snap.content_warp_acked = true;
+                self.world.upsert_session(snap).await;
+            }
         }
 
         // 5. B7 of the SEQ_005 unblock plan — fire the content
@@ -7211,11 +7235,15 @@ impl PacketProcessor {
                     if snap.content_warp_acked {
                         return None;
                     }
-                    snap.active_content_script
-                        .as_ref()
-                        .map(|a| (a.director_actor_id, a.parent_zone_id))
+                    snap.active_content_script.as_ref().map(|a| {
+                        (
+                            a.director_actor_id,
+                            a.parent_zone_id,
+                            snap.destination_spawn_type,
+                        )
+                    })
                 });
-                if let Some((director_actor_id, _parent_zone_id)) = reveal {
+                if let Some((director_actor_id, _parent_zone_id, dest_spawn_type)) = reveal {
                     let roster = {
                         let mut roster: Vec<u32> = Vec::new();
                         if let Some(mut snap) = self.world.session(source).await {
@@ -7232,34 +7260,42 @@ impl PacketProcessor {
                         }
                         roster
                     };
-                    // Reveal Sisipu + the ankle biters now that the client is
-                    // in the instance, via the proven push_npc_spawn path
-                    // (direct send to the player). Skip the player's own actor
-                    // and the non-renderable director entry.
-                    let npc_ids: Vec<u32> = roster
-                        .into_iter()
-                        .filter(|&id| id != source && id != director_actor_id)
-                        .collect();
-                    self.world
-                        .reveal_content_npcs(&self.registry, self.lua.as_ref(), source, &npc_ids)
-                        .await;
-                    // Party-add the ally (Sisipu) POST-reveal so she gets a
-                    // targetable party nameplate + HP bar in the HUD (retail
-                    // shows her there). Done after the reveal so the party
-                    // group trio references an actor the client already has
-                    // spawned (the pre-warp party-add was dropped because the
-                    // client had no Sisipu yet). (Garlemald-Server #46.)
-                    for &npc_id in &npc_ids {
-                        if let Some(h) = self.registry.get(npc_id).await
-                            && matches!(h.kind, crate::runtime::actor_registry::ActorKindTag::Ally)
-                        {
-                            self.apply_party_add_member(source, npc_id).await;
-                        }
+                    // The deferred-reveal is SPECIFIC to the man0l1 same-map
+                    // escort (spawnType 0x16): its content NPCs were held out of
+                    // the warp bundle and are pushed here, on the post-warp
+                    // zone-in echo, via the proven push_npc_spawn path (direct
+                    // send to the player). Every OTHER content warp (man0l0
+                    // deck tutorial, man0g0 SEQ_005 — spawnType 0x10) already
+                    // shipped its NPCs IN the bundle, so it must NOT re-reveal
+                    // (that would double-spawn). We still flip
+                    // `content_warp_acked`/`warp_complete` above for ALL content
+                    // warps so the `onUpdate` driver unparks regardless.
+                    // (Garlemald #46.)
+                    if dest_spawn_type == 0x16 {
+                        // Skip the player's own actor and the non-renderable
+                        // director entry.
+                        let npc_ids: Vec<u32> = roster
+                            .into_iter()
+                            .filter(|&id| id != source && id != director_actor_id)
+                            .collect();
+                        self.world
+                            .reveal_content_npcs(
+                                &self.registry,
+                                self.lua.as_ref(),
+                                source,
+                                &npc_ids,
+                            )
+                            .await;
+                        tracing::info!(
+                            session = source,
+                            "content warp acked — roster revealed, onUpdate driver unparked",
+                        );
+                    } else {
+                        tracing::info!(
+                            session = source,
+                            "content warp acked — onUpdate driver unparked (NPCs were bundled)",
+                        );
                     }
-                    tracing::info!(
-                        session = source,
-                        "content warp acked — roster revealed, ally party-added, driver unparked",
-                    );
                 }
             }
             OP_RX_LOCK_TARGET => {
