@@ -13213,6 +13213,73 @@ async fn s2_5_content_onupdate_engages_roster_and_reengages_on_death() {
     );
 }
 
+/// PoC: the SEQ_005 Gridania combat-tutorial leg (Man0g0, DoM branch)
+/// driven headlessly with a force-kill. Proves the full
+/// chain end-to-end inside map-server:
+///
+///   1. `SimpleContent30010.lua::onCreate` queues the 5 SpawnBattleNpcById
+///      intents (wolves 3/4/5, allies Yda 6 / Papalymo 7).
+///   2. `QuestDirectorMan0g001.lua::onEventStarted` is driven on the DoM
+///      branch (current_class = THM) until it PARKS on
+///      `waitForSignal("battleComplete")`.
+///   3. The 3 wolves are force-killed through the REAL death path
+///      (`dispatch_battle_event(BattleEvent::Die)`); the third death fires
+///      `battleComplete` organically (check_content_battle_complete) which
+///      resumes the parked director.
+///   4. The resumed win sequence is driven to completion and asserted:
+///      quest Man0g0 advanced to sequence 10, the content script torn
+///      down (active_content_script == None), and the player zone-changed
+///      to Gridania (155).
+///
+/// This drives the reusable `crate::testkit::OpenerCombat` facade rather
+/// than re-implementing the recipe inline, so the facade the out-of-crate
+/// `content-test` runner depends on is proven in-crate. Gated behind the
+/// `testkit` feature (which is what exposes the facade module).
+#[cfg(feature = "testkit")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn man0g0_seq005_force_kill_fires_battlecomplete_and_advances() {
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+
+    let mut c = crate::testkit::OpenerCombat::start(&script_root, "Man0g0")
+        .await
+        .unwrap();
+
+    // onCreate queued the 5 tutorial bnpcs (3/4/5 wolves, 6/7 allies).
+    assert!(
+        [3u32, 4, 5, 6, 7]
+            .iter()
+            .all(|id| c.spawn_intent().contains(id)),
+        "onCreate must queue all 5 tutorial SpawnBattleNpcById intents; got {:?}",
+        c.spawn_intent(),
+    );
+
+    // Drive the director to its battleComplete park, force-kill the wolves
+    // (the third death fires battleComplete organically), then drive the win
+    // tail to completion.
+    c.start_director().await.unwrap();
+    c.kill_monsters().await.unwrap();
+
+    // The win drove the quest forward, tore the content script down, and
+    // warped the player to Gridania (155).
+    assert_eq!(
+        c.quest_sequence().await,
+        10,
+        "StartSequence(10) must have advanced the Man0g0 quest",
+    );
+    assert!(
+        !c.content_active().await,
+        "ContentFinished must clear the active content script",
+    );
+    assert_eq!(
+        c.player_zone().await,
+        155,
+        "DoZoneChange must move the player to Gridania (155)",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #28 Phase 3 — hotbar press dispatch + execution + costs/recast/TP
 // ---------------------------------------------------------------------------
