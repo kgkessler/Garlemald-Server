@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "common",
+    "content-test",
     "lobby-server",
     "map-server",
     "web-server",

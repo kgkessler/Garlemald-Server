@@ -341,6 +341,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "content-test"
+version = "0.1.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "common",
+ "map-server",
+ "mlua",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
