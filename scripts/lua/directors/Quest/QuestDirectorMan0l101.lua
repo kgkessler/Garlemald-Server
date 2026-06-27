@@ -1,5 +1,4 @@
 require ("global")
-require ("tutorial")
 require ("quests/man/man0l1")
 
 -- Man0l1 SEQ_050 Zephyr Gate escort director (Garlemald-Server #46) —
@@ -11,8 +10,8 @@ require ("quests/man/man0l1")
 --
 --   client noticeEvent kick (startMan0l1Content's KickEvent) →
 --   onEventStarted closes the kick and parks on "escortComplete" →
---   the content script's onUpdate fires the signal when Sisipu reaches
---   the final waypoint with the road cleared → arrival cutscene
+--   the content script's onUpdate fires the signal once the road is
+--   cleared (every ankle biter defeated) → arrival cutscene
 --   (processEvent605, the wiki-documented "arrive at Oschon's Torch,
 --   enters an echo" beat) → SEQ_055 → ContentFinished teardown → warp
 --   into the lighthouse echo private area (the same destination the

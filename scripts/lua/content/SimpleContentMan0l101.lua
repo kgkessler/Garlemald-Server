@@ -14,28 +14,18 @@ require ("ally")
 -- machinery (SpawnBattleNpcById onCreate spawning, the 500 ms onUpdate
 -- driver, allyGlobal engagement, sendSignal → director coroutine).
 --
--- Escort shape (2010-09 recording FEI03OpK99o + era guides): Sisipu
--- walks the southbound road out of Zephyr Gate ("Oschon's Torch is due
--- south"), ankle-biter packs ambush along the way, and on arrival the
--- processEvent605 echo plays at the lighthouse. Coordinates are
--- DERIVED (no 1.x capture renders XYZ): a compressed road segment at
--- the gate's seeded height, with the remaining distance masked by the
--- arrival warp — see 056_man0l1_zephyr_escort.sql. The walk pauses
--- whenever live mobs are near Sisipu or she's engaged, and the
--- completion signal requires both arrival AND a cleared road.
+-- Runtime shape: the duty runs as a content instance in zone 129
+-- ('sea0Field02', Camp Skull Valley — see seed 066), warped into from the
+-- Zephyr Gate (man0l1.lua startMan0l1Content). onCreate spawns Sisipu +
+-- eight ankle biters clustered on the camp floor; onUpdate has Sisipu
+-- FOLLOW the player (who walks the real navmesh) and pull/hold on nearby
+-- live mobs. Completion is the kill count — once every ankle biter is dead
+-- the road is "clear" and we sendSignal("escortComplete"); the director
+-- then plays the processEvent605 arrival echo and warps to the lighthouse.
+-- (The old hardcoded southbound-waypoint walk was removed: it had no
+-- navmesh and walked Sisipu off the cliff — 2026-06-17.)
 
--- Sisipu's waypoints (escort beat order). The final entry is the
--- arrival point; ambush clusters from the 056 seed sit just past
--- waypoints 1-3.
-ESCORT_WAYPOINTS = {
-	{ x = -52.0, z = 210.0 },
-	{ x = -36.0, z = 255.0 },
-	{ x = -20.0, z = 300.0 },
-	{ x = -8.0,  z = 340.0 },
-};
-ESCORT_Y = 33.15;            -- gate road height (seed-anchored)
 WALK_STEP = 1.6;             -- units per 500 ms tick (escort walking pace)
-ARRIVE_EPSILON = 3.0;        -- "reached the waypoint" distance
 HOLD_RADIUS = 28.0;          -- live mob within this of Sisipu → hold the walk
 ENGAGE_RADIUS = 18.0;        -- mob pulls onto the escort inside this
 
@@ -45,7 +35,7 @@ ENGAGE_RADIUS = 18.0;        -- mob pulls onto the escort inside this
 escortState = {};
 
 function onCreate(starterPlayer, contentArea, director)
-	escortState[starterPlayer.actorId] = { wp = 1, signaled = false };
+	escortState[starterPlayer.actorId] = { signaled = false };
 
 	sisipu = GetWorldManager().SpawnBattleNpcById(16, contentArea);
 	local mobs = {};
@@ -130,14 +120,10 @@ function onUpdate(tick, area)
 		allyGlobal.EngageTarget(escort, mobs[1])
 	end
 
-	-- Completion = the road is cleared (every ankle biter defeated). The old
-	-- position-based "arrive at the final waypoint" gate was removed: the
-	-- hardcoded southbound ESCORT_WAYPOINTS have no navmesh and walked Sisipu
-	-- straight off the cliff / out of bounds (live 2026-06-17). Robust
-	-- completion is the kill count; Sisipu FOLLOWS the player (who walks the
-	-- real road) instead of leading a guessed path. (Garlemald-Server #46 —
-	-- pathing follow-up: a real navmesh route to Oschon's Torch so she can
-	-- lead like retail.)
+	-- Completion = the road is cleared (every ankle biter defeated). Sisipu
+	-- FOLLOWS the player (who walks the real navmesh) rather than leading a
+	-- hardcoded route. (Garlemald-Server #46 — pathing follow-up: a real
+	-- navmesh route to Oschon's Torch so she can lead like retail.)
 	if #mobs == 0 then
 		state.signaled = true
 		sendSignal("escortComplete")
