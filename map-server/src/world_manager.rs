@@ -657,7 +657,26 @@ pub(crate) fn push_npc_spawn(
         Some(ActorKindTag::BattleNpc) | Some(ActorKindTag::Ally)
     );
     let property_flags = if is_monster {
-        character.chara.property_flags & !(1u32 << 2)
+        // A real-pipeline BattleNpc/Ally (spawned via SpawnBattleNpcById) MUST
+        // carry the populace nameplate/render bits 0x13 (charaWork.property[0]/
+        // [1]/[4]) the client's `DepictionJudge:judgeNameplate` reads — bit 1
+        // is the targetable-nameplate flag. The gamedata_actor_class table has
+        // DUPLICATE classPath rows at propertyFlags 0 and 0x17, and content
+        // pools sometimes point at the pf=0 variant (man0l1's escort: Chigoe
+        // 2205603 + FighterAlly 2290007 are pf=0), which shipped these actors
+        // with NO property bits → un-targetable (target fell back to self),
+        // while man0g0's pf=0x17 wolves were fine. Forcing 0x13 here makes
+        // every script-spawned BattleNpc/Ally targetable regardless of which
+        // seed variant it resolved to. Bit 2 (PROPERTY_TARGETABLE/solid) STAYS
+        // masked — restoring it crashes the client's NpcBase work struct (see
+        // the note above). Ground-truthed via escort-vs-man0g0 packet diff
+        // 2026-06-17. (Garlemald-Server #46.)
+        let pf = if is_real_battle_npc {
+            character.chara.property_flags | 0x13
+        } else {
+            character.chara.property_flags
+        };
+        pf & !(1u32 << 2)
     } else {
         character.chara.property_flags
     };

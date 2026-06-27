@@ -1,4 +1,5 @@
 require ("global")
+require ("tutorial")
 require ("quests/man/man0l1")
 
 -- Man0l1 SEQ_050 Zephyr Gate escort director (Garlemald-Server #46) —
@@ -24,12 +25,14 @@ end
 function onEventStarted(player, actor, triggerName)
 	man0l1Quest = player:GetQuest("Man0l1");
 
-	-- The entry cutscene (processEvent604) now plays pre-warp in
-	-- startMan0l1Content (it's a startFadeInCutSceneAfterWarp cut gated on the
-	-- map-load flag, which the instant spawnType-0x16 warp leaves clear). This
-	-- director beat just closes the notice-kick context and parks on the escort
-	-- completion. (Garlemald-Server #46.)
+	-- This noticeEvent kick fires AFTER the duty warp into zone 129. The cutscene's
+	-- after-warp veil was already neutralised PRE-warp at the gate (man0l1.lua
+	-- startMan0l1Content: processEvent604 → processEvent604_3 → DoZoneChangeContent),
+	-- so the warp itself is a clean man0g0-style warp and the client lands
+	-- interactive. Just close the kick and park on completion. NO tutorial-mode
+	-- handlers (orderTutorialMode would silently re-gate the menu). (Garlemald-Server #46.)
 	player:EndEvent();
+
 	waitForSignal("escortComplete");
 
 	-- Render-settle beat (Man0l001 pattern): without it the arrival

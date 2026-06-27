@@ -130,37 +130,36 @@ function onUpdate(tick, area)
 		allyGlobal.EngageTarget(escort, mobs[1])
 	end
 
-	-- Hold the walk while the road ahead is contested.
+	-- Completion = the road is cleared (every ankle biter defeated). The old
+	-- position-based "arrive at the final waypoint" gate was removed: the
+	-- hardcoded southbound ESCORT_WAYPOINTS have no navmesh and walked Sisipu
+	-- straight off the cliff / out of bounds (live 2026-06-17). Robust
+	-- completion is the kill count; Sisipu FOLLOWS the player (who walks the
+	-- real road) instead of leading a guessed path. (Garlemald-Server #46 —
+	-- pathing follow-up: a real navmesh route to Oschon's Torch so she can
+	-- lead like retail.)
+	if #mobs == 0 then
+		state.signaled = true
+		sendSignal("escortComplete")
+		return
+	end
+
+	-- Hold while contested; otherwise trail the player, staying ~3u behind so
+	-- she never outruns navigable ground (the player navigates valid terrain).
 	if nearLive > 0 or escort:IsEngaged() then
 		return
 	end
-
-	local wp = ESCORT_WAYPOINTS[state.wp]
-	if not wp then return end
-	local remaining = dist2d(escort.positionX, escort.positionZ, wp.x, wp.z)
-	if remaining <= ARRIVE_EPSILON then
-		if state.wp >= #ESCORT_WAYPOINTS then
-			if #mobs == 0 then
-				-- Arrived with a clear road — resume the director beat
-				-- (QuestDirectorMan0l101 parks on this right after the
-				-- opening cutscene).
-				state.signaled = true
-				sendSignal("escortComplete")
-			end
-			return
-		end
-		state.wp = state.wp + 1
-		return
+	local FOLLOW_GAP = 3.0
+	local d = dist2d(escort.positionX, escort.positionZ, owner.positionX, owner.positionZ)
+	if d > FOLLOW_GAP then
+		local step = math.min(WALK_STEP, d - FOLLOW_GAP)
+		local dx = (owner.positionX - escort.positionX) / d
+		local dz = (owner.positionZ - escort.positionZ) / d
+		escort:MoveTo(
+			escort.positionX + dx * step,
+			owner.positionY,
+			escort.positionZ + dz * step,
+			math.atan(dx, dz),
+			1)   -- moveState 1 = walk
 	end
-
-	-- One walking step toward the current waypoint, facing travel.
-	local step = math.min(WALK_STEP, remaining)
-	local dx = (wp.x - escort.positionX) / remaining
-	local dz = (wp.z - escort.positionZ) / remaining
-	escort:MoveTo(
-		escort.positionX + dx * step,
-		ESCORT_Y,
-		escort.positionZ + dz * step,
-		math.atan(dx, dz),
-		1)   -- moveState 1 = walk
 end

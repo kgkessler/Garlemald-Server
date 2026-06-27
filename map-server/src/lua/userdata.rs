@@ -3414,14 +3414,31 @@ impl UserData for LuaZone {
             "CreateContentArea",
             |lua,
              this,
-             (player_arg, area_class_path, area_name, content_script, director_name): (
-                mlua::Value,
-                String,
-                String,
-                String,
-                String,
-            )| {
-                let parent_zone_id = this.snapshot.zone_id;
+             (
+                player_arg,
+                area_class_path,
+                area_name,
+                content_script,
+                director_name,
+                dest_zone_id,
+            ): (mlua::Value, String, String, String, String, Option<u32>)| {
+                // Optional 6th arg: the explicit INSTANCE zone the content runs
+                // in. man0l1's Sisipu escort runs in a genuinely DIFFERENT-map
+                // zone (129 'sea0Field02') than the player's current zone
+                // (128 'sea0Field01'): processEvent604 arms an after-warp
+                // Now-Loading veil that the client tears down ONLY when a real
+                // off-disk map load completes, and a same-map content warp never
+                // schedules one (128->128/141 all hang — captures/issue28-rca/
+                // 04-decomp-unlock.md). Routing the WHOLE content instance
+                // (NPC spawns, director, active_content_script, the
+                // DoZoneChangeContent migration + SetMap) through zone 129 makes
+                // the warp a real different-map load -> veil + command latch
+                // clear. When omitted (man0g0 SEQ_005 etc.), the instance stays
+                // in the player's current zone (same as before). (#46.)
+                let parent_zone_id = match dest_zone_id {
+                    Some(z) if z != 0 => z,
+                    _ => this.snapshot.zone_id,
+                };
                 let director_actor_id = crate::director::director::encode_director_actor_id(
                     parent_zone_id,
                     /* director_local_id */ 1,
