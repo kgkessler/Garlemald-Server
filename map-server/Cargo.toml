@@ -9,6 +9,12 @@ license.workspace = true
 name = "map-server"
 path = "src/main.rs"
 
+[features]
+# Opt-in test-harness facade (`crate::testkit`). Lets the out-of-crate
+# `content-test` runner drive opener combat walkthroughs headlessly. NOT
+# part of the normal server build.
+testkit = []
+
 [dependencies]
 common.workspace = true
 tokio.workspace = true
