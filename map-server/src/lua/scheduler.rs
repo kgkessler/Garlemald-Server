@@ -170,6 +170,15 @@ impl CoroutineScheduler {
         self.sleeping_on_time.len()
     }
 
+    /// The earliest pending time-park deadline (millis since UNIX epoch,
+    /// the same clock `drain_due_time` compares against), or `None` when
+    /// nothing is parked on the clock. Used by the headless test harness
+    /// (`crate::testkit`) to sleep just past the next `wait(n)` instead of
+    /// guessing a fixed duration.
+    pub(crate) fn next_time_deadline_ms(&self) -> Option<u64> {
+        self.sleeping_on_time.iter().map(|(t, _)| *t).min()
+    }
+
     pub fn pending_signal_count(&self) -> usize {
         self.sleeping_on_signal.values().map(|v| v.len()).sum()
     }
