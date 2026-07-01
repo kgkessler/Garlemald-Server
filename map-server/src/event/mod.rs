@@ -32,7 +32,7 @@
 //! The `Quest` runtime itself lives in `crate::actor::quest` — see the
 //! redesign docs there for the new `QuestData`/`QuestState` split.
 
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 pub mod dispatcher;
 pub mod lua_bridge;

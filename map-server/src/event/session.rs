@@ -26,8 +26,6 @@
 //! mutation emits `EventEvent`s into a shared `EventOutbox`; dispatch
 //! happens in the ticker.
 
-#![allow(dead_code)]
-
 use common::luaparam::LuaParam;
 
 use super::outbox::{EventEvent, EventOutbox};

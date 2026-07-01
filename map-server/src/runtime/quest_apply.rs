@@ -608,6 +608,16 @@ pub async fn apply_runtime_lua_command(
             apply_change_music(player_id, music_id, registry, world).await;
             true
         }
+        LC::ChangeSpeed {
+            player_id,
+            stop,
+            walk,
+            run,
+            active,
+        } => {
+            apply_change_speed(player_id, stop, walk, run, active, registry, world).await;
+            true
+        }
         LC::SendDataPacket { player_id, params } => {
             apply_send_data_packet(player_id, &params, registry, world).await;
             true
@@ -1197,6 +1207,50 @@ async fn apply_change_music(
         player = format!("0x{player_id:08X}"),
         music_id,
         "ChangeMusic applied",
+    );
+}
+
+/// `player:ChangeSpeed(stop, walk, run, active)` — port of C#
+/// `Actor::ChangeSpeed`. Sends `0x00D0 SetActorSpeed` carrying the four
+/// movement bands (stop/walk/run/active) to the player's own client.
+/// Drives the `!speed` GM command, `ChocoboRideCommand`, and
+/// `PopulaceChocoboLender`; before this the `ChangeSpeed` Lua binding was
+/// a no-op stub, so those scripts printed their confirmation but never
+/// changed the client's movement speed.
+async fn apply_change_speed(
+    player_id: u32,
+    stop: f32,
+    walk: f32,
+    run: f32,
+    active: f32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            "ChangeSpeed skipped — player not in registry",
+        );
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let mut sub =
+        crate::packets::send::actor::build_set_actor_speed(player_id, stop, walk, run, active);
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        player = format!("0x{player_id:08X}"),
+        stop,
+        walk,
+        run,
+        active,
+        "ChangeSpeed applied",
     );
 }
 

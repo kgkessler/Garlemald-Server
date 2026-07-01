@@ -34,12 +34,31 @@ use crate::processor::{LobbySession, PacketProcessor, Reply};
 
 const BUFFER_SIZE: usize = 0xFFFF;
 
-pub async fn run(config: Config, processor: PacketProcessor) -> Result<()> {
+pub async fn run(config: Config, processor: PacketProcessor, smoke: bool) -> Result<()> {
     let addr = format!("{}:{}", config.bind_ip(), config.port());
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("bind {addr}"))?;
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            if smoke {
+                // In smoke mode a bind failure must be reported as SMOKE_FAIL
+                // (grepped by CI) rather than an anyhow `?` bubble that never
+                // prints a marker line.
+                std::process::exit(common::smoke::smoke_fail(
+                    "Lobby",
+                    "startup",
+                    &e.to_string(),
+                    common::smoke::EXIT_STARTUP,
+                ));
+            }
+            return Err(e).with_context(|| format!("bind {addr}"));
+        }
+    };
     tracing::info!(%addr, "lobby server listening");
+
+    if smoke {
+        let _ = common::smoke::smoke_ok("Lobby", &addr);
+        return Ok(());
+    }
 
     let processor = Arc::new(processor);
 

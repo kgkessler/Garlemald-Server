@@ -21,8 +21,6 @@
 //! `harvest_node_id` + `harvest_type` fields the minigame needs to
 //! resolve a physical node back to its template pool.
 
-#![allow(dead_code)]
-
 /// `!mine` — ore outcrops. Retail action id 20001.
 pub const HARVEST_TYPE_MINE: u32 = 22002;
 /// `!log` — tree stumps, bushes. Retail action id 20002.

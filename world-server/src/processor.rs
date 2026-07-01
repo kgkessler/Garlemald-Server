@@ -40,6 +40,21 @@ pub struct PacketProcessor {
     pub sessions: Arc<SessionRegistry>,
 }
 
+/// A session-begin confirm from the map server carries a non-zero `error_code`
+/// only on failure; `0` means the map side accepted the session.
+fn session_begin_confirm_is_error(error_code: u16) -> bool {
+    error_code != 0
+}
+
+/// A map-side session-end confirm is stale when it names a `conn_seq` that no
+/// longer matches the connection currently owning that session id. That
+/// happens when a duplicate login superseded the old connection: the old
+/// connection's end confirm must not tear down the newer one. Only treat it as
+/// stale when both sides are known and differ.
+fn is_stale_end_confirm(current_conn_seq: Option<u64>, requesting_conn_seq: Option<u64>) -> bool {
+    matches!((current_conn_seq, requesting_conn_seq), (Some(c), Some(r)) if c != r)
+}
+
 impl PacketProcessor {
     pub async fn process_packet(
         &self,
@@ -75,12 +90,17 @@ impl PacketProcessor {
                 // Zoning-related; just log (the C# DebugPrintPacket path)
                 0x08 => {
                     tracing::debug!(session = client.id, "zoning packet stub");
+                    // Surface the raw body for the decomp audit: the
+                    // world.session-heartbeat-candidate classification rule
+                    // keys on this type, so this is its only observation point.
+                    common::packet_diagnostics::log_unknown_subpacket("world", "world", &sub);
                 }
                 // Game messages (route to owning zone server)
                 SUBPACKET_TYPE_GAMEMESSAGE => self.handle_game_message(&sub).await?,
-                t if t >= 0x1000 => self.handle_world_packet(client, &sub).await?,
+                t if t >= 0x1000 => self.handle_world_packet(&sub).await?,
                 _ => {
                     tracing::warn!(r#type = format!("0x{ty:X}"), "unhandled subpacket");
+                    common::packet_diagnostics::log_unknown_subpacket("world", "world", &sub);
                 }
             }
         }
@@ -97,7 +117,12 @@ impl PacketProcessor {
         let channel = match packet.header.connection_type {
             common::PACKET_TYPE_ZONE => SessionChannel::Zone,
             common::PACKET_TYPE_CHAT => SessionChannel::Chat,
-            _ => SessionChannel::Zone,
+            _ => {
+                // Unexpected connection_type: surface the raw base packet for
+                // the decomp audit before defaulting to the Zone channel.
+                common::packet_diagnostics::log_unknown_base_packet("world", "world", packet);
+                SessionChannel::Zone
+            }
         };
         tracing::info!(
             session_id = hello.session_id,
@@ -122,7 +147,14 @@ impl PacketProcessor {
                 handle.send_bytes(begin.to_bytes()).await;
             }
         }
+        // Evict any prior session on this (channel, id) before installing the
+        // new one, so a duplicate login supersedes the stale connection
+        // cleanly (mirrors C# `HandleDuplicateLogin`).
+        if let Some(old) = self.sessions.get(channel, hello.session_id).await {
+            self.end_existing_session(channel, old, client).await;
+        }
         self.sessions.add(channel, hello.session_id, session).await;
+        client.note_owned(channel, hello.session_id).await;
 
         // Complete handshake (0x07 + 0x02)
         let ack7 = tx::build_0x7_packet(0x0E01_6EE5);
@@ -130,6 +162,76 @@ impl PacketProcessor {
         client.send_bytes(ack7.to_bytes()).await;
         client.send_bytes(ack2.to_bytes()).await;
         Ok(())
+    }
+
+    /// Tear down a session that is being replaced by a duplicate login. For a
+    /// zone session we ask the owning map server to end it (so the map side
+    /// releases the actor) before dropping the registry entry, then wake the
+    /// superseded connection's read-loop so it exits.
+    async fn end_existing_session(
+        &self,
+        channel: SessionChannel,
+        old: Arc<Session>,
+        client: &ClientHandle,
+    ) {
+        // A duplicate hello arriving on the SAME connection (identical
+        // `conn_seq`) is a resend, not a takeover: it must not tear its own
+        // session down. Fall through so the caller re-adds the fresh state.
+        if old.client.conn_seq == client.conn_seq {
+            tracing::debug!(
+                session = old.session_id,
+                "duplicate hello on same connection; not evicting"
+            );
+            return;
+        }
+        tracing::info!(
+            session = old.session_id,
+            "ending existing session (duplicate login)"
+        );
+        if channel == SessionChannel::Zone {
+            let routing1 = old.state.lock().await.routing1.clone();
+            if let Some(handle) = routing1 {
+                self.sessions
+                    .mark_pending_end(old.session_id, old.client.conn_seq)
+                    .await;
+                handle
+                    .send_bytes(tx::build_session_end(old.session_id).to_bytes())
+                    .await;
+            }
+        }
+        // Compare-and-remove: only drop the entry if it is still the one we
+        // evicted (guards the get()-then-remove() race against a newer
+        // connection that may have taken over the id in between).
+        self.sessions
+            .remove_if(channel, old.session_id, old.client.conn_seq)
+            .await;
+        old.client.shutdown.notify_one();
+    }
+
+    /// Tear down every session a dropped connection owned. Skips any session id
+    /// that has since been taken over by a newer connection (different
+    /// `conn_seq`), so a lingering disconnect can't wipe a live reconnect.
+    pub async fn handle_disconnect(&self, client: &ClientHandle) {
+        let owned = client.owned.lock().await.clone();
+        for (channel, id) in owned {
+            let Some(session) = self.sessions.get(channel, id).await else {
+                continue;
+            };
+            if session.client.conn_seq != client.conn_seq {
+                continue;
+            }
+            if channel == SessionChannel::Zone {
+                let r1 = session.state.lock().await.routing1.clone();
+                if let Some(handle) = r1 {
+                    self.sessions.mark_pending_end(id, client.conn_seq).await;
+                    handle
+                        .send_bytes(tx::build_session_end(id).to_bytes())
+                        .await;
+                }
+            }
+            self.sessions.remove_if(channel, id, client.conn_seq).await;
+            tracing::info!(session = id, "session torn down on disconnect");
+        }
     }
 
     async fn handle_ping(&self, client: &ClientHandle) -> Result<()> {
@@ -214,6 +316,12 @@ impl PacketProcessor {
             tracing::debug!(session = target, "group created notification");
         }
 
+        // The world server structurally *forwards* game messages to the owning
+        // zone rather than dispatching them, so it must not run the
+        // unknown-game-message diagnostic here: every proxied opcode would be
+        // mislabelled as unhandled. The genuine catch-alls (the `_ =>` subpacket
+        // arm and the 0x08 arm) remain the world-side observation points.
+
         // Default: forward the gamemessage subpacket to the session's owning
         // zone server.
         let (r1, r2) = {
@@ -229,16 +337,22 @@ impl PacketProcessor {
         Ok(())
     }
 
-    async fn handle_world_packet(&self, _client: &ClientHandle, sub: &SubPacket) -> Result<()> {
+    pub(crate) async fn handle_world_packet(&self, sub: &SubPacket) -> Result<()> {
         let target = sub.header.target_id;
         let session = self.sessions.get(SessionChannel::Zone, target).await;
 
         match sub.header.r#type {
             0x1000 => {
-                if let Ok(p) = rx::SessionBeginConfirmPacket::parse(&sub.data)
-                    && (p.error_code == 0)
-                {
-                    tracing::error!(session = p.session_id, "error beginning session");
+                if let Ok(p) = rx::SessionBeginConfirmPacket::parse(&sub.data) {
+                    if session_begin_confirm_is_error(p.error_code) {
+                        tracing::error!(
+                            session = p.session_id,
+                            error_code = p.error_code,
+                            "error beginning session"
+                        );
+                    } else {
+                        tracing::info!(session = p.session_id, "session begin confirmed");
+                    }
                 }
             }
             0x1001 => {
@@ -254,12 +368,29 @@ impl PacketProcessor {
                             session.state.lock().await.routing1 = Some(handle);
                         }
                     } else {
-                        self.sessions
-                            .remove(SessionChannel::Zone, p.session_id)
-                            .await;
-                        self.sessions
-                            .remove(SessionChannel::Chat, p.session_id)
-                            .await;
+                        // Guard against a stale teardown: if a duplicate login
+                        // has since replaced the zone connection, the end
+                        // confirm we requested for the OLD connection must not
+                        // wipe the live one.
+                        let recorded = self.sessions.take_pending_end(p.session_id).await;
+                        let current = self
+                            .sessions
+                            .get(SessionChannel::Zone, p.session_id)
+                            .await
+                            .map(|s| s.client.conn_seq);
+                        if is_stale_end_confirm(current, recorded) {
+                            tracing::info!(
+                                session = p.session_id,
+                                "ignoring stale map session end confirm; newer zone connection is active"
+                            );
+                        } else {
+                            self.sessions
+                                .remove(SessionChannel::Zone, p.session_id)
+                                .await;
+                            self.sessions
+                                .remove(SessionChannel::Chat, p.session_id)
+                                .await;
+                        }
                     }
                 }
             }
@@ -684,5 +815,38 @@ impl PacketProcessor {
             .get(crate::data::SessionChannel::Zone, chara_id)
             .await?;
         Some(session.state.lock().await.character_name.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn begin_confirm_zero_is_success() {
+        assert!(!session_begin_confirm_is_error(0));
+    }
+
+    #[test]
+    fn begin_confirm_nonzero_is_error() {
+        assert!(session_begin_confirm_is_error(1));
+        assert!(session_begin_confirm_is_error(0xFFFF));
+    }
+
+    #[test]
+    fn end_confirm_is_stale_when_conn_seqs_differ() {
+        assert!(is_stale_end_confirm(Some(2), Some(1)));
+    }
+
+    #[test]
+    fn end_confirm_not_stale_when_conn_seqs_match() {
+        assert!(!is_stale_end_confirm(Some(1), Some(1)));
+    }
+
+    #[test]
+    fn end_confirm_not_stale_when_either_side_unknown() {
+        assert!(!is_stale_end_confirm(None, Some(1)));
+        assert!(!is_stale_end_confirm(Some(1), None));
+        assert!(!is_stale_end_confirm(None, None));
     }
 }

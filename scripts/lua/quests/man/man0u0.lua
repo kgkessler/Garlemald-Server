@@ -111,8 +111,12 @@ function onStateChange(player, quest, sequence)
         -- Setup states incase we loaded in.
         local asciliaCanPush = not data:GetFlag(FLAG_SEQ000_MINITUT0);
         local asciliaFlag = data:GetFlag(FLAG_SEQ000_MINITUT1) and QFLAG_NONE or QFLAG_TALK;
-        local fretfulfarmhandFlag = data:GetFlag(FLAG_SEQ000_MINITUT2) and QFLAG_NONE or QFLAG_TALK;
-        local gildiggingmistressFlag = data:GetFlag(FLAG_SEQ000_MINITUT3) and QFLAG_NONE or QFLAG_TALK;
+        -- Sequential mini-tutorial chain: each marker only lights once its
+        -- predecessor step is done and its own step isn't. Fretful follows
+        -- the Ascilia talk (MINITUT1); Gil-digging follows the Fretful talk
+        -- (MINITUT2). Flag bits are unchanged so the exit gate stays 0xF.
+        local fretfulfarmhandFlag = (data:GetFlag(FLAG_SEQ000_MINITUT1) and not data:GetFlag(FLAG_SEQ000_MINITUT2)) and QFLAG_TALK or QFLAG_NONE;
+        local gildiggingmistressFlag = (data:GetFlag(FLAG_SEQ000_MINITUT2) and not data:GetFlag(FLAG_SEQ000_MINITUT3)) and QFLAG_TALK or QFLAG_NONE;
 
         local exitFlag = data:GetFlags() == 0xF and QFLAG_PUSH or QFLAG_NONE;
 
@@ -215,6 +219,25 @@ function onNotice(player, quest, target)
     quest:UpdateENPCs();
 end
 
+-- Fired by the server when the player opens THIS quest's journal entry
+-- (after the qtdata reply). Acts as the "talked to Ascilia again" handoff:
+-- once Ascilia's first talk is done (MINITUT0) but her follow-up talk isn't
+-- (MINITUT1), reading the journal advances the chain so the Fretful Farmhand
+-- marker lights up next. Flag bits are unchanged, so the exit gate stays 0xF.
+function onJournalRequest(player, quest)
+    local data = quest:GetData();
+
+    -- Only advance the Merchant-Strip mini-tutorial chain while on SEQ_000
+    -- (the same sequence guard every other hook in this file uses); a journal
+    -- open on a later sequence must not re-touch these flags.
+    if (quest:getSequence() == SEQ_000
+        and data:GetFlag(FLAG_SEQ000_MINITUT0)
+        and not data:GetFlag(FLAG_SEQ000_MINITUT1)) then
+        data:SetFlag(FLAG_SEQ000_MINITUT1);
+        quest:UpdateENPCs();
+    end
+end
+
 function seq000_onTalk(player, quest, npc, classId)
 	local data = quest:GetData();
 
@@ -298,9 +321,11 @@ function getJournalMapMarkerList(player, quest)
 
     if (sequence == SEQ_000) then
         if (data:GetFlag(FLAG_SEQ000_MINITUT0)) then
+            -- Mirror onStateChange's sequential gate: only the current step's
+            -- marker is offered (predecessor done AND own step not done).
             if (not data:GetFlag(FLAG_SEQ000_MINITUT1)) then table.insert(possibleMarkers, MRKR_ASCILIA); end
-            if (not data:GetFlag(FLAG_SEQ000_MINITUT2)) then table.insert(possibleMarkers, MRKR_FRETFUL_FARMHAND); end
-            if (not data:GetFlag(FLAG_SEQ000_MINITUT3)) then table.insert(possibleMarkers, MRKR_GIL_DIGGING_MISTRESS); end
+            if (data:GetFlag(FLAG_SEQ000_MINITUT1) and not data:GetFlag(FLAG_SEQ000_MINITUT2)) then table.insert(possibleMarkers, MRKR_FRETFUL_FARMHAND); end
+            if (data:GetFlag(FLAG_SEQ000_MINITUT2) and not data:GetFlag(FLAG_SEQ000_MINITUT3)) then table.insert(possibleMarkers, MRKR_GIL_DIGGING_MISTRESS); end
         end
 
     elseif (sequence == SEQ_010) then

@@ -144,6 +144,13 @@ pub struct LaunchArgs {
     /// Override the session lifetime in hours
     #[arg(long)]
     pub session_hours: Option<u32>,
+    /// Boot only far enough to validate config + DB, print a SMOKE_OK /
+    /// SMOKE_FAIL marker, then exit (CI/dev fail-fast).
+    #[arg(long)]
+    pub smoke: bool,
+    /// Suppress the interactive stdin console (no-op on servers without one).
+    #[arg(long = "no-console")]
+    pub no_console: bool,
     /// Path to the web TOML config
     #[arg(long, default_value = "./configs/web.toml")]
     pub config: String,

@@ -34,7 +34,7 @@
 //! typed `GroupEvent`s on a `GroupOutbox`; the game-loop dispatcher
 //! turns those into the right packet sequence per session.
 
-#![allow(dead_code, unused_imports, clippy::module_inception)]
+#![allow(unused_imports, clippy::module_inception)]
 
 pub mod content;
 pub mod dispatcher;

@@ -88,8 +88,25 @@ pub async fn run() -> Result<()> {
     tracing::info!("==================================");
 
     let args = LaunchArgs::parse();
+    let smoke = args.smoke;
+    // In smoke mode we never reach the accept loop, so also skip the stdin
+    // reader that would otherwise sit blocked on `--smoke` runs.
+    let no_console = args.no_console || smoke;
     tracing::debug!(config_path = %args.config, "loading config");
-    let mut config = Config::load(&args.config)?;
+    let mut config = match Config::load(&args.config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Map",
+                    "config",
+                    &e.to_string(),
+                    common::smoke::EXIT_CONFIG,
+                ));
+            }
+            return Err(e);
+        }
+    };
     config.apply_launch_args(args);
     tracing::info!(
         bind_ip = %config.bind_ip(),
@@ -102,16 +119,43 @@ pub async fn run() -> Result<()> {
     );
 
     tracing::info!(db_path = %config.db_path().display(), "opening sqlite database");
-    let db = Arc::new(Database::open(config.db_path()).await?);
+    let db = match Database::open(config.db_path()).await {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Map",
+                    "database",
+                    &e.to_string(),
+                    common::smoke::EXIT_DATABASE,
+                ));
+            }
+            return Err(e);
+        }
+    };
     match db.ping().await {
         Ok(()) => tracing::info!("DB connection ok"),
         Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Map",
+                    "database",
+                    &e.to_string(),
+                    common::smoke::EXIT_DATABASE,
+                ));
+            }
             tracing::error!(error = %e, "DB connection failed; aborting");
             return Err(e);
         }
     }
 
-    let world = Arc::new(WorldManager::new());
+    let world = Arc::new(WorldManager::new().with_world_settings(
+        crate::world_manager::WorldSettings {
+            dalamud_phase: config.world.dalamud_phase,
+            weather_id: config.world.weather_id,
+            weather_transition: config.world.weather_transition,
+        },
+    ));
     let registry = Arc::new(ActorRegistry::new());
     let lua = Arc::new(LuaEngine::new(config.script_root().to_path_buf()));
 
@@ -326,22 +370,29 @@ pub async fn run() -> Result<()> {
         }
     });
 
-    // Interactive console reader.
-    tokio::spawn({
-        let cmd = cmd.clone();
-        async move {
-            let stdin = BufReader::new(tokio::io::stdin());
-            let mut lines = stdin.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::info!(%line, "[Console Input]");
-                if let Ok(response) = cmd.run(&line).await
-                    && !response.is_empty()
-                {
-                    tracing::info!(%response, "command result");
+    // Interactive console reader. Skipped when `--no-console` (or `--smoke`,
+    // which never reaches the accept loop) so CI runs don't sit on stdin.
+    if !no_console {
+        tokio::spawn({
+            let cmd = cmd.clone();
+            async move {
+                let stdin = BufReader::new(tokio::io::stdin());
+                let mut lines = stdin.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::info!(%line, "[Console Input]");
+                    if let Ok(response) = cmd.run(&line).await
+                        && !response.is_empty()
+                    {
+                        tracing::info!(%response, "command result");
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
-    server::run(config, db, world, registry, lua, cmd).await
+    // `--smoke`: config + DB + content catalogs are validated by this point.
+    // The success marker is emitted by `server::run` *after* it binds the
+    // listener (so map smoke also proves the port is bindable, mirroring
+    // lobby/world/web); it returns before entering the accept loop.
+    server::run(config, db, world, registry, lua, cmd, smoke).await
 }

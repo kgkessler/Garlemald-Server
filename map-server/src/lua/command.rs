@@ -106,6 +106,19 @@ pub enum LuaCommand {
         player_id: u32,
         music_id: u16,
     },
+    /// `player:ChangeSpeed(stop, walk, run, active)` — port of C#
+    /// `Actor::ChangeSpeed`. Emits `0x00D0 SetActorSpeed` with the four
+    /// movement bands to the player's own client. Drives the `!speed` GM
+    /// command, `ChocoboRideCommand`, and `PopulaceChocoboLender`; the
+    /// binding was previously a no-op so those scripts ran but never
+    /// changed client-side speed.
+    ChangeSpeed {
+        player_id: u32,
+        stop: f32,
+        walk: f32,
+        run: f32,
+        active: f32,
+    },
     /// `player:SendDataPacket(dataType, ...)` — port of C#
     /// `Player::SendDataPacket` (`Player.cs` → `GenericDataPacket`,
     /// opcode 0x0133). Emits a 0x0133 GenericData subpacket carrying the

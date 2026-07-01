@@ -28,8 +28,6 @@
 //! coroutine stashes `(Arc<Lua>, Thread)`. This matches the C# shape of
 //! holding a Coroutine reference alongside its script.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

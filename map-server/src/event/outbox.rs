@@ -20,8 +20,6 @@
 //! the rest of the server — the ticker drains these and the dispatcher
 //! turns them into packets, DB writes, and Lua calls.
 
-#![allow(dead_code)]
-
 use common::luaparam::LuaParam;
 
 #[derive(Debug, Clone)]

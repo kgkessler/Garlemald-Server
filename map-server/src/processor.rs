@@ -169,6 +169,7 @@ impl PacketProcessor {
                 SUBPACKET_TYPE_GAMEMESSAGE => self.handle_game_message(client, &sub).await?,
                 other => {
                     tracing::debug!(r#type = format!("0x{other:X}"), "unhandled map subpacket");
+                    common::packet_diagnostics::log_unknown_subpacket("map", "map", &sub);
                 }
             }
         }
@@ -374,6 +375,15 @@ impl PacketProcessor {
         // (Garlemald-Server #46). The PlayerSetNpcLs apply path keeps
         // the DB row authoritative; this mirror is read-only at zone-in.
         character.chara.npc_linkshells = loaded.npc_linkshells.clone();
+        // Levequest journal hydration — mirror the loaded regional/local
+        // guildleve slots into CharaState so the zone-in `/_init` bundle
+        // re-emits them (previously loaded into LoadedPlayer, then dropped).
+        character.chara.guildleves_local = loaded.guildleves_local.clone();
+        character.chara.guildleves_regional = loaded.guildleves_regional.clone();
+        // Equipped-title hydration — mirror `currentTitle` so the zone-in
+        // bundle can emit `SetPlayerTitle`; the DB column already loaded into
+        // `loaded.current_title` but was never applied to the runtime actor.
+        character.chara.current_title = loaded.current_title;
         // SNpc / Path Companion hydration — same registry-reachability
         // motivation. The SetSNpc apply path mutates these in-place +
         // persists via db.save_snpc.
@@ -7360,6 +7370,7 @@ impl PacketProcessor {
                     source = source,
                     "unhandled game message",
                 );
+                common::packet_diagnostics::log_unknown_game_message("map", "map", sub);
             }
         }
         Ok(())
@@ -8433,6 +8444,10 @@ impl PacketProcessor {
 
         // Single-quest reply for a parseable request.
         let mut replied = false;
+        // The quest whose journal entry was just opened (qtdata request only),
+        // so we can fire its `onJournalRequest` hook exactly once — scoped
+        // strictly to the requested quest, never fanned out to all actives.
+        let mut journal_hook_quest: Option<u32> = None;
         if let Some(quest_id) = requested_quest_id {
             let quest_state = {
                 let c = handle.character.read().await;
@@ -8497,6 +8512,11 @@ impl PacketProcessor {
                     "RequestQuestJournalCommand → reply sent",
                 );
                 replied = true;
+                // Only the info (`qtdata`) request drives the journal-handoff
+                // hook; the map-marker (`qtmap`) request is a read-only view.
+                if tag == "qtdata" {
+                    journal_hook_quest = Some(quest_id);
+                }
             }
         }
 
@@ -8543,6 +8563,17 @@ impl PacketProcessor {
         );
         end.set_target_id(actor_id);
         client.send_bytes(end.to_bytes()).await;
+
+        // Journal-handoff hook — after the qtdata reply, fire the opened
+        // quest's `onJournalRequest(player, quest)` so scripts can advance
+        // flag state on a journal read (e.g. man0u0's Ul'dah mini-tutorial
+        // uses it to light the next NPC marker). Scoped strictly to the
+        // requested quest id; quests without the hook are a quiet no-op
+        // (`call_quest_hook` returns early on a missing global function).
+        if let Some(quest_id) = journal_hook_quest {
+            self.fire_quest_hook(handle, quest_id, "onJournalRequest", vec![])
+                .await;
+        }
     }
 
     /// Run `getJournalInformation` / `getJournalMapMarkerList` against the

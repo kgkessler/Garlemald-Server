@@ -30,6 +30,7 @@ pub struct Config {
     pub server: ServerSection,
     pub database: DatabaseSection,
     pub scripting: ScriptingSection,
+    pub world: WorldSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +58,19 @@ pub struct ScriptingSection {
     pub load_from_database: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorldSection {
+    /// Dalamud descent phase emitted at zone-in (`SetDalamud`, 0x0010). A
+    /// visual/testing knob for the red-moon descent; no gameplay effect.
+    /// Default 0 = largest/closest.
+    pub dalamud_phase: i8,
+    /// Weather id emitted at zone-in (`SetWeather`, 0x000D). Default 1 = clear.
+    pub weather_id: u16,
+    /// Weather transition time emitted alongside `weather_id`. Default 1.
+    pub weather_transition: u16,
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
@@ -81,6 +95,16 @@ impl Default for ScriptingSection {
         Self {
             script_root: PathBuf::from("./scripts"),
             load_from_database: true,
+        }
+    }
+}
+
+impl Default for WorldSection {
+    fn default() -> Self {
+        Self {
+            dalamud_phase: 0,
+            weather_id: 1,
+            weather_transition: 1,
         }
     }
 }
@@ -148,6 +172,13 @@ pub struct LaunchArgs {
     pub db_path: Option<PathBuf>,
     #[arg(long = "world-id")]
     pub world_id: Option<u32>,
+    /// Boot only far enough to validate config + DB + content load, print a
+    /// SMOKE_OK / SMOKE_FAIL marker, then exit (CI/dev fail-fast).
+    #[arg(long)]
+    pub smoke: bool,
+    /// Suppress the interactive stdin console reader.
+    #[arg(long = "no-console")]
+    pub no_console: bool,
     #[arg(long, default_value = "./configs/map.toml")]
     pub config: String,
 }

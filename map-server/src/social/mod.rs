@@ -28,7 +28,7 @@
 //! for the outbox, pushes the corresponding event, then drains to
 //! dispatch.
 
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 pub mod chat;
 pub mod dispatcher;

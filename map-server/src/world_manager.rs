@@ -778,7 +778,30 @@ pub struct GatherNodeMetadata {
 }
 
 /// Top-level zone + session registry.
+/// Server-global world tunables sourced from `[world]` in `map.toml`,
+/// emitted verbatim in the zone-in bundle. Defaults reproduce the prior
+/// hardcoded values (Dalamud phase 0 = largest, weather 1 = clear).
+#[derive(Debug, Clone, Copy)]
+pub struct WorldSettings {
+    pub dalamud_phase: i8,
+    pub weather_id: u16,
+    pub weather_transition: u16,
+}
+
+impl Default for WorldSettings {
+    fn default() -> Self {
+        Self {
+            dalamud_phase: 0,
+            weather_id: 1,
+            weather_transition: 1,
+        }
+    }
+}
+
 pub struct WorldManager {
+    /// Server-global world tunables (Dalamud phase, weather) from config.
+    world_settings: WorldSettings,
+
     zones: RwLock<HashMap<u32, Arc<RwLock<Zone>>>>,
 
     /// Named entrance points (`server_zones_spawnlocations`) keyed by id.
@@ -806,6 +829,7 @@ pub struct WorldManager {
 impl WorldManager {
     pub fn new() -> Self {
         Self {
+            world_settings: WorldSettings::default(),
             zones: RwLock::new(HashMap::new()),
             zone_entrances: RwLock::new(HashMap::new()),
             seamless_boundaries: RwLock::new(HashMap::new()),
@@ -813,6 +837,13 @@ impl WorldManager {
             sessions: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Override the server-global world tunables (Dalamud phase, weather)
+    /// from `[world]` in `map.toml`. Consumed once at boot in `lib::run`.
+    pub fn with_world_settings(mut self, settings: WorldSettings) -> Self {
+        self.world_settings = settings;
+        self
     }
 
     /// Resolve a gather node's `(harvest_node_id, harvest_type)` from
@@ -1563,6 +1594,33 @@ impl WorldManager {
                 .map(|e| (e.npc_ls_id, e.is_calling, e.is_extra))
                 .collect()
         };
+        // Levequest journal slots — re-emitted in the `/_init` bundle so the
+        // leve pane repopulates on relog. Filtered to non-empty, in-range
+        // slots (client arrays: local[8], regional[16]). (Kodama parity.)
+        let local_leves: Vec<(u16, u32)> = {
+            let c = actor_handle.character.read().await;
+            c.chara
+                .guildleves_local
+                .iter()
+                .filter(|e| e.quest_id != 0 && e.slot < 8)
+                .map(|e| (e.slot, e.quest_id))
+                .collect()
+        };
+        let regional_leves: Vec<(u16, u16, bool, bool)> = {
+            let c = actor_handle.character.read().await;
+            c.chara
+                .guildleves_regional
+                .iter()
+                .filter(|e| e.guildleve_id != 0 && e.slot < 16)
+                .map(|e| (e.slot, e.guildleve_id, e.abandoned, e.completed))
+                .collect()
+        };
+        // Equipped title — emitted as `SetPlayerTitle` in the bundle when
+        // nonzero, so a persisted title survives relog. (Kodama parity.)
+        let current_title = {
+            let c = actor_handle.character.read().await;
+            c.chara.current_title
+        };
         let (zone_actor_id, region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
             let z = zone_arc.read().await;
             (
@@ -1740,9 +1798,13 @@ impl WorldManager {
             };
         subpackets.extend(vec![
             tx::actor::build_set_actor_is_zoning(actor_id, false),
-            tx::misc::build_set_dalamud(actor_id, 0),
+            tx::misc::build_set_dalamud(actor_id, self.world_settings.dalamud_phase),
             tx::misc::build_set_music(actor_id, music_id, 0x01),
-            tx::misc::build_set_weather(actor_id, 1, 1),
+            tx::misc::build_set_weather(
+                actor_id,
+                self.world_settings.weather_id,
+                self.world_settings.weather_transition,
+            ),
             tx::misc::build_set_map(actor_id, region_id, zone_actor_id),
             tx::actor::build_add_actor(actor_id, 8),
             tx::actor::build_0x132(actor_id, 0x0B, "commandForced"),
@@ -1788,6 +1850,12 @@ impl WorldManager {
             actor_id, &[0u32; 5],
         ));
         subpackets.push(tx::player::build_set_completed_achievements(actor_id, &[]));
+        // Equipped title (C# `Player.SetPlayerTitle`) — emitted only when the
+        // character actually has one set, so a persisted title renders at
+        // login and survives relog. No packet for the untitled default.
+        if current_title != 0 {
+            subpackets.push(tx::player::build_set_player_title(actor_id, current_title));
+        }
         subpackets.push(tx::actor::build_actor_instantiate(
             actor_id,
             0,
@@ -1872,10 +1940,20 @@ impl WorldManager {
         // ordering for the journal pane to render the quest's
         // description/summary text — sending it after `/_init` (as we
         // did originally) leaves the journal entry name-only.
-        subpackets.extend(tx::actor::build_player_journal_property(
-            actor_id,
-            &active_quests,
-        ));
+        // Skip the journal packet entirely for a questless character.
+        // C# `Player.AddQuest` → `SendQuestClientUpdate` only fires when
+        // the player actually holds a quest, so a fresh (or all-openers-
+        // complete) character gets no `playerWork/journal` packet at all.
+        // Emitting an empty-properties packet here diverges from the
+        // reference and was implicated in inconsistent login state; the
+        // normal man0g0 opener always has an active quest and dodges it.
+        // Mirrors the guarded `npc_linkshells` emission below.
+        if !active_quests.is_empty() {
+            subpackets.extend(tx::actor::build_player_journal_property(
+                actor_id,
+                &active_quests,
+            ));
+        }
         subpackets.extend(tx::actor::build_player_property_init(
             actor_id,
             hp,
@@ -1894,6 +1972,8 @@ impl WorldManager {
             initial_town,
             rest_bonus_exp_rate,
             &active_quests,
+            &local_leves,
+            &regional_leves,
             &hotbar_props,
         ));
         // NPC-linkshell pearl state — re-emit each owned linkshell's

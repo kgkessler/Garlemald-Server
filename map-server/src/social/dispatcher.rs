@@ -21,8 +21,6 @@
 //! helper; group chats fan-out via the group membership cached on the
 //! source player.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use tokio::sync::RwLock;

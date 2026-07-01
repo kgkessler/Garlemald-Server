@@ -22,8 +22,6 @@
 //! (PlayAnimation, DoBattleAction, Cast, Engage, Spawn, Die) queue outbound
 //! packets and will land alongside the game-loop integration.
 
-#![allow(dead_code)]
-
 use super::modifier::Modifier;
 use super::{CharaState, Character};
 

@@ -34,8 +34,6 @@
 //! script, drains the resulting command queue, then applies the commands.
 //! No awaiting inside Lua.
 
-#![allow(dead_code)]
-
 pub mod catalogs;
 pub mod command;
 pub mod globals;
@@ -1791,6 +1789,135 @@ mod tests {
             "man0l1 onNotice(SEQ_003) must also emit EndEvent in the same drain \
              (proves it did NOT park on callClientFunction); got {:?}",
             result.commands,
+        );
+    }
+
+    /// P4 (Garlemald-Server) — the REAL `man0u0.lua` (Ul'dah opener)
+    /// `onJournalRequest` hook is the journal-handoff that advances the
+    /// Merchant-Strip mini-tutorial chain. Once Ascilia's first talk is
+    /// done (`FLAG_SEQ000_MINITUT0` = bit 0) but her follow-up talk isn't
+    /// (`FLAG_SEQ000_MINITUT1` = bit 1), opening the journal must set bit 1
+    /// and re-run the ENPC swap so the next NPC marker (Fretful Farmhand)
+    /// lights up. It must NOT touch flags once bit 1 is already set, and
+    /// must no-op before bit 0 is set (chain hasn't started).
+    #[test]
+    fn real_man0u0_on_journal_request_advances_minitut1() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("quests/man/man0u0.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        let handle_with_flags = |flags: u32| userdata::LuaQuestHandle {
+            player_id: 42,
+            quest_id: 110_009, // Man0u0
+            has_quest: true,
+            sequence: 0, // SEQ_000
+            flags,
+            counters: [0; 4],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+            queue: CommandQueue::new(),
+        };
+
+        // MINITUT0 set, MINITUT1 not → advance to MINITUT1 + UpdateENPCs.
+        let advanced = engine.call_quest_hook(
+            &script_path,
+            "onJournalRequest",
+            sample_snapshot(),
+            handle_with_flags(0b0001),
+            vec![],
+        );
+        assert!(
+            advanced.error.is_none(),
+            "onJournalRequest errored: {:?}",
+            advanced.error
+        );
+        assert!(
+            advanced.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::QuestSetFlag {
+                    bit: 1,
+                    quest_id: 110_009,
+                    ..
+                }
+            )),
+            "journal handoff must SetFlag(MINITUT1); got {:?}",
+            advanced.commands,
+        );
+        assert!(
+            advanced.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::QuestUpdateEnpcs {
+                    quest_id: 110_009,
+                    ..
+                }
+            )),
+            "journal handoff must re-run UpdateENPCs; got {:?}",
+            advanced.commands,
+        );
+
+        // MINITUT0 and MINITUT1 both set → no further advance.
+        let already = engine.call_quest_hook(
+            &script_path,
+            "onJournalRequest",
+            sample_snapshot(),
+            handle_with_flags(0b0011),
+            vec![],
+        );
+        assert!(
+            already.error.is_none(),
+            "onJournalRequest errored: {:?}",
+            already.error
+        );
+        assert!(
+            !already
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::QuestSetFlag { bit: 1, .. })),
+            "must not re-set MINITUT1 once set; got {:?}",
+            already.commands,
+        );
+
+        // MINITUT0 not yet set → no-op (the chain hasn't started).
+        let not_started = engine.call_quest_hook(
+            &script_path,
+            "onJournalRequest",
+            sample_snapshot(),
+            handle_with_flags(0b0000),
+            vec![],
+        );
+        assert!(
+            not_started.error.is_none(),
+            "onJournalRequest errored: {:?}",
+            not_started.error
+        );
+        assert!(
+            not_started.commands.is_empty(),
+            "must no-op before MINITUT0 is set; got {:?}",
+            not_started.commands,
+        );
+
+        // On a later sequence (SEQ_010) the guard must fire even with
+        // MINITUT0 set → no flag mutation, no ENPC refresh.
+        let wrong_sequence = engine.call_quest_hook(
+            &script_path,
+            "onJournalRequest",
+            sample_snapshot(),
+            userdata::LuaQuestHandle {
+                sequence: 10, // SEQ_010, not SEQ_000
+                ..handle_with_flags(0b0001)
+            },
+            vec![],
+        );
+        assert!(
+            wrong_sequence.error.is_none(),
+            "onJournalRequest errored: {:?}",
+            wrong_sequence.error
+        );
+        assert!(
+            wrong_sequence.commands.is_empty(),
+            "journal handoff must no-op outside SEQ_000; got {:?}",
+            wrong_sequence.commands,
         );
     }
 

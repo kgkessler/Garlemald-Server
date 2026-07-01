@@ -22,8 +22,6 @@
 //! enum; we do the same with `HashMap<Modifier, f64>`. Callers can also key
 //! by raw u32 for the wire-format accessors (`GetMod(uint)`).
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 /// Every mod id the client / scripts can reference. Values match the u32

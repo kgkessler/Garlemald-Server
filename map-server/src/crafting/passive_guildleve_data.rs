@@ -31,8 +31,6 @@
 //!
 //! [`objective_item_id`]: PassiveGuildleveData::objective_item_id
 
-#![allow(dead_code)]
-
 /// Every field mirrors the DB column name verbatim (snake-cased). The
 /// four difficulty bands are stored in parallel arrays rather than a
 /// `struct Band` so the loader maps straight from `objectiveItemIdN`

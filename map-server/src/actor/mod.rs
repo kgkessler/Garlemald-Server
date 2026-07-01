@@ -270,6 +270,19 @@ pub struct CharaState {
     /// pending NPC-linkshell message is lost across a relog (the
     /// `SetNpcLs` delta only fires live). (Garlemald-Server #46.)
     pub npc_linkshells: Vec<crate::gamedata::NpcLinkshellEntry>,
+    /// Regional/local levequest journal slots
+    /// (`characters_quest_guildleve_*`), hydrated at session-begin so the
+    /// zone-in `/_init` bundle re-emits `work.guildleveId[N]` (regional) /
+    /// `playerWork.questGuildleve[N]` (local). Without this the leve pane
+    /// is empty on relog. Registry-reachable copy — same CharaState-vs-
+    /// PlayerState split as `npc_linkshells` above. (Kodama parity.)
+    pub guildleves_local: Vec<crate::gamedata::GuildleveLocalEntry>,
+    pub guildleves_regional: Vec<crate::gamedata::GuildleveRegionalEntry>,
+    /// Equipped title (`characters.currentTitle`), hydrated at
+    /// session-begin so the zone-in bundle emits `SetPlayerTitle`. The
+    /// authoritative runtime copy; `PlayerState.current_title` stays as
+    /// the login-DTO shape (same split as the GC / homepoint fields).
+    pub current_title: u32,
     /// "Standard NPC" / Path Companion scratchpad — set by C#
     /// `Player.SetSNpc(nickname, actorClassId, classType)` in the
     /// man200 MSQ branch. Persisted to migration-051 columns
@@ -357,6 +370,9 @@ impl Default for CharaState {
             homepoint_inn: 0,
             hotbar: Vec::new(),
             npc_linkshells: Vec::new(),
+            guildleves_local: Vec::new(),
+            guildleves_regional: Vec::new(),
+            current_title: 0,
             snpc_nickname: String::new(),
             snpc_skin: 0,
             snpc_personality: 0,

@@ -27,8 +27,6 @@
 //! The `Arc<Mutex<CommandQueue>>` inside each userdata is shared so *all*
 //! userdata created for one script invocation write into the same bucket.
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use mlua::{AnyUserData, UserData, UserDataFields, UserDataMethods, Value};
@@ -2362,12 +2360,21 @@ impl UserData for LuaPlayer {
         });
         methods.add_method(
             "ChangeSpeed",
-            |_, this, (_idle, _walk, _run, _active): (f32, f32, f32, f32)| {
-                // Speed changes flow through ActorProperty packets in
-                // retail; Phase 8c records the intent so scripts don't
-                // error. Full packet emission rides with the dispatcher
-                // depth fills.
-                let _ = this.snapshot.actor_id;
+            |_, this, (stop, walk, run, active): (f32, f32, f32, f32)| {
+                // Emit `0x00D0 SetActorSpeed` to the caller's own client
+                // via the command queue (drained through
+                // `apply_change_speed`). Drives `!speed`,
+                // `ChocoboRideCommand`, and `PopulaceChocoboLender`.
+                push(
+                    &this.queue,
+                    LuaCommand::ChangeSpeed {
+                        player_id: this.snapshot.actor_id,
+                        stop,
+                        walk,
+                        run,
+                        active,
+                    },
+                );
                 Ok(())
             },
         );

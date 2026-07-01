@@ -23,8 +23,6 @@
 //! `"iif"`, etc.), and (c) the description. We replicate that introspection
 //! and run `onTrigger` with the coerced parameters.
 
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use anyhow::Result;
