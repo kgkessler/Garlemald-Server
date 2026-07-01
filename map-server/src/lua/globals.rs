@@ -173,6 +173,35 @@ pub fn install_globals(
         globals.set("GetGatherResolver", f)?;
     }
 
+    // GetGatherNodeMetadata(zoneId, uniqueId) → { harvestNodeId,
+    // harvestType } | nil. Resolves the CLICKED gather node's
+    // per-spawn `(harvest_node_id, harvest_type)` from its
+    // `(zone_id, unique_id)` actor identity, so `DummyCommand.lua`
+    // can pick the right template + minigame for the node the player
+    // actually struck instead of the hardcoded grade-2 tutorial mine.
+    // Mirrors `WorldManager::gather_metadata` on the synchronous
+    // catalog surface (Lua globals must not `await`). Returns `nil`
+    // when the key is unknown — the caller keeps its tutorial-node
+    // fallback. NOTE: the clicked node's identity is not yet threaded
+    // into the harvest command event (see DummyCommand.lua), so live
+    // callers currently pass the tutorial key; the binding is exercised
+    // by tests until that plumbing lands.
+    {
+        let cats = catalogs.clone();
+        let f = lua.create_function(move |lua, (zone_id, unique_id): (u32, String)| match cats
+            .gather_node_metadata(zone_id, &unique_id)
+        {
+            Some(meta) => {
+                let t = lua.create_table()?;
+                t.set("harvestNodeId", meta.harvest_node_id)?;
+                t.set("harvestType", meta.harvest_type)?;
+                Ok(Value::Table(t))
+            }
+            None => Ok(Value::Nil),
+        })?;
+        globals.set("GetGatherNodeMetadata", f)?;
+    }
+
     // `action` table — Tier 1 #2 C. Narrow Lua-driven combat
     // surface. Today only exposes `TryStatus` (buff/debuff/DoT
     // application); `DoAction` / full damage-resolution from Lua

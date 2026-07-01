@@ -296,6 +296,18 @@ pub async fn apply_runtime_lua_command(
             apply_add_gil(actor_id, amount, registry, Some(world), db).await;
             true
         }
+        LC::EarnAchievement {
+            actor_id,
+            achievement_id,
+            points,
+        } => {
+            apply_earn_achievement(actor_id, achievement_id, points, registry, world, db).await;
+            true
+        }
+        LC::SetTitle { actor_id, title_id } => {
+            apply_set_title(actor_id, title_id, registry, world, db).await;
+            true
+        }
         // NPC-linkshell scratchpad writes — these ride quest hooks that
         // often park on a callClientFunction coroutine (man0l1 Baderon
         // talk), so the NewNpcLsMsg / ReadNpcLsMsg / EndOfNpcLsMsgs burst
@@ -4223,6 +4235,104 @@ pub async fn apply_add_gil(
             );
         }
     }
+}
+
+/// `player:EarnAchievement(id[, points])` drain. Persists to
+/// `characters_achievements`, then — only on a first-time earn — pops the
+/// earned toast and re-syncs the authoritative points total + latest-5
+/// (read back from the DB) to the owning client via the achievement
+/// dispatcher. `chara_id == actor_id` in this server's lobby flow
+/// (processor.rs: "`chara_id` == session id"). Re-earns are silent.
+pub async fn apply_earn_achievement(
+    actor_id: u32,
+    achievement_id: u32,
+    points: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    let newly = match db.award_achievement(actor_id, achievement_id, points).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                actor = actor_id,
+                id = achievement_id,
+                err = %e,
+                "EarnAchievement: DB persist failed",
+            );
+            return;
+        }
+    };
+    if !newly {
+        // Already earned — no toast, no state re-sync (retail parity).
+        return;
+    }
+    let points_total = db.get_achievement_points(actor_id).await.unwrap_or(0);
+    let latest_ids = db
+        .get_latest_achievements(actor_id)
+        .await
+        .unwrap_or([0u32; 5]);
+
+    let mut ob = crate::achievement::AchievementOutbox::new();
+    ob.push(crate::achievement::AchievementEvent::Earned {
+        player_actor_id: actor_id,
+        achievement_id,
+    });
+    ob.push(crate::achievement::AchievementEvent::SetPoints {
+        player_actor_id: actor_id,
+        points: points_total,
+    });
+    ob.push(crate::achievement::AchievementEvent::SetLatest {
+        player_actor_id: actor_id,
+        latest_ids,
+    });
+    for e in ob.drain() {
+        crate::achievement::dispatch_achievement_event(&e, registry, world).await;
+    }
+    tracing::info!(
+        actor = actor_id,
+        id = achievement_id,
+        points = points_total,
+        "EarnAchievement applied",
+    );
+}
+
+/// `player:SetTitle(titleId)` drain. Persists `characters.currentTitle`
+/// (so it survives relog — login reads it back into `chara.current_title`),
+/// mirrors it onto the live registry Character so a same-session zone-in
+/// renders it, and broadcasts `SetPlayerTitle` (0x019D). `title_id == 0`
+/// clears the title.
+pub async fn apply_set_title(
+    actor_id: u32,
+    title_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    if let Err(e) = db.set_current_title(actor_id, title_id).await {
+        tracing::warn!(
+            actor = actor_id,
+            title = title_id,
+            err = %e,
+            "SetTitle: DB persist failed",
+        );
+        return;
+    }
+    // Mirror onto the live Character so a same-session zone-in bundle
+    // (which reads `c.chara.current_title`) reflects the change without a
+    // relog.
+    if let Some(handle) = registry.get(actor_id).await {
+        handle.character.write().await.chara.current_title = title_id;
+    }
+    let mut ob = crate::achievement::AchievementOutbox::new();
+    ob.push(crate::achievement::AchievementEvent::SetPlayerTitle {
+        player_actor_id: actor_id,
+        title_id,
+    });
+    for e in ob.drain() {
+        crate::achievement::dispatch_achievement_event(&e, registry, world).await;
+    }
+    tracing::info!(actor = actor_id, title = title_id, "SetTitle applied");
 }
 
 /// Push the player's post-grant gil balance to their client as a

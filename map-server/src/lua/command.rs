@@ -305,6 +305,25 @@ pub enum LuaCommand {
         actor_id: u32,
         amount: i32,
     },
+    /// `player:EarnAchievement(achievementId[, points])` — persist the
+    /// earned achievement (`characters_achievements`), pop the earned
+    /// toast, and re-sync the points total + latest-5 to the client.
+    /// Idempotent: re-earning an already-owned achievement is a silent
+    /// no-op (no toast). `points` seeds the catalog row's `rewardPoints`
+    /// when the achievement isn't otherwise in `gamedata_achievements`.
+    EarnAchievement {
+        actor_id: u32,
+        achievement_id: u32,
+        points: u32,
+    },
+    /// `player:SetTitle(titleId)` — equip / clear the player's current
+    /// title (`characters.currentTitle`), persist it so it survives
+    /// relog, and broadcast `SetPlayerTitle` (0x019D). `title_id == 0`
+    /// clears the title.
+    SetTitle {
+        actor_id: u32,
+        title_id: u32,
+    },
     /// `player:Die()` — force the actor into the DEAD state (flipping
     /// `current_main_state`, zeroing HP, broadcasting `SetActorState`).
     /// Used by GM commands and by scripted death cutscenes.

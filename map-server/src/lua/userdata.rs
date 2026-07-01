@@ -1414,15 +1414,36 @@ impl UserData for LuaPlayer {
         // --- Guildleve trio ---------------------------------------
         // GM-side leve management (gm/addguildleve.lua,
         // gm/removeguildleve.lua) + CraftCommand.lua's quest
-        // lookup. The full leve subsystem (LeveDirector,
-        // characters_guildleve table, leve completion state
-        // machine) isn't ported yet; logged stubs let the
-        // commands not crash. 3 sites total.
+        // lookup. The full C# tradecraft leve subsystem
+        // (LeveDirector, `gamedata_guildleves` catalog, leve
+        // completion state machine) isn't ported yet, so ids
+        // outside the regional range stay a logged stub.
+        //
+        // Ids inside the fieldcraft/battlecraft range
+        // (`130_001..=130_450` / `140_001..=140_450`) DO have a
+        // built accept pipeline, so route them into it: this is the
+        // content-side entry point that turns `!addguildleve <id>`
+        // (gm/addguildleve.lua) into a real journal accept — the
+        // leve then ticks via the live fieldcraft/battlecraft
+        // progress hooks and can be handed in via
+        // `HandInRegionalLeve`. Band 0 (easiest) is used since the
+        // GM command carries no difficulty argument.
         methods.add_method("AddGuildleve", |_, this, gl_id: u32| {
+            if crate::leve::is_regional_leve_quest_id(gl_id) {
+                push(
+                    &this.queue,
+                    LuaCommand::AcceptRegionalLeve {
+                        player_id: this.snapshot.actor_id,
+                        leve_id: gl_id,
+                        difficulty: 0,
+                    },
+                );
+                return Ok(());
+            }
             tracing::debug!(
                 player = this.snapshot.actor_id,
                 gl_id,
-                "AddGuildleve captured (leve subsystem not wired)",
+                "AddGuildleve captured (non-regional id — C# guildleve subsystem not wired)",
             );
             Ok(())
         });
@@ -2193,6 +2214,40 @@ impl UserData for LuaPlayer {
                 LuaCommand::AddGil {
                     actor_id: this.snapshot.actor_id,
                     amount,
+                },
+            );
+            Ok(())
+        });
+
+        // `player:EarnAchievement(achievementId[, points])` — pop the
+        // earned toast, persist to `characters_achievements`, and re-sync
+        // the points total + latest-5 (Phase 8 achievement subsystem).
+        // Idempotent on a re-earn. `points` (default 0) seeds the catalog
+        // reward when the achievement isn't otherwise in
+        // `gamedata_achievements`.
+        methods.add_method(
+            "EarnAchievement",
+            |_, this, (achievement_id, points): (u32, Option<u32>)| {
+                push(
+                    &this.queue,
+                    LuaCommand::EarnAchievement {
+                        actor_id: this.snapshot.actor_id,
+                        achievement_id,
+                        points: points.unwrap_or(0),
+                    },
+                );
+                Ok(())
+            },
+        );
+
+        // `player:SetTitle(titleId)` — equip / clear the current title,
+        // persist it (survives relog), and broadcast SetPlayerTitle.
+        methods.add_method("SetTitle", |_, this, title_id: u32| {
+            push(
+                &this.queue,
+                LuaCommand::SetTitle {
+                    actor_id: this.snapshot.actor_id,
+                    title_id,
                 },
             );
             Ok(())

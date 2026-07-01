@@ -30,6 +30,7 @@ use crate::data::ItemData;
 use crate::gamedata::{BattleCommand, GuildleveGamedata, QuestMeta, StatusEffectDef};
 use crate::gathering::GatherResolver;
 use crate::leve::RegionalLeveResolver;
+use crate::world_manager::GatherNodeMetadata;
 
 #[derive(Default)]
 pub struct Catalogs {
@@ -64,6 +65,14 @@ pub struct Catalogs {
     /// so `GetRegionalLeveResolver()` in Lua hands out a userdata
     /// wrapper without copying the catalog.
     pub regional_leves: RwLock<Option<Arc<RegionalLeveResolver>>>,
+    /// Per-gather-spawn metadata keyed by `(zone_id, unique_id)`.
+    /// Mirrors the `WorldManager::gather_node_metadata` map, but exposed
+    /// on the synchronous `Catalogs` surface so `DummyCommand.lua` can
+    /// resolve the clicked node's `(harvest_node_id, harvest_type)`
+    /// without `await` (Lua globals run in a blocking context). Boot
+    /// installs the same rows the world manager loads from
+    /// `server_gather_node_spawns`.
+    pub gather_node_metadata: RwLock<HashMap<(u32, String), GatherNodeMetadata>>,
 }
 
 impl Catalogs {
@@ -163,6 +172,33 @@ impl Catalogs {
         if let Ok(mut w) = self.regional_leves.write() {
             *w = Some(Arc::new(resolver));
         }
+    }
+
+    /// Install the per-node gather metadata snapshot (`(zone_id,
+    /// unique_id) → GatherNodeMetadata`). Called once at boot from the
+    /// same `server_gather_node_spawns` rows the world manager loads.
+    pub fn install_gather_node_metadata(
+        &self,
+        metadata: HashMap<(u32, String), GatherNodeMetadata>,
+    ) {
+        if let Ok(mut w) = self.gather_node_metadata.write() {
+            *w = metadata;
+        }
+    }
+
+    /// Resolve a clicked gather node's `(harvest_node_id, harvest_type)`
+    /// from its `(zone_id, unique_id)` actor identity. `None` when the
+    /// key is unknown (not a gather-node spawn, or the snapshot hasn't
+    /// been installed yet). Backs the `GetGatherNodeMetadata` Lua global.
+    pub fn gather_node_metadata(
+        &self,
+        zone_id: u32,
+        unique_id: &str,
+    ) -> Option<GatherNodeMetadata> {
+        self.gather_node_metadata
+            .read()
+            .ok()
+            .and_then(|w| w.get(&(zone_id, unique_id.to_string())).copied())
     }
 
     /// Cheap `Arc` clone of the installed regional-leve resolver, or

@@ -1826,11 +1826,34 @@ impl WorldManager {
             ));
         }
         subpackets.push(tx::player::build_set_special_event_work(actor_id));
-        subpackets.push(tx::player::build_set_achievement_points(actor_id, 0));
-        subpackets.push(tx::player::build_set_latest_achievements(
-            actor_id, &[0u32; 5],
+        // Real achievement state at login/zone-in. `chara_id == session_id`
+        // in this server's lobby flow, so the session id keys the DB reads.
+        // Empty/failed reads degrade to the previous zero-state instead of
+        // dropping the bundle.
+        let achievement_points = db.get_achievement_points(session_id).await.unwrap_or(0);
+        let latest_achievements = db
+            .get_latest_achievements(session_id)
+            .await
+            .unwrap_or([0u32; 5]);
+        let completed_ids = db.get_achievements(session_id).await.unwrap_or_default();
+        let mut completed_bits = vec![false; crate::achievement::COMPLETED_ACHIEVEMENTS_BITS];
+        for id in completed_ids {
+            if (id as usize) < completed_bits.len() {
+                completed_bits[id as usize] = true;
+            }
+        }
+        subpackets.push(tx::player::build_set_achievement_points(
+            actor_id,
+            achievement_points,
         ));
-        subpackets.push(tx::player::build_set_completed_achievements(actor_id, &[]));
+        subpackets.push(tx::player::build_set_latest_achievements(
+            actor_id,
+            &latest_achievements,
+        ));
+        subpackets.push(tx::player::build_set_completed_achievements(
+            actor_id,
+            &completed_bits,
+        ));
         // Equipped title (C# `Player.SetPlayerTitle`) — emitted only when the
         // character actually has one set, so a persisted title renders at
         // login and survives relog. No packet for the untitled default.
