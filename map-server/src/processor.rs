@@ -7883,6 +7883,21 @@ impl PacketProcessor {
         // un-parking the combat-tutorial director. Generalizes the journal
         // one-off above. (Garlemald-Server #28.)
         if let Some(command_name) = Self::command_script_name(owner_actor_id) {
+            // Harvest commands are node-scoped: the command static actor
+            // (0xA0F0xxxx) is identical for every gather node, so resolve
+            // the node the player actually struck. The client `SetTarget`s
+            // the node before invoking the command, so its soft target
+            // (`current_target`) IS the clicked node; map that live actor
+            // id back to the `(zoneId, uniqueId)` key `DummyCommand.lua`
+            // feeds `GetGatherNodeMetadata`. `None` for every other
+            // command (they don't read the commandActor's identity).
+            // (Wave 3 gather partial.)
+            let command_actor_identity = if Self::is_gather_command(owner_actor_id) {
+                let target = { handle.character.read().await.chara.current_target };
+                self.world.gather_node_identity(target).await
+            } else {
+                None
+            };
             self.dispatch_command_script(
                 &handle,
                 owner_actor_id,
@@ -7890,6 +7905,7 @@ impl PacketProcessor {
                 event_name_for_cmd,
                 event_type_for_cmd,
                 lua_params_for_cmd,
+                command_actor_identity,
             )
             .await;
         }
@@ -8092,6 +8108,24 @@ impl PacketProcessor {
     /// EventStart log. (Garlemald-Server #46.)
     const EMOTE_STANDARD_COMMAND: u32 = 0xA0F0_5E26;
 
+    /// Harvest command static actors — the client fires an `EventStart`
+    /// against one of these (eventName `"commandRequest"`) when the
+    /// player picks Mine / Log / Fish / Quarry / Harvest / Spearfish on a
+    /// gathering node. The masked low half is the harvest command id
+    /// (`22002..=22007`, [`crate::gathering::HARVEST_TYPE_MINE`] …), and
+    /// the static-actor id is `id | 0xA0F00000` like every other command
+    /// actor. All six route to the one `commands/DummyCommand.lua` script,
+    /// which branches on the node's resolved `harvestType` internally.
+    /// Without a dispatch arm the press falls through `command_script_name`
+    /// and no minigame ever opens. (Wave 3 gather partial.)
+    const GATHER_COMMAND_MASK: u32 = 0xA0F0_0000;
+
+    /// Is `owner_actor_id` one of the six harvest command static actors?
+    fn is_gather_command(owner_actor_id: u32) -> bool {
+        (owner_actor_id & 0xFFF0_0000) == Self::GATHER_COMMAND_MASK
+            && crate::gathering::is_valid_harvest_type(owner_actor_id & 0xFFFF)
+    }
+
     /// SetTarget's `attackTarget` "no attack target" sentinel — the value the
     /// 1.x client writes when the player has no locked combat target (pmeteor
     /// `SetTargetPacket.attackTarget` "Usually 0xE0000000"). Same constant as
@@ -8143,6 +8177,7 @@ impl PacketProcessor {
             Self::LOGOUT_COMMAND => Some("LogoutCommand"),
             Self::TELEPORT_COMMAND => Some("TeleportCommand"),
             Self::EMOTE_STANDARD_COMMAND => Some("EmoteStandardCommand"),
+            id if Self::is_gather_command(id) => Some("DummyCommand"),
             _ => None,
         }
     }
@@ -8150,6 +8185,7 @@ impl PacketProcessor {
     /// Run `commands/<Name>.lua::onEventStarted` for a client command static
     /// actor and apply its commands (incl. any `sendSignal`). Generalizes the
     /// hardcoded journal command. (Garlemald-Server #28.)
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_command_script(
         &self,
         handle: &ActorHandle,
@@ -8158,6 +8194,13 @@ impl PacketProcessor {
         event_name: String,
         event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
+        // Identity `(zone_id, unique_id)` of the physical actor the command
+        // was invoked on, when the dispatch resolved it (harvest commands:
+        // the clicked gather node). Stamped onto the `commandActor`
+        // userdata so `DummyCommand.lua` can key `GetGatherNodeMetadata`
+        // off the node the player actually struck. `None` for every
+        // command that isn't node-scoped. (Wave 3 gather partial.)
+        command_actor_identity: Option<(u32, String)>,
     ) {
         let Some(lua) = self.lua.as_ref() else {
             return;
@@ -8186,6 +8229,7 @@ impl PacketProcessor {
                 event_name,
                 event_type,
                 lua_params,
+                command_actor_identity,
             )
         })
         .await;
@@ -10096,6 +10140,59 @@ mod login_burst_routing_tests {
             !PacketProcessor::is_login_scoped_burst(&burst),
             "ordinary resume bursts must NOT route through the login applier",
         );
+    }
+}
+
+#[cfg(test)]
+mod gather_command_routing_tests {
+    use super::*;
+
+    /// The six harvest command static actors (`0xA0F00000 | 22002..=22007`)
+    /// route to `commands/DummyCommand.lua`, and nothing else does. Without
+    /// this arm a Mine/Log/Fish/Quarry/Harvest/Spearfish press falls
+    /// through `command_script_name` and no minigame ever opens. (Wave 3.)
+    #[test]
+    fn gather_command_static_actors_route_to_dummy_command() {
+        for harvest_type in [
+            crate::gathering::HARVEST_TYPE_MINE,
+            crate::gathering::HARVEST_TYPE_LOG,
+            crate::gathering::HARVEST_TYPE_FISH,
+            crate::gathering::HARVEST_TYPE_QUARRY,
+            crate::gathering::HARVEST_TYPE_HARVEST,
+            crate::gathering::HARVEST_TYPE_SPEARFISH,
+        ] {
+            let owner = 0xA0F0_0000 | harvest_type;
+            assert!(
+                PacketProcessor::is_gather_command(owner),
+                "0x{owner:08X} must be recognised as a harvest command",
+            );
+            assert_eq!(
+                PacketProcessor::command_script_name(owner),
+                Some("DummyCommand"),
+                "0x{owner:08X} must route to DummyCommand",
+            );
+        }
+    }
+
+    /// A non-harvest low half (or the wrong high mask) is NOT a harvest
+    /// command — the range check must not swallow the journal / activate /
+    /// teleport command actors or an out-of-band id.
+    #[test]
+    fn non_gather_ids_are_not_harvest_commands() {
+        // Adjacent-but-invalid harvest ids.
+        assert!(!PacketProcessor::is_gather_command(0xA0F0_0000 | 22001));
+        assert!(!PacketProcessor::is_gather_command(0xA0F0_0000 | 22008));
+        // Other real command static actors keep their own scripts.
+        assert_eq!(
+            PacketProcessor::command_script_name(PacketProcessor::LOGOUT_COMMAND),
+            Some("LogoutCommand"),
+        );
+        assert_eq!(
+            PacketProcessor::command_script_name(PacketProcessor::EMOTE_STANDARD_COMMAND),
+            Some("EmoteStandardCommand"),
+        );
+        // Right low half but wrong high mask (not a command actor at all).
+        assert!(!PacketProcessor::is_gather_command(0x4000_0000 | 22002));
     }
 }
 

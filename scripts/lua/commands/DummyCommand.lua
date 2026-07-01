@@ -131,24 +131,22 @@ function onEventStarted(player, commandActor, triggerName, arg1, arg2, arg3, arg
 
     -- Per-node routing. `GetGatherNodeMetadata(zoneId, uniqueId)` resolves
     -- the CLICKED node's `(harvestNodeId, harvestType)` from its actor
-    -- identity. `nodeZoneId` / `nodeUniqueId` come from the clicked
-    -- gather-node actor.
+    -- identity.
     --
-    -- KNOWN GAP: the clicked node's `(zoneId, uniqueId)` is not yet
-    -- threaded into the harvest command event — `commandActor` here is
-    -- the static HarvestJudge command actor, not the struck node. Until
-    -- that arg plumbing lands (see the Rust-side followup), `nodeZoneId`
-    -- / `nodeUniqueId` stay nil and we fall back to the grade-2 tutorial
-    -- mining template (1001 / commandMine). The resolution path below is
-    -- ready for the day those args arrive: pass them in and every node
-    -- routes to its own template + discipline.
-    local nodeZoneId = nil;
-    local nodeUniqueId = nil;
+    -- The command static actor (0xA0F0xxxx) is identical for every
+    -- gathering node, so the server-side harvest-command dispatch resolves
+    -- the player's current target (the node they struck) and stamps its
+    -- `(zoneId, uniqueId)` onto THIS `commandActor` userdata before the
+    -- script runs. When the server couldn't resolve a node (no gather
+    -- node under the reticle) the fields stay empty/zero and we fall back
+    -- to the grade-2 tutorial mining template (1001 / commandMine).
+    local nodeUniqueId = commandActor:GetUniqueId();
+    local nodeZoneId = commandActor:GetZoneID();
 
     harvestNodeId = 1001;     -- Tutorial grade-2 mining fallback.
     harvestType = commandMine;
 
-    if nodeZoneId ~= nil and nodeUniqueId ~= nil then
+    if nodeUniqueId ~= nil and nodeUniqueId ~= "" and nodeZoneId ~= nil and nodeZoneId ~= 0 then
         local meta = GetGatherNodeMetadata(nodeZoneId, nodeUniqueId);
         if meta ~= nil then
             harvestNodeId = meta.harvestNodeId;

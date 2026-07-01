@@ -45,11 +45,23 @@ function onEventStarted(player, npc)
 				goto MENU_LOOP;
 			else
 				wasAccepted = callClientFunction(player, "eventTalkDetail", cards[chosenGLCard], 0, 0xF4242, 0xD, 0xF4242, 0, 0, true, 0);
-				
+
 				if (wasAccepted == true) then
-				
+					-- Resolve the clicked guildleve card (plate id) back
+					-- to its catalog leve and add it to the journal via
+					-- the built regional-leve accept pipeline. Band 0
+					-- (easiest) — the battlecraft grid offers no band
+					-- picker here. Missing resolver / unmapped card both
+					-- degrade to a no-op so the menu still closes cleanly.
+					local resolver = GetRegionalLeveResolver();
+					if (resolver ~= nil) then
+						local leveId = resolver:LeveForCard(cards[chosenGLCard]);
+						if (leveId ~= nil) then
+							player:AcceptRegionalLeve(leveId, 0);
+						end
+					end
 				end
-				
+
 				goto CARDS_LOOP;
 				
 			end
@@ -71,6 +83,28 @@ function onEventStarted(player, npc)
 	elseif (menuChoice == 0x2B) then
 	--Leve Evaluation
 	elseif (menuChoice == 5) then
+		-- Hand-in / evaluation flow. Retail drives this via
+		-- `eventGLChangeDetail` + `askRetryRegionalleve` over the
+		-- player's *active* leves; we don't yet expose an
+		-- active-regional-leve enumeration binding to Lua, so this
+		-- reuses the same battlecraft card grid + `LeveForCard`
+		-- resolve to let the player pick a leve to hand in. PROVISIONAL:
+		-- the card selected here is the leve's *definition* card, which
+		-- only matters once the player actually holds the matching
+		-- (accepted + completed) leve — `HandInRegionalLeve` no-ops
+		-- otherwise (checks the journal). See followups: needs a real
+		-- active-leve list binding for the canonical eval UI.
+		local evalCards = {0x30C3, 0x30C4, 0x30C1, 0x30C5, 0x30C6, 0x30C7, 0x30C8, 0x30C9};
+		local chosenEvalCard = callClientFunction(player, "eventTalkCard", evalCards[1], evalCards[2], evalCards[3], evalCards[4], evalCards[5], evalCards[6], evalCards[7], evalCards[8]);
+		if (chosenEvalCard ~= nil and chosenEvalCard ~= -1) then
+			local resolver = GetRegionalLeveResolver();
+			if (resolver ~= nil) then
+				local leveId = resolver:LeveForCard(evalCards[chosenEvalCard]);
+				if (leveId ~= nil) then
+					player:HandInRegionalLeve(leveId);
+				end
+			end
+		end
 	--Tutorial
 	elseif (menuChoice == 6) then
 	--End of Info

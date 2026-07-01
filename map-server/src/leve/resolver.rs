@@ -31,6 +31,14 @@
 //!   band if a seeded leve ever varies the target per-band.
 //! * `by_battlecraft_target: HashMap<u32, Vec<u32>>` — analogous but
 //!   keyed by BattleNpc actor-class id.
+//! * `by_plate_id: HashMap<u32, u32>` — guildleve UI *plate* (card) id
+//!   → leve id. The levemete NPC script (`PopulaceGuildlevePublisher`)
+//!   renders a grid of hardcoded plate/card ids; this index maps the
+//!   card the player clicks back to the catalog leve so the accept /
+//!   hand-in branches can drive `player:AcceptRegionalLeve` /
+//!   `HandInRegionalLeve`. Plate id is unique per leve (a card renders
+//!   exactly one leve), so unlike the target indexes it maps to a
+//!   single id rather than a `Vec`.
 //!
 //! The secondary indexes let the progress hooks answer "which active
 //! leves care about *this* item / *this* killed mob?" in O(1) per
@@ -45,6 +53,7 @@ pub struct RegionalLeveResolver {
     by_id: HashMap<u32, RegionalLeveData>,
     by_fieldcraft_target: HashMap<u32, Vec<u32>>,
     by_battlecraft_target: HashMap<u32, Vec<u32>>,
+    by_plate_id: HashMap<u32, u32>,
 }
 
 impl RegionalLeveResolver {
@@ -75,11 +84,25 @@ impl RegionalLeveResolver {
                 }
             }
         }
+        // Plate id 0 means "no UI card assigned" (the DB default);
+        // skip it so unmapped leves don't collide on key 0.
+        if row.plate_id > 0 {
+            self.by_plate_id.insert(row.plate_id, id);
+        }
         self.by_id.insert(id, row);
     }
 
     pub fn by_id(&self, leve_id: u32) -> Option<&RegionalLeveData> {
         self.by_id.get(&leve_id)
+    }
+
+    /// Resolve a guildleve UI *plate* / card id (e.g. `0x30C3`) to its
+    /// catalog leve. Backs the levemete script's card-selection ->
+    /// accept / hand-in flow. `None` when no seeded leve carries that
+    /// plate id (unmapped card, or plate id 0).
+    pub fn leve_for_plate(&self, plate_id: u32) -> Option<&RegionalLeveData> {
+        let id = self.by_plate_id.get(&plate_id)?;
+        self.by_id.get(id)
     }
 
     /// Leve ids that target `item_catalog_id` as a fieldcraft
@@ -128,10 +151,14 @@ mod tests {
     use super::*;
 
     fn mk(id: u32, ty: LeveType, target: i32) -> RegionalLeveData {
+        mk_plated(id, ty, target, 0)
+    }
+
+    fn mk_plated(id: u32, ty: LeveType, target: i32, plate_id: u32) -> RegionalLeveData {
         RegionalLeveData {
             id,
             leve_type: ty,
-            plate_id: 0,
+            plate_id,
             border_id: 0,
             recommended_class: 0,
             issuing_location: 0,
@@ -182,6 +209,22 @@ mod tests {
     fn fieldcraft_target_does_not_appear_in_battlecraft_index() {
         let r = RegionalLeveResolver::from_rows([mk(130_001, LeveType::Fieldcraft, 10_001_006)]);
         assert!(r.battlecraft_leves_for_class(10_001_006).is_empty());
+    }
+
+    #[test]
+    fn resolver_maps_plate_id_to_leve() {
+        // Two battlecraft leves with distinct UI card ids (0x30C3,
+        // 0x30C4) plus one leve with no plate (0) that must not
+        // register a plate-index entry.
+        let r = RegionalLeveResolver::from_rows([
+            mk_plated(140_001, LeveType::Battlecraft, 5_000_035, 0x30C3),
+            mk_plated(140_002, LeveType::Battlecraft, 5_000_076, 0x30C4),
+            mk_plated(130_001, LeveType::Fieldcraft, 10_001_006, 0),
+        ]);
+        assert_eq!(r.leve_for_plate(0x30C3).map(|d| d.id), Some(140_001));
+        assert_eq!(r.leve_for_plate(0x30C4).map(|d| d.id), Some(140_002));
+        assert!(r.leve_for_plate(0x30C1).is_none(), "unmapped card -> none");
+        assert!(r.leve_for_plate(0).is_none(), "plate 0 never indexed");
     }
 
     #[test]
