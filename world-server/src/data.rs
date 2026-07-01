@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,18 +59,42 @@ pub struct DBWorld {
 #[derive(Clone)]
 pub struct ClientHandle {
     pub id: u32,
+    /// Stable per-connection identity assigned at accept. Distinguishes a
+    /// freshly-reconnected session from a superseded one so a stale teardown
+    /// can't wipe the live connection. (`id` is seeded 0 and never overwritten,
+    /// so it is unusable for connection identity — mirrors the C# reliance on
+    /// `Object.ReferenceEquals(clientConnection, ...)`.)
+    pub conn_seq: u64,
     pub tx: mpsc::Sender<Vec<u8>>,
+    /// `(channel, session_id)` pairs this connection created, so its read-loop
+    /// can tear them down on disconnect (mirrors C# `HandleClientDisconnect`).
+    pub owned: Arc<Mutex<Vec<(SessionChannel, u32)>>>,
+    /// Signalled to make this connection's read-loop exit early when it is
+    /// evicted by a duplicate login (mirrors C# `ClientConnection.Disconnect()`).
+    pub shutdown: Arc<Notify>,
 }
 
 impl ClientHandle {
-    pub fn new(id: u32, tx: mpsc::Sender<Vec<u8>>) -> Self {
-        Self { id, tx }
+    pub fn new(id: u32, conn_seq: u64, tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            id,
+            conn_seq,
+            tx,
+            owned: Arc::new(Mutex::new(Vec::new())),
+            shutdown: Arc::new(Notify::new()),
+        }
     }
 
     /// Best-effort send. Drops if the channel is closed (client has
     /// disconnected).
     pub async fn send_bytes(&self, bytes: Vec<u8>) {
         let _ = self.tx.send(bytes).await;
+    }
+
+    /// Record a `(channel, session_id)` this connection owns so the read-loop
+    /// can tear it down when the socket drops.
+    pub async fn note_owned(&self, channel: SessionChannel, session_id: u32) {
+        self.owned.lock().await.push((channel, session_id));
     }
 }
 

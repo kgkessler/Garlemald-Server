@@ -110,6 +110,20 @@ point at, then typing a fresh Rust implementation) are treated as
 clean-room and do not need per-file listing, but the general
 acknowledgment above still applies.
 
+## PacketClassificationRegistry (packet diagnostics)
+
+- Lineage: Project Meteor Server (AGPL-3.0) + AetherXIV / EchoGate (AGPL-3.0)
+- Source: <https://github.com/jackandcarter/AetherXIV-EchoGate>
+- License: GNU Affero General Public License v3.0 (AGPL-3.0)
+
+The unknown-packet classification registry in
+`common/src/packet_diagnostics.rs` (`classify`) is a **re-derived**
+heuristic map of unhandled FFXIV 1.23b subpacket `type` / game-message
+`opcode` values to candidate meanings, cross-referenced from the Project
+Meteor and AetherXIV (EchoGate) reference packet dispatchers. The labels
+are hypotheses recovered for the ongoing clean-room decomp, not verbatim
+translations of upstream tables.
+
 ## Acknowledgments
 
 Thanks to Ioncannon, Jean-Philip Desjardins, and every contributor to

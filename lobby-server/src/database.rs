@@ -387,10 +387,13 @@ impl Database {
         Ok(rows)
     }
 
-    pub async fn get_character(&self, _user_id: u32, char_id: u32) -> Result<Option<Character>> {
+    pub async fn get_character(&self, user_id: u32, char_id: u32) -> Result<Option<Character>> {
         let row = self
             .conn
             .call_db(move |c| {
+                // Scope the lookup to the authenticated owner: without the
+                // `c.userId = :uid` predicate any user could select another
+                // user's character by id (IDOR).
                 let v = c
                     .query_row(
                         r"SELECT c.id, c.slot, c.serverId, c.name, c.isLegacy, c.doRename,
@@ -399,9 +402,46 @@ impl Database {
                                  p.mainSkill, p.mainSkillLevel
                           FROM characters c
                           INNER JOIN characters_parametersave p ON c.id = p.characterId
-                          WHERE c.id = :cid",
-                        named_params! { ":cid": char_id },
+                          WHERE c.id = :cid AND c.userId = :uid",
+                        named_params! { ":cid": char_id, ":uid": user_id },
                         character_from_row,
+                    )
+                    .optional()?;
+                Ok(v)
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// Fetch the most recent *reserved* (state = 0) character row for a user,
+    /// if any. A reservation is the placeholder row `reserve_character` inserts
+    /// before the client sends the follow-up CMD_MAKE; it has no
+    /// `characters_parametersave` row yet, so this query MUST NOT reuse the
+    /// INNER JOIN that `get_character` / `get_characters` rely on. Used to
+    /// rehydrate `LobbySession` scratch state when a RESERVE -> MAKE
+    /// reservation is otherwise lost (e.g. a dropped/reconnected session),
+    /// preventing an orphaned `characterId = 0` MAKE.
+    pub async fn get_reserved_character(&self, user_id: u32) -> Result<Option<Character>> {
+        tracing::debug!(user_id, "db: get_reserved_character");
+        let row = self
+            .conn
+            .call_db(move |c| {
+                let v = c
+                    .query_row(
+                        r"SELECT id, slot, serverId, name FROM characters
+                          WHERE userId = :uid AND state = 0
+                          ORDER BY id DESC LIMIT 1",
+                        named_params! { ":uid": user_id },
+                        |r| {
+                            Ok(Character {
+                                id: r.get::<_, u32>(0)?,
+                                slot: r.get::<_, u16>(1)?,
+                                server_id: r.get::<_, u16>(2)?,
+                                name: r.get::<_, String>(3)?,
+                                state: 0,
+                                ..Default::default()
+                            })
+                        },
                     )
                     .optional()?;
                 Ok(v)
@@ -518,4 +558,111 @@ fn appearance_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Appearance> {
         left_ear: r.get::<_, u32>(32).unwrap_or_default(),
         right_ear: r.get::<_, u32>(33).unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh in-memory database opened through the shared helper (applies
+    /// `schema.sql` because the `:memory:` path never "exists" on disk).
+    async fn fresh_db() -> Database {
+        Database::open(":memory:").await.expect("open in-memory db")
+    }
+
+    async fn insert_character(db: &Database, user_id: u32, name: &str, state: u32) -> u32 {
+        let name = name.to_owned();
+        db.conn
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT INTO characters(userId, slot, serverId, name, state)
+                      VALUES(:uid, 0, 1, :name, :state)",
+                    named_params! { ":uid": user_id, ":name": name, ":state": state },
+                )?;
+                Ok(c.last_insert_rowid() as u32)
+            })
+            .await
+            .expect("insert character")
+    }
+
+    /// Insert a fully-made character (state = 2) plus the
+    /// `characters_parametersave` row its INNER JOIN requires, so
+    /// `get_character` can resolve it. Returns the new character id.
+    async fn insert_made_character(db: &Database, user_id: u32, name: &str) -> u32 {
+        let name = name.to_owned();
+        db.conn
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT INTO characters(userId, slot, serverId, name, state)
+                      VALUES(:uid, 0, 1, :name, 2)",
+                    named_params! { ":uid": user_id, ":name": name },
+                )?;
+                let cid = c.last_insert_rowid() as u32;
+                c.execute(
+                    r"INSERT INTO characters_parametersave
+                      (characterId, hp, hpMax, mp, mpMax, mainSkill, mainSkillLevel)
+                      VALUES(:cid, 1900, 1000, 115, 115, 2, 1)",
+                    named_params! { ":cid": cid },
+                )?;
+                Ok(cid)
+            })
+            .await
+            .expect("insert made character")
+    }
+
+    #[tokio::test]
+    async fn get_character_is_scoped_to_the_owning_user() {
+        let db = fresh_db().await;
+        let owner = 100;
+        let attacker = 200;
+        let cid = insert_made_character(&db, owner, "Owned Char").await;
+
+        // The owner can read their own character.
+        let mine = db.get_character(owner, cid).await.expect("owner query");
+        let mine = mine.expect("owner should see their character");
+        assert_eq!(mine.id, cid);
+
+        // A different user must NOT be able to read it by id (IDOR closed).
+        let theirs = db
+            .get_character(attacker, cid)
+            .await
+            .expect("attacker query");
+        assert!(
+            theirs.is_none(),
+            "get_character must not return a character owned by a different userId"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_reserved_character_returns_reserved_row() {
+        let db = fresh_db().await;
+        let user_id = 42;
+        let cid = insert_character(&db, user_id, "Reserved Name", 0).await;
+
+        let found = db
+            .get_reserved_character(user_id)
+            .await
+            .expect("query reserved character");
+
+        let found = found.expect("state=0 row should be returned");
+        assert_eq!(found.id, cid);
+        assert_eq!(found.name, "Reserved Name");
+        assert_eq!(found.state, 0);
+        assert_eq!(found.server_id, 1);
+    }
+
+    #[tokio::test]
+    async fn get_reserved_character_ignores_made_row() {
+        let db = fresh_db().await;
+        let user_id = 7;
+        // state = 2 is a fully-made character, not a reservation.
+        insert_character(&db, user_id, "Made Name", 2).await;
+
+        let found = db
+            .get_reserved_character(user_id)
+            .await
+            .expect("query reserved character");
+
+        assert!(found.is_none(), "state=2 row must NOT be returned");
+    }
 }

@@ -46,8 +46,23 @@ async fn main() -> Result<()> {
     tracing::info!("==================================");
 
     let args = LaunchArgs::parse();
+    let smoke = args.smoke;
+    let _no_console = args.no_console; // no interactive console here; accepted for CLI parity
     tracing::debug!(config_path = %args.config, "loading config");
-    let mut config = Config::load(&args.config)?;
+    let mut config = match Config::load(&args.config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Lobby",
+                    "config",
+                    &e.to_string(),
+                    common::smoke::EXIT_CONFIG,
+                ));
+            }
+            return Err(e);
+        }
+    };
     config.apply_launch_args(args);
     tracing::info!(
         bind_ip = %config.bind_ip(),
@@ -57,15 +72,36 @@ async fn main() -> Result<()> {
     );
 
     tracing::info!(db_path = %config.db_path().display(), "opening sqlite database");
-    let db = Database::open(config.db_path()).await?;
+    let db = match Database::open(config.db_path()).await {
+        Ok(db) => db,
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Lobby",
+                    "database",
+                    &e.to_string(),
+                    common::smoke::EXIT_DATABASE,
+                ));
+            }
+            return Err(e);
+        }
+    };
     match db.ping().await {
         Ok(()) => tracing::info!("DB connection ok"),
         Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Lobby",
+                    "database",
+                    &e.to_string(),
+                    common::smoke::EXIT_DATABASE,
+                ));
+            }
             tracing::error!(error = %e, "DB connection failed; aborting");
             return Err(e);
         }
     }
 
     let processor = PacketProcessor::new(db);
-    server::run(config, processor).await
+    server::run(config, processor, smoke).await
 }

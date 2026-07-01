@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::handlers::{self, AppState};
 
-pub async fn run(config: Config, db: Database) -> Result<()> {
+pub async fn run(config: Config, db: Database, smoke: bool) -> Result<()> {
     let bind_addr: SocketAddr = format!("{}:{}", config.bind_ip(), config.port())
         .parse()
         .with_context(|| {
@@ -62,9 +62,26 @@ pub async fn run(config: Config, db: Database) -> Result<()> {
         .with_state(state);
 
     tracing::info!(%bind_addr, "web server listening");
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding {bind_addr}"))?;
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Web",
+                    "startup",
+                    &e.to_string(),
+                    common::smoke::EXIT_STARTUP,
+                ));
+            }
+            return Err(e).with_context(|| format!("binding {bind_addr}"));
+        }
+    };
+
+    if smoke {
+        let _ = common::smoke::smoke_ok("Web", &bind_addr.to_string());
+        return Ok(());
+    }
+
     axum::serve(listener, app.into_make_service())
         .await
         .context("axum::serve")?;

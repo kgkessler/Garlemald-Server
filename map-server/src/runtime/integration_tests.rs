@@ -14808,19 +14808,22 @@ async fn man0u0_seq000_tutorial_flags_and_exit_gate() {
         Some(QFLAG_TALK),
         "Ascilia stays marked until her second talk (MINITUT1)",
     );
+    // Sequential chain: the Farmhand marker only lights AFTER Ascilia's
+    // follow-up talk (MINITUT1); the Mistress waits on the Farmhand talk
+    // (MINITUT2). Neither shows yet — only MINITUT0 is set.
     assert_eq!(
         enpc_flag(FRETFUL_FARMHAND).await,
-        Some(QFLAG_TALK),
-        "Farmhand marker must appear once Ascilia's push tutorial is done",
+        Some(QFLAG_OFF),
+        "Farmhand marker must stay suppressed until MINITUT1 (Ascilia's 2nd talk)",
     );
     assert_eq!(
         enpc_flag(GIL_DIGGING_MISTRESS).await,
-        Some(QFLAG_TALK),
-        "Mistress marker must appear once Ascilia's push tutorial is done",
+        Some(QFLAG_OFF),
+        "Mistress marker must stay suppressed until MINITUT2 (Farmhand talk)",
     );
 
     // Talk #2 — Ascilia: processTtrMini001 + SetFlag(MINITUT1) → her
-    // marker clears.
+    // marker clears and the Farmhand's lights up (next in the chain).
     fire_quest_on_talk_via_command(
         &handle,
         QUEST_ID,
@@ -14836,6 +14839,16 @@ async fn man0u0_seq000_tutorial_flags_and_exit_gate() {
         enpc_flag(ASCILIA).await,
         Some(QFLAG_OFF),
         "Ascilia's marker must clear after MINITUT1",
+    );
+    assert_eq!(
+        enpc_flag(FRETFUL_FARMHAND).await,
+        Some(QFLAG_TALK),
+        "Farmhand marker lights once MINITUT1 is set (predecessor done, own step not)",
+    );
+    assert_eq!(
+        enpc_flag(GIL_DIGGING_MISTRESS).await,
+        Some(QFLAG_OFF),
+        "Mistress marker still waits on MINITUT2 (Farmhand talk)",
     );
 
     // Farmhand + Mistress.
@@ -14854,6 +14867,11 @@ async fn man0u0_seq000_tutorial_flags_and_exit_gate() {
         enpc_flag(FRETFUL_FARMHAND).await,
         Some(QFLAG_OFF),
         "Farmhand's marker must clear after MINITUT2",
+    );
+    assert_eq!(
+        enpc_flag(GIL_DIGGING_MISTRESS).await,
+        Some(QFLAG_TALK),
+        "Mistress marker lights once MINITUT2 is set (Farmhand done, own step not)",
     );
 
     fire_quest_on_talk_via_command(
