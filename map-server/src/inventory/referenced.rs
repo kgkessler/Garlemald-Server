@@ -24,8 +24,6 @@
 //! `DbEquip`/`DbUnequip` events; the in-memory source package is expected
 //! to `mark_dirty` the referenced item so its resend reflects the new link.
 
-#![allow(dead_code)]
-
 use crate::data::InventoryItem;
 
 use super::outbox::{InventoryEvent, InventoryOutbox};

@@ -20,8 +20,6 @@
 //! outbox: mutation methods take `&mut StatusOutbox` and the game loop
 //! drains it into packet/DB/Lua side effects per tick.
 
-#![allow(dead_code)]
-
 #[derive(Debug, Clone)]
 pub enum StatusEvent {
     /// `Database.SavePlayerStatusEffects` (player-only).

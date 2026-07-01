@@ -33,8 +33,6 @@
 //! scripts can legitimately `player:AddExp(100, classId)` /
 //! `quest:SetQuestFlag(5)` on kill and have the side effects persist.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use crate::database::Database;

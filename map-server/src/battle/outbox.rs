@@ -21,8 +21,6 @@
 //! BattleUtils push events here; the game loop drains them per tick and
 //! turns them into packet sends, DB writes, and Lua dispatches.
 
-#![allow(dead_code)]
-
 use super::command::{BattleCommand, CommandResult};
 use super::effects::HitEffect;
 use super::target_find::ValidTarget;

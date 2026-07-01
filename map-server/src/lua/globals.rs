@@ -22,8 +22,6 @@
 //! The C# `LoadGlobals` helper does the same thing: it wires up
 //! `GetWorldManager`, `GetStaticActor(ById)`, `GetItemGamedata`, etc.
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use mlua::{Function, Lua, MultiValue, Value};

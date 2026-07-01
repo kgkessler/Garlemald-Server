@@ -29,8 +29,6 @@
 //! Non-event `LuaCommand` variants (movement, inventory, combat, …) are
 //! left untouched — other bridges translate those.
 
-#![allow(dead_code)]
-
 use common::luaparam::LuaParam;
 
 use crate::lua::command::{LuaCommand, LuaCommandArg};

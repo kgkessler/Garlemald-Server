@@ -29,7 +29,7 @@
 //! * `spawner` — the boot-time spawn pipeline that turns
 //!   `SpawnLocation` seeds into live actors in the registry.
 
-#![allow(dead_code, unused_imports, clippy::module_inception)]
+#![allow(unused_imports, clippy::module_inception)]
 
 pub mod actor_class;
 pub mod ally;

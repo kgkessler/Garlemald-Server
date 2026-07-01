@@ -31,7 +31,7 @@
 //! real packet sends + Lua calls (matching the pattern used by inventory,
 //! status, battle, area, and event).
 
-#![allow(dead_code, unused_imports, clippy::module_inception)]
+#![allow(unused_imports, clippy::module_inception)]
 
 pub mod director;
 pub mod dispatcher;

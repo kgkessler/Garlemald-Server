@@ -22,8 +22,6 @@
 //! by actor id instead since that matches how our outbox events identify
 //! actors and avoids interior-mutability headaches.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

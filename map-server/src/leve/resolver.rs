@@ -36,8 +36,6 @@
 //! leves care about *this* item / *this* killed mob?" in O(1) per
 //! event instead of walking every active leve on every tick.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use super::data::{LeveType, RegionalLeveData};

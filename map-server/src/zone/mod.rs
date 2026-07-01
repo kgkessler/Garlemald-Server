@@ -31,7 +31,7 @@
 //! `Zone`/`PrivateArea` compose. Behaviour that diverges (`FindActor…`,
 //! `CreateScriptBindPacket`) becomes methods on the enclosing type.
 
-#![allow(dead_code, unused_imports, clippy::module_inception)]
+#![allow(unused_imports, clippy::module_inception)]
 
 pub mod area;
 pub mod navmesh;

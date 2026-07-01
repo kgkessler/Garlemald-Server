@@ -32,8 +32,6 @@
 //! `SetPlayerDreamPacket` lands the fade-out animation on the right
 //! pillow rather than wherever the player happened to click the bed from.
 
-#![allow(dead_code)]
-
 /// XZ distance threshold from each inn room's centre — Meteor uses
 /// 20 units and we match it verbatim.
 pub const INN_ROOM_RADIUS: f32 = 20.0;

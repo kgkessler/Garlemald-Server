@@ -19,8 +19,6 @@
 //! `StatusEffectFlags` + `StatusEffectOverwrite`. Ported 1:1 from
 //! `Actors/Chara/Ai/StatusEffect.cs` (lines 352–401).
 
-#![allow(dead_code)]
-
 /// Bitfield of behavioral flags on a status effect. Values match the C# bit
 /// positions exactly so `gamedata_statuseffects.flags` rows stay compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

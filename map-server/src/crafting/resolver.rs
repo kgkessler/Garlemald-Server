@@ -35,8 +35,6 @@
 //! to feed back to `GetRecipeByID`, and storing ids sidesteps the
 //! lifetime gymnastics of mixing owned and borrowed rows in one map.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use super::recipe::{RECIPE_MATERIAL_SLOTS, Recipe};

@@ -23,8 +23,6 @@
 //! events on a `StatusOutbox` that the game loop drains each tick, mirroring
 //! the pattern used by the inventory runtime.
 
-#![allow(dead_code)]
-
 pub mod flags;
 pub mod ids;
 pub mod outbox;

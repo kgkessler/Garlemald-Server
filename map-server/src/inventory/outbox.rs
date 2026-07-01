@@ -30,8 +30,6 @@
 //! each tick and fans the events out to DB writes + packet sends. Pure and
 //! unit-testable.
 
-#![allow(dead_code)]
-
 use crate::data::InventoryItem;
 
 /// One side effect produced by an `ItemPackage` mutation.

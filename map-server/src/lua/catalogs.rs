@@ -22,8 +22,6 @@
 //! Using `std::sync::RwLock` rather than `tokio::sync::RwLock` because Lua
 //! globals are called from synchronous script contexts and must not `await`.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 

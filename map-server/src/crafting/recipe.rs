@@ -33,8 +33,6 @@
 //! resolver's `[u32; 8]` fingerprint lookup matches the C# MD5-over-
 //! packed-bytes approach byte-for-byte.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 /// Number of material slots on the `gamedata_recipes` row. Lua pads

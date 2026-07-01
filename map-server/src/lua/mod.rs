@@ -34,8 +34,6 @@
 //! script, drains the resulting command queue, then applies the commands.
 //! No awaiting inside Lua.
 
-#![allow(dead_code)]
-
 pub mod catalogs;
 pub mod command;
 pub mod globals;

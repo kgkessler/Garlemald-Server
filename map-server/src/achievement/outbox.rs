@@ -18,8 +18,6 @@
 
 //! Events emitted by achievement + title mutations.
 
-#![allow(dead_code)]
-
 #[derive(Debug, Clone)]
 pub enum AchievementEvent {
     /// Pop the in-game achievement-earned toast + add to the DB.

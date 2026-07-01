@@ -26,8 +26,6 @@
 //!     + its items into the 11-slot table the DummyCommand minigame
 //!       feeds through `callClientFunction`.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use super::node::{AIM_SLOTS, AimSlot, GatherNode, GatherNodeItem};

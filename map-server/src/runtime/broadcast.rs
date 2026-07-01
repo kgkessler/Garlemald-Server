@@ -24,8 +24,6 @@
 //!
 //! The caller is responsible for supplying the raw SubPacket bytes.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
