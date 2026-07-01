@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,12 +42,23 @@ use crate::world_master::WorldMaster;
 const BUFFER_SIZE: usize = 0xFFFF;
 const SEND_QUEUE_DEPTH: usize = 1000;
 
+/// Monotonic per-connection sequence source. Every accepted socket draws a
+/// unique `conn_seq` so a superseded connection's teardown can be told apart
+/// from the live one that replaced it (mirrors the C# reliance on object
+/// reference identity for `ClientConnection`).
+static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Thread-safe registry of live sessions, keyed by channel + id. Matches the
 /// C# pair of `mZoneSessionList` / `mChatSessionList` dictionaries.
 pub struct SessionRegistry {
     zone: Mutex<HashMap<u32, Arc<Session>>>,
     chat: Mutex<HashMap<u32, Arc<Session>>>,
     id_to_name: Mutex<HashMap<u32, String>>,
+    /// Session ids whose map-side end has been requested, mapped to the
+    /// `conn_seq` that requested it. Lets the 0x1001 end-confirm handler drop
+    /// a teardown that belongs to a superseded connection instead of wiping a
+    /// freshly-reconnected session.
+    pending_session_ends: Mutex<HashMap<u32, u64>>,
 }
 
 impl SessionRegistry {
@@ -55,6 +67,7 @@ impl SessionRegistry {
             zone: Mutex::new(HashMap::new()),
             chat: Mutex::new(HashMap::new()),
             id_to_name: Mutex::new(HashMap::new()),
+            pending_session_ends: Mutex::new(HashMap::new()),
         }
     }
 
@@ -88,6 +101,31 @@ impl SessionRegistry {
         map.lock().await.remove(&id);
     }
 
+    /// Compare-and-remove: drop the entry for `id` on `channel` only when the
+    /// session currently present carries `expected_conn_seq`. Returns whether a
+    /// removal happened. This closes the get()-then-remove() TOCTOU race — a
+    /// newer connection that took over the id between a caller's read and its
+    /// removal is left intact.
+    pub async fn remove_if(
+        &self,
+        channel: SessionChannel,
+        id: u32,
+        expected_conn_seq: u64,
+    ) -> bool {
+        let map = match channel {
+            SessionChannel::Zone => &self.zone,
+            SessionChannel::Chat => &self.chat,
+        };
+        let mut guard = map.lock().await;
+        match guard.get(&id) {
+            Some(session) if session.client.conn_seq == expected_conn_seq => {
+                guard.remove(&id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn get_name(&self, id: u32) -> Option<String> {
         self.id_to_name.lock().await.get(&id).cloned()
@@ -99,6 +137,22 @@ impl SessionRegistry {
             map.insert(id, name);
         }
     }
+
+    /// Record that a map-side session end has been requested by the connection
+    /// identified by `conn_seq`. The matching end-confirm is validated against
+    /// this so a stale teardown can be ignored.
+    pub async fn mark_pending_end(&self, session_id: u32, conn_seq: u64) {
+        self.pending_session_ends
+            .lock()
+            .await
+            .insert(session_id, conn_seq);
+    }
+
+    /// Consume the pending-end record for `session_id`, returning the
+    /// requesting `conn_seq` if one was outstanding.
+    pub async fn take_pending_end(&self, session_id: u32) -> Option<u64> {
+        self.pending_session_ends.lock().await.remove(&session_id)
+    }
 }
 
 impl Default for SessionRegistry {
@@ -107,12 +161,33 @@ impl Default for SessionRegistry {
     }
 }
 
-pub async fn run(config: Config, db: Arc<Database>, world: Arc<WorldMaster>) -> Result<()> {
+pub async fn run(
+    config: Config,
+    db: Arc<Database>,
+    world: Arc<WorldMaster>,
+    smoke: bool,
+) -> Result<()> {
     let addr = format!("{}:{}", config.bind_ip(), config.port());
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("bind {addr}"))?;
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "World",
+                    "startup",
+                    &e.to_string(),
+                    common::smoke::EXIT_STARTUP,
+                ));
+            }
+            return Err(e).with_context(|| format!("bind {addr}"));
+        }
+    };
     tracing::info!(%addr, "world server listening");
+
+    if smoke {
+        let _ = common::smoke::smoke_ok("World", &addr);
+        return Ok(());
+    }
 
     let sessions = Arc::new(SessionRegistry::new());
 
@@ -121,16 +196,20 @@ pub async fn run(config: Config, db: Arc<Database>, world: Arc<WorldMaster>) -> 
         sessions.preload_names(all).await;
     }
 
+    // Build the processor first so the zone-connection reader loop can route
+    // world<->map control packets (type >= 0x1000) through
+    // `handle_world_packet` instead of blindly relaying every subpacket to the
+    // game client.
+    let processor = Arc::new(PacketProcessor {
+        db,
+        world,
+        sessions,
+    });
+
     // Open connections to every map (zone) server advertised in
     // `server_zones`, one per unique (ip, port). Mirrors the C#
     // `WorldMaster.ConnectToZoneServers()` startup step.
-    connect_zone_servers(&db, &world, &sessions).await;
-
-    let processor = Arc::new(PacketProcessor {
-        db: db.clone(),
-        world,
-        sessions: sessions.clone(),
-    });
+    connect_zone_servers(&processor).await;
 
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -178,15 +257,33 @@ async fn handle_connection(
 
     // Before the first hello we don't know the player's id; seed with 0 and
     // let the hello handler overwrite `ClientHandle.id` via a new struct.
-    let client = ClientHandle::new(0, tx);
+    // Each accepted socket draws a unique `conn_seq` so a duplicate login can
+    // supersede this connection without a stale teardown wiping the newer one.
+    let conn_seq = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let client = ClientHandle::new(0, conn_seq, tx);
 
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut pending = 0usize;
+    // Every exit path (EOF, read error, or an eviction signal from a duplicate
+    // login) funnels through the single `handle_disconnect` call after the
+    // loop, so owned sessions are always torn down exactly once.
     loop {
-        let n = read.read(&mut buffer[pending..]).await?;
+        let n = tokio::select! {
+            read_result = read.read(&mut buffer[pending..]) => match read_result {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(%peer, client_id = client.id, error = %e, "socket read error");
+                    break;
+                }
+            },
+            _ = client.shutdown.notified() => {
+                tracing::info!(%peer, client_id = client.id, "connection superseded; shutting down");
+                break;
+            }
+        };
         if n == 0 {
             tracing::info!(%peer, client_id = client.id, "disconnected");
-            return Ok(());
+            break;
         }
         common::packet_log::log_inbound(peer, &buffer[pending..pending + n]);
         let bytes_in = pending + n;
@@ -214,6 +311,9 @@ async fn handle_connection(
         pending = bytes_in - offset;
         buffer[pending..].fill(0);
     }
+
+    processor.handle_disconnect(&client).await;
+    Ok(())
 }
 
 /// Load `server_zones` and spawn one supervisor task per unique map-server
@@ -222,12 +322,8 @@ async fn handle_connection(
 /// and retry with backoff. This decouples startup ordering: the world server
 /// can boot before the map server is listening, and transient map-server
 /// restarts automatically reattach.
-async fn connect_zone_servers(
-    db: &Arc<Database>,
-    world: &Arc<WorldMaster>,
-    sessions: &Arc<SessionRegistry>,
-) {
-    let rows = match db.get_server_zones().await {
+async fn connect_zone_servers(processor: &Arc<PacketProcessor>) {
+    let rows = match processor.db.get_server_zones().await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!(error = %e, "server_zones query failed; zones unrouted");
@@ -246,10 +342,9 @@ async fn connect_zone_servers(
     }
 
     for ((ip, port), zone_ids) in by_endpoint {
-        let world = world.clone();
-        let sessions = sessions.clone();
+        let processor = processor.clone();
         tokio::spawn(async move {
-            supervise_zone_endpoint(ip, port, zone_ids, world, sessions).await;
+            supervise_zone_endpoint(ip, port, zone_ids, processor).await;
         });
     }
 }
@@ -259,8 +354,7 @@ async fn supervise_zone_endpoint(
     ip: String,
     port: u16,
     zone_ids: Vec<u32>,
-    world: Arc<WorldMaster>,
-    sessions: Arc<SessionRegistry>,
+    processor: Arc<PacketProcessor>,
 ) {
     let addr = format!("{ip}:{port}");
     let mut backoff = Duration::from_secs(1);
@@ -280,7 +374,7 @@ async fn supervise_zone_endpoint(
         tracing::info!(%addr, "zone server connected");
         backoff = Duration::from_secs(1);
 
-        run_zone_connection(socket, &ip, port, &zone_ids, &world, &sessions).await;
+        run_zone_connection(socket, &ip, port, &zone_ids, &processor).await;
 
         tracing::warn!(%addr, retry_in = ?backoff, "zone server disconnected; will retry");
         tokio::time::sleep(backoff).await;
@@ -295,8 +389,7 @@ async fn run_zone_connection(
     ip: &str,
     port: u16,
     zone_ids: &[u32],
-    world: &Arc<WorldMaster>,
-    sessions: &Arc<SessionRegistry>,
+    processor: &Arc<PacketProcessor>,
 ) {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_DEPTH);
     let (mut read_half, mut write_half) = tokio::io::split(socket);
@@ -325,7 +418,10 @@ async fn run_zone_connection(
         outbound: tx,
     });
     for zid in zone_ids {
-        world.register_zone_server(*zid, handle.clone()).await;
+        processor
+            .world
+            .register_zone_server(*zid, handle.clone())
+            .await;
     }
 
     // Reader — parses BasePackets from the zone server, fans the inner
@@ -366,16 +462,29 @@ async fn run_zone_connection(
                 }
             };
             for sub in subs {
+                // World<->map control packets (type >= 0x1000) are session
+                // lifecycle / group signalling — they must be dispatched
+                // server-side, NOT relayed to the game client. This is what
+                // makes the 0x1000/0x1001 handlers + the pending-end stale
+                // guard reachable.
+                if sub.header.r#type >= 0x1000 {
+                    if let Err(e) = processor.handle_world_packet(&sub).await {
+                        tracing::warn!(error = %e, "world control packet handling error");
+                    }
+                    continue;
+                }
+
+                // Game data (type < 0x1000): relay to the owning session's
+                // client by target_id. Try Zone channel first; Chat sessions
+                // also receive peer-to-peer forwards, so fall back there.
                 let target = sub.header.target_id;
                 if target == 0 {
                     continue;
                 }
-                // Try Zone channel first; Chat sessions also receive
-                // peer-to-peer forwards, so fall back there.
-                let session = sessions.get(SessionChannel::Zone, target).await;
+                let session = processor.sessions.get(SessionChannel::Zone, target).await;
                 let session = match session {
                     Some(s) => Some(s),
-                    None => sessions.get(SessionChannel::Chat, target).await,
+                    None => processor.sessions.get(SessionChannel::Chat, target).await,
                 };
                 if let Some(session) = session {
                     session.client.send_bytes(sub.to_bytes()).await;
@@ -397,7 +506,80 @@ async fn run_zone_connection(
     // `routing1`/`routing2`; the writer task exits whenever those finally
     // drop. We don't await it — blocking on orphaned sessions would stall
     // reconnect.
-    world.unregister_zone_server(zone_ids).await;
+    processor.world.unregister_zone_server(zone_ids).await;
     drop(handle);
     drop(writer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session(id: u32, seq: u64) -> Arc<Session> {
+        let (tx, _rx) = mpsc::channel(1);
+        Arc::new(Session::new(
+            id,
+            SessionChannel::Zone,
+            ClientHandle::new(id, seq, tx),
+        ))
+    }
+
+    #[tokio::test]
+    async fn add_then_get_returns_the_session() {
+        let registry = SessionRegistry::new();
+        registry
+            .add(SessionChannel::Zone, 42, make_session(42, 1))
+            .await;
+
+        let got = registry.get(SessionChannel::Zone, 42).await;
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().session_id, 42);
+    }
+
+    #[tokio::test]
+    async fn add_twice_get_returns_newer_conn_seq() {
+        let registry = SessionRegistry::new();
+        registry
+            .add(SessionChannel::Zone, 7, make_session(7, 1))
+            .await;
+        registry
+            .add(SessionChannel::Zone, 7, make_session(7, 2))
+            .await;
+
+        let got = registry.get(SessionChannel::Zone, 7).await.unwrap();
+        assert_eq!(got.client.conn_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn remove_if_spares_a_newer_session_and_removes_the_matching_one() {
+        let registry = SessionRegistry::new();
+        // An older connection (seq 1) is superseded by a newer one (seq 2) on
+        // the same id — the newer session is what's live in the map.
+        registry
+            .add(SessionChannel::Zone, 7, make_session(7, 1))
+            .await;
+        registry
+            .add(SessionChannel::Zone, 7, make_session(7, 2))
+            .await;
+
+        // The OLDER conn_seq must NOT evict the newer live session.
+        assert!(!registry.remove_if(SessionChannel::Zone, 7, 1).await);
+        assert!(registry.get(SessionChannel::Zone, 7).await.is_some());
+
+        // The matching (newer) conn_seq removes it.
+        assert!(registry.remove_if(SessionChannel::Zone, 7, 2).await);
+        assert!(registry.get(SessionChannel::Zone, 7).await.is_none());
+
+        // Removing a missing id is a no-op that reports false.
+        assert!(!registry.remove_if(SessionChannel::Zone, 7, 2).await);
+    }
+
+    #[tokio::test]
+    async fn mark_then_take_pending_end_is_consumed_once() {
+        let registry = SessionRegistry::new();
+        registry.mark_pending_end(99, 5).await;
+
+        assert_eq!(registry.take_pending_end(99).await, Some(5));
+        assert_eq!(registry.take_pending_end(99).await, None);
+    }
 }

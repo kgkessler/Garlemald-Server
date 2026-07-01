@@ -118,6 +118,7 @@ impl PacketProcessor {
                 0x0B => replies.extend(self.handle_modify_character(session, &sub).await?),
                 other => {
                     tracing::warn!(opcode = format!("0x{other:X}"), "unknown opcode; ignoring");
+                    common::packet_diagnostics::log_unknown_game_message("lobby", "lobby", &sub);
                 }
             }
         }
@@ -319,6 +320,38 @@ impl PacketProcessor {
             world_id = chara.server_id;
         }
 
+        // MAKE-only rehydrate: if the RESERVE -> MAKE reservation scratch state
+        // was lost (dropped/reconnected session), recover it from the reserved
+        // (state = 0) row so the follow-up make doesn't orphan a `characterId=0`
+        // row. Only runs for CMD_MAKE and only when the session is missing a
+        // world, cid, or name.
+        if should_recover_reservation(
+            req.command,
+            world_id,
+            session.new_chara_cid,
+            session.new_chara_name.is_empty(),
+        ) && let Ok(Some(reserved)) = self
+            .db
+            .get_reserved_character(session.current_user_id)
+            .await
+        {
+            session.new_chara_cid = reserved.id;
+            session.new_chara_slot = reserved.slot;
+            session.new_chara_world_id = reserved.server_id;
+            session.new_chara_name = reserved.name.clone();
+            // Track the recovered reservation's world unconditionally so the
+            // get_server validation + world_name reply below reflect it (a
+            // stale non-zero world_id from the lost session must not win).
+            world_id = reserved.server_id;
+            name = reserved.name;
+            tracing::info!(
+                user_id = session.current_user_id,
+                cid = session.new_chara_cid,
+                name = %session.new_chara_name,
+                "recovered reserved character"
+            );
+        }
+
         let world = self
             .db
             .get_server(world_id as u32)
@@ -407,6 +440,22 @@ impl PacketProcessor {
                     _ => {}
                 }
 
+                if reservation_missing(session.new_chara_cid, session.new_chara_name.is_empty()) {
+                    let mut err = error_packet(
+                        req.sequence,
+                        0,
+                        0,
+                        13001,
+                        "Character reservation was not found, please create the character again.",
+                    );
+                    err.set_target_id(0xe0006868);
+                    tracing::warn!(
+                        user_id = session.current_user_id,
+                        "character make rejected: reservation not found"
+                    );
+                    return Ok(vec![Reply::Encrypted(vec![err])]);
+                }
+
                 self.db
                     .make_character(session.current_user_id, session.new_chara_cid, &info)
                     .await?;
@@ -455,6 +504,27 @@ impl PacketProcessor {
     }
 }
 
+/// Whether a character-modify request should try to rehydrate its
+/// reservation scratch state from the persisted `state = 0` row. Recovery is
+/// MAKE-only, and only when the in-memory scratchpad is missing a world, cid,
+/// or name (the RESERVE -> MAKE session was dropped/reconnected). Keeping this
+/// decision pure makes the reconnection edge cases directly testable.
+fn should_recover_reservation(
+    command: u8,
+    world_id: u16,
+    new_chara_cid: u32,
+    new_chara_name_is_empty: bool,
+) -> bool {
+    command == CharacterModifyPacket::CMD_MAKE
+        && (world_id == 0 || new_chara_cid == 0 || new_chara_name_is_empty)
+}
+
+/// Whether a CMD_MAKE lacks a usable reservation and must be rejected with
+/// error 13001 (reservation not found). Evaluated after any recovery attempt.
+fn reservation_missing(new_chara_cid: u32, new_chara_name_is_empty: bool) -> bool {
+    new_chara_cid == 0 || new_chara_name_is_empty
+}
+
 /// Build the MD5-based Blowfish key from the ticket phrase + client number.
 /// Byte layout matches the C# `GenerateKey` helper:
 /// `[0x78, 0x56, 0x34, 0x12, clientNumber_le, 0xE8, 0x03, 0x00, 0x00, ticket...]`
@@ -498,5 +568,45 @@ mod tests {
         let a = generate_blowfish_key("hello", 0x1);
         let b = generate_blowfish_key("hello", 0x2);
         assert_ne!(a, b);
+    }
+
+    // -- reservation recovery decision (CMD_MAKE) --------------------------
+
+    const MAKE: u8 = CharacterModifyPacket::CMD_MAKE;
+    const RESERVE: u8 = CharacterModifyPacket::CMD_RESERVE;
+
+    #[test]
+    fn recovers_make_with_empty_session_scratch() {
+        // (a) MAKE with an empty scratchpad (no world/cid/name) must attempt
+        // recovery so an existing state=0 reservation can be rehydrated.
+        assert!(should_recover_reservation(MAKE, 0, 0, true));
+        // Any single missing field is enough to trigger recovery.
+        assert!(should_recover_reservation(MAKE, 0, 5, false));
+        assert!(should_recover_reservation(MAKE, 1, 0, false));
+        assert!(should_recover_reservation(MAKE, 1, 5, true));
+    }
+
+    #[test]
+    fn skips_recovery_when_make_scratch_is_complete() {
+        // A fully-populated scratchpad needs no recovery.
+        assert!(!should_recover_reservation(MAKE, 1, 5, false));
+    }
+
+    #[test]
+    fn non_make_command_never_recovers() {
+        // (c) A non-MAKE command must never trigger reservation recovery, even
+        // with a fully-empty scratchpad.
+        assert!(!should_recover_reservation(RESERVE, 0, 0, true));
+        assert!(!should_recover_reservation(0x03, 0, 0, true));
+    }
+
+    #[test]
+    fn reservation_missing_flags_empty_scratch() {
+        // (b) With no recovered cid/name, MAKE must be rejected (→ 13001).
+        assert!(reservation_missing(0, true));
+        assert!(reservation_missing(0, false));
+        assert!(reservation_missing(5, true));
+        // A recovered cid + name means the reservation is present.
+        assert!(!reservation_missing(5, false));
     }
 }

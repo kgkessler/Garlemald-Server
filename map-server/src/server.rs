@@ -46,12 +46,32 @@ pub async fn run(
     registry: Arc<ActorRegistry>,
     lua: Arc<LuaEngine>,
     cmd: Arc<CommandProcessor>,
+    smoke: bool,
 ) -> Result<()> {
     let addr = format!("{}:{}", config.bind_ip(), config.port());
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("bind {addr}"))?;
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            if smoke {
+                std::process::exit(common::smoke::smoke_fail(
+                    "Map",
+                    "startup",
+                    &e.to_string(),
+                    common::smoke::EXIT_STARTUP,
+                ));
+            }
+            return Err(e).with_context(|| format!("bind {addr}"));
+        }
+    };
     tracing::info!(%addr, "map server listening");
+
+    // `--smoke`: the listener bound successfully (and the content catalogs
+    // loaded upstream in `lib::run`), so report success and exit before the
+    // accept loop — mirroring lobby/world/web.
+    if smoke {
+        let _ = common::smoke::smoke_ok("Map", &addr);
+        return Ok(());
+    }
 
     let processor = Arc::new(PacketProcessor {
         db,

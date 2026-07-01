@@ -140,6 +140,13 @@ pub struct LaunchArgs {
     pub db_path: Option<PathBuf>,
     #[arg(long = "world-id")]
     pub world_id: Option<u32>,
+    /// Boot only far enough to validate config + DB, print a SMOKE_OK /
+    /// SMOKE_FAIL marker, then exit (CI/dev fail-fast).
+    #[arg(long)]
+    pub smoke: bool,
+    /// Suppress the interactive stdin console (no-op on servers without one).
+    #[arg(long = "no-console")]
+    pub no_console: bool,
     #[arg(long, default_value = "./configs/world.toml")]
     pub config: String,
 }
