@@ -4853,17 +4853,21 @@ impl UserData for LuaItemPackage {
             }
             Ok(())
         });
-        methods.add_method("RemoveItem", |_, this, catalog: u32| {
-            push(
-                &this.queue,
-                LuaCommand::RemoveItem {
-                    actor_id: this.owner_actor_id,
-                    item_package: this.package_code,
-                    server_item_id: catalog as u64,
-                },
-            );
-            Ok(())
-        });
+        methods.add_method(
+            "RemoveItem",
+            |_, this, (catalog, quantity): (u32, Option<i32>)| {
+                push(
+                    &this.queue,
+                    LuaCommand::RemoveItem {
+                        actor_id: this.owner_actor_id,
+                        item_package: this.package_code,
+                        catalog_id: catalog,
+                        quantity: quantity.unwrap_or(1),
+                    },
+                );
+                Ok(())
+            },
+        );
         // `package:HasItem(catalogId, [minQty])` — answer locally from
         // the inventory snapshot the owning `LuaPlayer` cloned in at
         // `GetItemPackage(...)` time. Mirrors C#

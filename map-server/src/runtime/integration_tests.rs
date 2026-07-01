@@ -1111,6 +1111,230 @@ async fn apply_add_gil_emits_currency_bracket_and_obtain_toast() {
     );
 }
 
+/// Inventory live-producer increment 1 — a mid-session NORMAL `AddItem`
+/// persists via `add_harvest_item` AND pushes a no-wipe single-package
+/// bracket to the owning client: `0x016D(no-wipe) → 0x0146(200, 0) →
+/// 0x0148(ListX01) → 0x0147 → 0x016E`, every subpacket target-stamped
+/// (proxy rule), the X01 row carrying the new stack's total. DB reflects
+/// the granted quantity.
+#[tokio::test]
+async fn live_add_item_emits_normal_no_wipe_bracket() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const ITEM_ID: u32 = 10_009_001;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Baggins Bagholder')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    registry
+        .insert(ActorHandle::new(
+            42,
+            ActorKindTag::Player,
+            230,
+            42,
+            Character::new(42),
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_add_item(
+        42,
+        crate::inventory::PKG_NORMAL,
+        ITEM_ID,
+        5,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+
+    // DB reflects the grant.
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_NORMAL as u32)
+        .await
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.item_id == ITEM_ID)
+        .expect("NORMAL row for the granted item");
+    assert_eq!(row.quantity, 5, "DB carries the granted quantity");
+
+    // Wire: exactly the 5-subpacket no-wipe bracket.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_LIST_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "no-wipe NORMAL bracket; saw {opcodes:?}",
+    );
+    // BeginChange data[0] == 0 → no wipe.
+    assert_eq!(subs[0].data[0], 0, "begin_change must be no-wipe");
+    // SetBegin body: u32 actor, u16 capacity 200, u16 code 0 (NORMAL).
+    let set_begin = &subs[1].data;
+    assert_eq!(
+        u16::from_le_bytes([set_begin[4], set_begin[5]]),
+        crate::inventory::CAP_NORMAL,
+    );
+    assert_eq!(
+        u16::from_le_bytes([set_begin[6], set_begin[7]]),
+        crate::inventory::PKG_NORMAL,
+    );
+    // X01 record: u64 unique_id, i32 quantity @8, u32 item_id @12.
+    let item = &subs[2].data;
+    let qty = i32::from_le_bytes([item[8], item[9], item[10], item[11]]);
+    let item_id = u32::from_le_bytes([item[12], item[13], item[14], item[15]]);
+    let unique_id = u64::from_le_bytes(item[..8].try_into().unwrap());
+    assert_eq!(qty, 5, "X01 carries the post-grant stack total");
+    assert_eq!(item_id, ITEM_ID, "X01 carries the granted catalog id");
+    assert_ne!(unique_id, 0, "X01 carries the real server_items.id");
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+}
+
+/// Inventory live-producer increment 1 — a mid-session `RemoveItem` that
+/// fully drains a stack frees its slot: DB row deleted, and the owning
+/// client sees a no-wipe bracket carrying a `RemoveX01` for the freed
+/// slot (`0x016D(no-wipe) → 0x0146(200, 0) → 0x0152(RemoveX01) → 0x0147 →
+/// 0x016E`), every subpacket target-stamped.
+#[tokio::test]
+async fn live_remove_item_emits_remove_bracket() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const ITEM_ID: u32 = 10_009_002;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Baggins Bagholder')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Seed a 5-stack in the NORMAL bag (slot 0).
+    assert_eq!(db.add_harvest_item(42, ITEM_ID, 5, 1).await.unwrap(), 5);
+
+    registry
+        .insert(ActorHandle::new(
+            42,
+            ActorKindTag::Player,
+            230,
+            42,
+            Character::new(42),
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    // Remove the whole stack → depleted → slot freed.
+    crate::runtime::quest_apply::apply_remove_item(
+        42,
+        crate::inventory::PKG_NORMAL,
+        ITEM_ID,
+        5,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+
+    // DB row is gone.
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_NORMAL as u32)
+        .await
+        .unwrap();
+    assert!(
+        !rows.iter().any(|r| r.item_id == ITEM_ID),
+        "depleted stack must be deleted from the bag; got {rows:?}",
+    );
+
+    // Wire: no-wipe bracket with a RemoveX01 for the freed slot 0.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_REMOVE_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "no-wipe remove bracket; saw {opcodes:?}",
+    );
+    assert_eq!(subs[0].data[0], 0, "begin_change must be no-wipe");
+    // RemoveX01 body: u16 slot @0 == freed slot 0.
+    let remove = &subs[2].data;
+    assert_eq!(
+        u16::from_le_bytes([remove[0], remove[1]]),
+        0,
+        "RemoveX01 must free the depleted slot (0)",
+    );
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+}
+
 /// Wave 3 — `apply_earn_achievement` end-to-end: a first-time earn
 /// persists to `characters_achievements` AND dispatches the earned toast
 /// (0x019E) + points (0x019C) + latest-5 (0x019B) to the owning client,

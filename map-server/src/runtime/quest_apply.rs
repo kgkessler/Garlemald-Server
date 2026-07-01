@@ -3328,6 +3328,27 @@ pub async fn apply_add_item(
                 total,
                 "AddItem applied",
             );
+            // Live no-wipe refresh: push the freshly-changed NORMAL rows to
+            // the owning client mid-session so the bag renders the new
+            // stack without a re-zone (mirrors `apply_add_gil` →
+            // `send_gil_update`). `world: None` keeps the DB-only behaviour
+            // for callers without a live zone (tests, batch seeders).
+            // NOTE: mid-session-added items still vanish on the NEXT
+            // zone-in because `send_zone_in_bundle` re-sends empty NORMAL
+            // brackets — a documented limitation gated behind the separate
+            // bulk bag-load Wine RCA, not a regression here.
+            if let Some(world) = world {
+                send_inventory_package_update(
+                    actor_id,
+                    crate::inventory::PKG_NORMAL,
+                    crate::inventory::CAP_NORMAL,
+                    Some(item_id),
+                    registry,
+                    world,
+                    db,
+                )
+                .await;
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -4416,6 +4437,194 @@ async fn send_gil_update(
         );
         pkt.set_target_id(session_id);
         client.send_bytes(pkt.to_bytes()).await;
+    }
+}
+
+/// Resolve `actor_id`'s owning client and emit a NO-WIPE single-package
+/// inventory bracket wrapping `middle` (the per-row `ListX01` / `RemoveX01`
+/// subpackets). Every subpacket is stamped with the session id — the world
+/// proxy drops `target_id == 0` frames.
+///
+/// Shape mirrors `send_gil_update`:
+///   `InventoryBeginChange(no-wipe) 0x016D` →
+///   `InventorySetBegin(cap, code) 0x0146` → `middle…` →
+///   `InventorySetEnd 0x0147` → `InventoryEndChange 0x016E`.
+///
+/// No-ops cleanly when the player isn't registered or has no live session.
+async fn send_inventory_bracket(
+    actor_id: u32,
+    cap: u16,
+    code: u16,
+    middle: Vec<common::subpacket::SubPacket>,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    use crate::packets::send::actor_inventory as inv;
+    let mut subs = Vec::with_capacity(middle.len() + 4);
+    subs.push(inv::build_inventory_begin_change(actor_id, false));
+    subs.push(inv::build_inventory_set_begin(actor_id, cap, code));
+    subs.extend(middle);
+    subs.push(inv::build_inventory_set_end(actor_id));
+    subs.push(inv::build_inventory_end_change(actor_id));
+    for mut sub in subs {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+}
+
+/// Package-generic mid-session inventory refresh. Re-reads the authoritative
+/// rows from the DB AFTER the mutation (so the wire carries the real
+/// `server_items.id` the client tracks by), then emits a no-wipe bracket for
+/// the changed rows via [`send_inventory_bracket`].
+///
+/// `changed_item_id = Some(id)` emits a `ListX01` for EVERY row whose
+/// `item_id == id` — critical for multi-slot spill, where a stack that hit
+/// the cap spilled into a second slot and both rows must render. `None`
+/// emits every row in the package.
+///
+/// Written cap+code-generic (the proven `send_gil_update` template) so
+/// key-items / loot / bazaar can reuse it once their per-table persistence
+/// lands. Never wipes and never touches the crashy bulk zone-in bag-load.
+pub(crate) async fn send_inventory_package_update(
+    actor_id: u32,
+    package_code: u16,
+    cap: u16,
+    changed_item_id: Option<u32>,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    let rows = db
+        .get_item_package(actor_id, package_code as u32)
+        .await
+        .unwrap_or_default();
+    use crate::packets::send::actor_inventory as inv;
+    let middle: Vec<common::subpacket::SubPacket> = rows
+        .iter()
+        .filter(|r| changed_item_id.map(|id| r.item_id == id).unwrap_or(true))
+        .map(|r| inv::build_inventory_list_x01(actor_id, r))
+        .collect();
+    if middle.is_empty() {
+        return;
+    }
+    send_inventory_bracket(actor_id, cap, package_code, middle, registry, world).await;
+}
+
+/// `package:RemoveItem(catalogId[, quantity])` drain. Removes up to
+/// `quantity` of `catalog_id` from `item_package`, walking the matching
+/// stacks back-to-front (highest slot first, mirroring
+/// `ItemPackage::remove`): a stack larger than the remaining count is
+/// decremented in place (`db.set_quantity`, emits an updated `ListX01`); a
+/// stack that fully drains frees its slot (`db.remove_item`, emits a
+/// `RemoveX01` for the freed slot). The updates + removes ship in one
+/// no-wipe bracket stamped to the owning client.
+///
+/// `world: None` keeps the DB-only behaviour for callers without a live
+/// zone (integration tests, batch tooling).
+pub async fn apply_remove_item(
+    actor_id: u32,
+    item_package: u16,
+    catalog_id: u32,
+    quantity: i32,
+    registry: &ActorRegistry,
+    world: Option<&WorldManager>,
+    db: &Database,
+) {
+    if quantity <= 0 || catalog_id == 0 {
+        return;
+    }
+    let rows = match db.get_item_package(actor_id, item_package as u32).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                actor = actor_id,
+                package = item_package,
+                item = catalog_id,
+                err = %e,
+                "RemoveItem: DB read failed",
+            );
+            return;
+        }
+    };
+    let mut remaining = quantity;
+    let mut updated: Vec<crate::data::InventoryItem> = Vec::new();
+    let mut freed_slots: Vec<u16> = Vec::new();
+    // Back-to-front: drain the tail stacks before the head so the head
+    // (lowest slot) stack is the last to shrink/disappear.
+    for row in rows.iter().rev() {
+        if remaining <= 0 {
+            break;
+        }
+        if row.item_id != catalog_id {
+            continue;
+        }
+        if row.quantity > remaining {
+            let new_qty = row.quantity - remaining;
+            if let Err(e) = db.set_quantity(row.unique_id, new_qty).await {
+                tracing::warn!(
+                    actor = actor_id,
+                    item = catalog_id,
+                    err = %e,
+                    "RemoveItem: set_quantity failed",
+                );
+                return;
+            }
+            let mut r = row.clone();
+            r.quantity = new_qty;
+            updated.push(r);
+            remaining = 0;
+        } else {
+            if let Err(e) = db.remove_item(actor_id, row.unique_id).await {
+                tracing::warn!(
+                    actor = actor_id,
+                    item = catalog_id,
+                    err = %e,
+                    "RemoveItem: remove_item failed",
+                );
+                return;
+            }
+            freed_slots.push(row.slot);
+            remaining -= row.quantity;
+        }
+    }
+    if updated.is_empty() && freed_slots.is_empty() {
+        tracing::debug!(
+            actor = actor_id,
+            item = catalog_id,
+            qty = quantity,
+            "RemoveItem: no matching stack — no-op",
+        );
+        return;
+    }
+    tracing::info!(
+        actor = actor_id,
+        package = item_package,
+        item = catalog_id,
+        removed = quantity - remaining.max(0),
+        "RemoveItem applied",
+    );
+    if let Some(world) = world {
+        use crate::packets::send::actor_inventory as inv;
+        let mut middle: Vec<common::subpacket::SubPacket> =
+            Vec::with_capacity(updated.len() + freed_slots.len());
+        for r in &updated {
+            middle.push(inv::build_inventory_list_x01(actor_id, r));
+        }
+        for slot in &freed_slots {
+            middle.push(inv::build_inventory_remove_x01(actor_id, *slot));
+        }
+        let cap = crate::inventory::default_capacity(item_package);
+        send_inventory_bracket(actor_id, cap, item_package, middle, registry, world).await;
     }
 }
 

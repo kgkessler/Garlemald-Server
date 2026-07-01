@@ -439,7 +439,11 @@ pub enum LuaCommand {
     RemoveItem {
         actor_id: u32,
         item_package: u16,
-        server_item_id: u64,
+        /// Catalog (gamedata) id of the item to remove — matches what the
+        /// Lua `package:RemoveItem(catalogId, ...)` binding actually passes.
+        catalog_id: u32,
+        /// How many to remove (defaults to 1 in the binding).
+        quantity: i32,
     },
     AddQuest {
         player_id: u32,

@@ -2814,7 +2814,8 @@ impl Database {
                         sd.dealingAttached2, sd.dealingAttached3, sd.dealingTag, sd.bazaarMode,
                         sm.durability, sm.mainQuality, sm.subQuality1, sm.subQuality2, sm.subQuality3,
                         sm.param1, sm.param2, sm.param3, sm.spiritbind,
-                        sm.materia1, sm.materia2, sm.materia3, sm.materia4, sm.materia5
+                        sm.materia1, sm.materia2, sm.materia3, sm.materia4, sm.materia5,
+                        ci.slot
                       FROM characters_inventory ci
                       INNER JOIN server_items si ON ci.serverItemId = si.id
                       LEFT JOIN server_items_modifiers sm ON si.id = sm.id
@@ -2829,6 +2830,15 @@ impl Database {
                             item_id: r.get::<_, u32>(1).unwrap_or_default(),
                             quantity: r.get::<_, i32>(3).unwrap_or(1),
                             quality: r.get::<_, u8>(4).unwrap_or(1),
+                            // ci.slot is the authoritative in-package
+                            // position; `link_slot = 0xFFFF` (not-linked)
+                            // makes `encode_item` render `slot` on the wire
+                            // rather than a stale 0. `item_package` echoes
+                            // the queried package so downstream builders can
+                            // read it back off the row.
+                            slot: r.get::<_, u16>(26).unwrap_or_default(),
+                            link_slot: 0xFFFF,
+                            item_package: item_package as u16,
                             tag: ItemTag {
                                 durability: r.get::<_, u32>(12).unwrap_or_default(),
                                 main_quality: r.get::<_, u8>(13).unwrap_or_default(),
@@ -2839,7 +2849,6 @@ impl Database {
                                 materia_id: r.get::<_, u32>(21).unwrap_or_default(),
                                 ..Default::default()
                             },
-                            ..Default::default()
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;
