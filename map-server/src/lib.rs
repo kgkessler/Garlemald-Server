@@ -111,7 +111,13 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let world = Arc::new(WorldManager::new());
+    let world = Arc::new(WorldManager::new().with_world_settings(
+        crate::world_manager::WorldSettings {
+            dalamud_phase: config.world.dalamud_phase,
+            weather_id: config.world.weather_id,
+            weather_transition: config.world.weather_transition,
+        },
+    ));
     let registry = Arc::new(ActorRegistry::new());
     let lua = Arc::new(LuaEngine::new(config.script_root().to_path_buf()));
 
