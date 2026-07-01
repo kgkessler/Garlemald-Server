@@ -337,11 +337,12 @@ impl Player {
     // ----- Home points / initial town --------------------------------------
 
     pub fn get_initial_town(&self) -> u8 {
-        // Not held on Player directly in the C# shape; mirror that by
-        // deferring to the inventory-summary-less CharaState helpers. For
-        // now return 0 when no slot is set — the real value is loaded in
-        // by `Database::load_player_character`.
-        0
+        // The real starting-city id is hydrated onto `CharaState` at
+        // session-begin (`processor::handle_session_begin`, from
+        // `LoadedPlayer::initial_town`). Read it from the live
+        // `Character` here so the `LuaPlayer` snapshot / `GetInitialTown`
+        // binding reflects the persisted value rather than a hardcoded 0.
+        self.character.chara.initial_town
     }
 
     pub fn get_home_point(&self) -> u32 {
@@ -625,5 +626,34 @@ mod tests {
         assert_eq!(p.get_current_gil(), 0);
         p.helpers.inventory_summary.insert(1_000_001, 42);
         assert_eq!(p.get_current_gil(), 42);
+    }
+
+    #[test]
+    fn snapshot_carries_profile_fields_from_chara_state() {
+        use crate::lua::userdata::PlayerSnapshot;
+
+        // Arrange — hydrate the profile fields the way session-begin
+        // does (from LoadedPlayer) so the fixed snapshot builders have
+        // real, non-zero values to read.
+        let mut p = fresh_player();
+        p.character.chara.initial_town = 2; // Gridania
+        p.character.chara.tribe = 3;
+        p.character.chara.guardian = 5;
+        p.character.chara.birthday_month = 7;
+        p.character.chara.birthday_day = 14;
+
+        // Act — the two fixed accessor paths.
+        let initial_town = p.get_initial_town();
+        let snapshot = PlayerSnapshot::from(&p);
+
+        // Assert — get_initial_town no longer hardcodes 0.
+        assert_eq!(initial_town, 2);
+        // Assert — the From<&Player> snapshot carries the real profile
+        // fields instead of zeroing them.
+        assert_eq!(snapshot.initial_town, 2);
+        assert_eq!(snapshot.tribe, 3);
+        assert_eq!(snapshot.guardian, 5);
+        assert_eq!(snapshot.birth_month, 7);
+        assert_eq!(snapshot.birth_day, 14);
     }
 }
