@@ -246,6 +246,21 @@ pub async fn apply_runtime_lua_command(
             .await;
             true
         }
+        // `player:SendMessage(messageType, sender, text)` from a
+        // quest/NPC hook — the raw 0x0003 chat-log line (shop/retainer
+        // error feedback, new-player notices, NPC-linkshell glow toast
+        // `[sheet:...]`). Previously fell through to the "unhandled" log,
+        // so all 101 live `:SendMessage(...)` call sites were silently
+        // dropped on the runtime drain path.
+        LC::SendMessage {
+            actor_id,
+            message_type,
+            sender,
+            text,
+        } => {
+            apply_send_message(actor_id, message_type, &sender, &text, registry, world).await;
+            true
+        }
         // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
         // linkshell narration line (0x0161 DispId-sender family).
         LC::SendGameMessageLocalizedDisplayName {
@@ -4445,6 +4460,50 @@ pub(crate) async fn apply_send_game_message(
         log = format!("0x{log_type:02X}"),
         params = params.len(),
         "SendGameMessage emitted",
+    );
+}
+
+/// `player:SendMessage(messageType, sender, text)` — emit one raw
+/// chat-log line (0x0003 `SendMessagePacket`) into the invoking
+/// player's own client. Covers MESSAGE_TYPE_SYSTEM (0x20) yellow log
+/// lines, new-player notices, shop/retainer error feedback, and
+/// quest-script debug/progress echoes. Self-only, target-stamped (the
+/// builder stamps the target session so the world proxy relays it).
+/// Mirrors the send/target-stamp shape of [`apply_send_game_message`].
+pub(crate) async fn apply_send_message(
+    actor_id: u32,
+    message_type: u8,
+    sender: &str,
+    text: &str,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    // build_send_message stamps target_id = session_id internally; for a
+    // self-message the source and target sessions are the same player.
+    let sub = crate::packets::send::build_send_message(
+        session_id,
+        session_id,
+        message_type,
+        sender,
+        text,
+    );
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        actor = actor_id,
+        kind = format!("0x{message_type:02X}"),
+        %sender,
+        %text,
+        "SendMessage emitted",
     );
 }
 
