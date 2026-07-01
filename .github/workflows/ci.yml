@@ -1,7 +1,8 @@
 name: CI
 
-# Build + test + fmt/clippy gate on every push and PR to ALL branches, so no
-# merge lands without a green build + passing tests. See issue #14.
+# Build + test + content walkthroughs + service smoke-boot + fmt/clippy gate on
+# every push and PR to ALL branches, so no merge lands without a green build +
+# passing tests. See issue #14.
 on:
   pull_request:
     branches: ['**']
@@ -17,7 +18,7 @@ concurrency:
 permissions:
   contents: read
 
-# The four gates are independent jobs (no `needs:` between them) so they run in
+# The six gates are independent jobs (no `needs:` between them) so they run in
 # parallel and ALL signals surface even when one fails — there is no fail-fast
 # coupling across separate jobs.
 #
@@ -71,3 +72,38 @@ jobs:
         with:
           rustflags: ""
       - run: cargo test --workspace --locked
+
+  # content-test is a standalone `main()` driver (not a `#[test]`), so the `test`
+  # job above never runs it. It drives the real map-server content engine
+  # in-process through the SEQ_000 tutorial, the SEQ_005 live-combat force-kill,
+  # and the SEQ_010 hand-off for all three starting-city MSQ routes, exiting
+  # non-zero on any failed walkthrough case. Debug profile: the SEQ_005 legs sleep
+  # on a real wall clock regardless of profile, so a release build only adds
+  # compile time. `timeout-minutes` bounds those wall-clock beats so a stuck
+  # director fails instead of burning the 6h default.
+  content-test:
+    name: content-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      # Run from the repo root so it resolves ./scripts/lua + ./scripts/tests.
+      - run: cargo run --locked -p content-test
+
+  # smoke boots each service in `--smoke` mode against a throwaway SQLite DB and
+  # asserts a SMOKE_OK marker + exit 0 (a bind/config/DB/catalog-load failure is
+  # reported as SMOKE_FAIL → non-zero). This covers the end-to-end boot path the
+  # unit-level `test` job cannot. PROFILE=debug avoids a second release build.
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - run: PROFILE=debug scripts/smoke-local.sh
