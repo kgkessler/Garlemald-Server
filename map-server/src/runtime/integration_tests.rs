@@ -4066,6 +4066,113 @@ async fn lua_gather_node_metadata_binding_resolves_installed_key() {
     let _ = std::fs::remove_file(&probe);
 }
 
+/// End-to-end clicked-node threading: the harvest-command dispatch stamps
+/// the struck gather node's `(zone_id, unique_id)` onto the `commandActor`
+/// userdata, so a command script can resolve the node's template via
+/// `GetGatherNodeMetadata(commandActor:GetZoneID(), commandActor:GetUniqueId())`
+/// instead of the hardcoded tutorial mine. Drives the real
+/// `LuaEngine::call_command_on_event_started` command path (the same one
+/// `DummyCommand.lua` runs through) with a minimal probe script.
+/// (Wave 3 gather partial.)
+#[tokio::test]
+async fn command_actor_identity_threads_clicked_gather_node() {
+    use crate::lua::LuaEngine;
+    use crate::lua::command::LuaCommand;
+    use crate::lua::userdata::PlayerSnapshot;
+    use crate::world_manager::GatherNodeMetadata;
+    use std::collections::HashMap;
+
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-gather-cmd-identity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("commands")).unwrap();
+    // Probe command script: resolve the clicked node off `commandActor`
+    // and echo the resolved template via an AddItem so the test can
+    // inspect it. Empty identity (no node) resolves to nil → no AddItem.
+    let probe = root.join("commands/__probe_gather_identity.lua");
+    std::fs::write(
+        &probe,
+        r#"
+        function onEventStarted(player, commandActor, triggerName)
+            local meta = GetGatherNodeMetadata(commandActor:GetZoneID(), commandActor:GetUniqueId())
+            if meta ~= nil then
+                player:GetItemPackage(0):AddItem(meta.harvestNodeId, meta.harvestType)
+            end
+        end
+        "#,
+    )
+    .unwrap();
+
+    let engine = LuaEngine::new(&root);
+    let mut metadata: HashMap<(u32, String), GatherNodeMetadata> = HashMap::new();
+    metadata.insert(
+        (180, "logging_bramble_gridania_1".to_string()),
+        GatherNodeMetadata {
+            harvest_node_id: 2001,
+            harvest_type: crate::gathering::HARVEST_TYPE_LOG,
+        },
+    );
+    engine.catalogs().install_gather_node_metadata(metadata);
+
+    let snapshot = PlayerSnapshot {
+        actor_id: 0x1234_5678,
+        ..Default::default()
+    };
+
+    // Resolved node → the probe reads its (zone, unique) off commandActor
+    // and resolves the LOG template (2001 / HARVEST_TYPE_LOG).
+    let resolved = engine.call_command_on_event_started(
+        &probe,
+        snapshot.clone(),
+        0xA0F0_0000 | crate::gathering::HARVEST_TYPE_LOG, // Log command static actor
+        "commandRequest".to_string(),
+        0,
+        Vec::new(),
+        Some((180, "logging_bramble_gridania_1".to_string())),
+    );
+    assert!(
+        resolved.error.is_none(),
+        "probe onEventStarted errored: {:?}",
+        resolved.error,
+    );
+    assert!(
+        resolved.commands.iter().any(|c| matches!(
+            c,
+            LuaCommand::AddItem { item_id, quantity, .. }
+                if *item_id == 2001 && *quantity == crate::gathering::HARVEST_TYPE_LOG as i32
+        )),
+        "clicked node must resolve to its own template; got {:?}",
+        resolved.commands,
+    );
+
+    // No resolved node (server couldn't map the target) → empty identity,
+    // GetGatherNodeMetadata(0, "") is nil, no template echoed.
+    let unresolved = engine.call_command_on_event_started(
+        &probe,
+        snapshot,
+        0xA0F0_0000 | crate::gathering::HARVEST_TYPE_MINE,
+        "commandRequest".to_string(),
+        0,
+        Vec::new(),
+        None,
+    );
+    assert!(unresolved.error.is_none());
+    assert!(
+        !unresolved
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::AddItem { .. })),
+        "an unresolved node must not echo any template; got {:?}",
+        unresolved.commands,
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---------------------------------------------------------------------------
 // Retainer — Tier 4 #14
 // ---------------------------------------------------------------------------
@@ -11400,6 +11507,78 @@ async fn accept_regional_leve_installs_journal_entry_and_persists() {
         0,
         "ACCEPTED bit persisted",
     );
+}
+
+/// Seed 066 wiring: a levemete UI card (guildleve plate) id resolves
+/// through the catalog to the expected seeded battlecraft leve id, and
+/// feeding that resolved id into `apply_accept_regional_leve` journals
+/// the leve. Exercises the full levemete-side path the
+/// PopulaceGuildlevePublisher accept branch now drives:
+/// `resolver:LeveForCard(card)` -> `player:AcceptRegionalLeve(leveId, 0)`.
+#[tokio::test]
+async fn card_id_resolves_to_seeded_leve_and_accept_journals() {
+    use crate::runtime::quest_apply::apply_accept_regional_leve;
+    use common::db::ConnCallExt;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (311, 0, 0, 0, 'CardAccepter')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let lua = Arc::new(crate::lua::LuaEngine::new(&script_root));
+    let resolver = db.load_regional_leve_resolver().await.unwrap();
+
+    // Card 0x30C3 is the first battlecraft card the levemete script
+    // renders; seed 066 maps it to leve 140_001.
+    let leve = resolver
+        .leve_for_plate(0x30C3)
+        .expect("card 0x30C3 maps to a seeded leve");
+    assert_eq!(leve.id, 140_001, "plate 0x30C3 -> leve 140_001");
+    let leve_id = leve.id;
+    // Plate 0 (the DB default) must never resolve — guards against the
+    // unmapped fieldcraft rows collapsing onto a single key.
+    assert!(
+        resolver.leve_for_plate(0).is_none(),
+        "unmapped plate id never resolves",
+    );
+
+    lua.catalogs().install_regional_leve_resolver(resolver);
+
+    let registry = Arc::new(ActorRegistry::new());
+    let character = crate::actor::Character::new(311);
+    registry
+        .insert(ActorHandle::new(
+            311,
+            ActorKindTag::Player,
+            180,
+            311,
+            character,
+        ))
+        .await;
+
+    let accepted = apply_accept_regional_leve(311, leve_id, 0, &registry, &db, Some(&lua)).await;
+    assert!(accepted, "resolved card leve accepts");
+
+    let h = registry.get(311).await.unwrap();
+    let c = h.character.read().await;
+    let q = c.quest_journal.get(leve_id).expect("leve in journal");
+    assert!(q.get_flag(crate::leve::ACCEPTED_FLAG_BIT));
 }
 
 /// Accept on a leve id the catalog doesn't know about returns false

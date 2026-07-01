@@ -763,6 +763,7 @@ impl LuaEngine {
     /// `command` arg is a stub `LuaActor` carrying the command actor id (the
     /// scripts that need it only read its id; ActivateCommand.lua ignores it).
     /// (Garlemald-Server #28.)
+    #[allow(clippy::too_many_arguments)]
     pub fn call_command_on_event_started(
         &self,
         script_path: &Path,
@@ -774,8 +775,22 @@ impl LuaEngine {
         // eventType — see the arg-push block below). (Garlemald-Server #46.)
         _event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
+        // Identity of the physical actor the command was invoked on, when
+        // the caller resolved it (harvest commands: the clicked gather
+        // node's `(zone_id, unique_id)`). The command static actor's own
+        // id (`command_actor_id`) is the same for every node, so the
+        // struck node's identity rides on the `commandActor` userdata's
+        // `zone_id` / `unique_id` fields — `DummyCommand.lua` reads them
+        // back via `commandActor:GetZoneID()` / `:GetUniqueId()` to route
+        // to the right template. `None` leaves the fields empty (every
+        // non-harvest command). (Wave 3 gather partial.)
+        command_actor_identity: Option<(u32, String)>,
     ) -> PartialLuaCallResult {
         let owner_player_id = player_snapshot.actor_id;
+        let (command_zone_id, command_unique_id) = match command_actor_identity {
+            Some((zone_id, unique_id)) => (zone_id, unique_id),
+            None => (0, String::new()),
+        };
         self.spawn_director_on_event_started(script_path, owner_player_id, |lua, queue| {
             let player = userdata::LuaPlayer {
                 snapshot: player_snapshot,
@@ -786,8 +801,8 @@ impl LuaEngine {
                 name: String::new(),
                 class_name: String::new(),
                 class_path: String::new(),
-                unique_id: String::new(),
-                zone_id: 0,
+                unique_id: command_unique_id,
+                zone_id: command_zone_id,
                 zone_name: String::new(),
                 state: 0,
                 pos: (0.0, 0.0, 0.0),
@@ -2463,6 +2478,7 @@ mod tests {
                 "commandRequest".to_string(),
                 0,
                 Vec::new(),
+                None,
             );
             assert!(
                 result.error.is_none(),
@@ -2507,6 +2523,7 @@ mod tests {
             "commandRequest".to_string(),
             0, // event_type — now ignored on the command path
             vec![LuaParam::Int32(105), LuaParam::Int32(1)], // emoteId=Bow, showText=1
+            None,
         );
         assert!(
             result.error.is_none(),

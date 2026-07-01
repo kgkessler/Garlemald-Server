@@ -248,6 +248,16 @@ async fn spawn_one(
         handle = handle.with_private_area(name, level);
     }
     ctx.registry.insert(handle).await;
+
+    // 4. If this seed is a gather node, record `actor_id → (zone_id,
+    //    unique_id)` so the harvest-command dispatch can turn the
+    //    player's clicked/target actor into the `(zoneId, uniqueId)` key
+    //    `GetGatherNodeMetadata` reads. No-ops for every non-gather
+    //    actor (see `WorldManager::note_gather_node_actor`).
+    ctx.world
+        .note_gather_node_actor(actor_id, zone_id, &seed.unique_id)
+        .await;
+
     Some(actor_id)
 }
 

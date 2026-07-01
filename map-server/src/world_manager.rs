@@ -798,6 +798,22 @@ pub struct WorldManager {
     /// generic spawn pipeline.
     gather_node_metadata: RwLock<HashMap<(u32, String), GatherNodeMetadata>>,
 
+    /// Reverse index `live actor_id → (zone_id, unique_id)` for the
+    /// spawned gather-node actors. The metadata map above is keyed by
+    /// `(zone_id, unique_id)` because those are the identity fields a
+    /// seed carries at boot, but a player's *current target* is an
+    /// `actor_id` (the client's `SetTarget`/`checkedActorId`). The
+    /// generic spawner assigns that composite id late (running actor
+    /// counter), so it can't be derived from the seed — instead the
+    /// spawn pass calls [`WorldManager::note_gather_node_actor`] once it
+    /// knows the id, letting the harvest-command dispatch turn "the node
+    /// the player clicked" into the `(zoneId, uniqueId)` key
+    /// `GetGatherNodeMetadata` needs. Only gather-node spawns land here
+    /// (the note method no-ops for any `(zone_id, unique_id)` absent from
+    /// `gather_node_metadata`), so BattleNpc/populace ids never pollute
+    /// this map.
+    gather_node_actors: RwLock<HashMap<u32, (u32, String)>>,
+
     /// Player state indexed by session id — zone membership, player
     /// position snapshot, etc. Updated by movement handlers.
     sessions: RwLock<HashMap<u32, Session>>,
@@ -815,6 +831,7 @@ impl WorldManager {
             zone_entrances: RwLock::new(HashMap::new()),
             seamless_boundaries: RwLock::new(HashMap::new()),
             gather_node_metadata: RwLock::new(HashMap::new()),
+            gather_node_actors: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
         }
@@ -846,6 +863,35 @@ impl WorldManager {
     #[cfg(test)]
     pub(crate) async fn gather_metadata_count(&self) -> usize {
         self.gather_node_metadata.read().await.len()
+    }
+
+    /// Record that the live actor `actor_id` is the gather node seeded as
+    /// `(zone_id, unique_id)`. No-op unless that pair is a known gather
+    /// node (present in `gather_node_metadata`), so the generic spawn
+    /// pass can call this for *every* actor it materialises and only the
+    /// real gather nodes are indexed. Called from the boot spawner once
+    /// the composite actor id is assigned.
+    pub async fn note_gather_node_actor(&self, actor_id: u32, zone_id: u32, unique_id: &str) {
+        let is_gather_node = self
+            .gather_node_metadata
+            .read()
+            .await
+            .contains_key(&(zone_id, unique_id.to_string()));
+        if is_gather_node {
+            self.gather_node_actors
+                .write()
+                .await
+                .insert(actor_id, (zone_id, unique_id.to_string()));
+        }
+    }
+
+    /// Resolve a live gather-node actor id back to the `(zone_id,
+    /// unique_id)` key `GetGatherNodeMetadata` is addressed by. Returns
+    /// `None` when the actor isn't a gather-node spawn (or gather spawns
+    /// weren't loaded). This is the bridge from "the actor the player
+    /// clicked/targeted" to the per-node harvest template.
+    pub async fn gather_node_identity(&self, actor_id: u32) -> Option<(u32, String)> {
+        self.gather_node_actors.read().await.get(&actor_id).cloned()
     }
 
     // -----------------------------------------------------------------
@@ -3184,6 +3230,50 @@ mod tests {
             false,
             Some(&StubNavmeshLoader),
         )
+    }
+
+    /// `note_gather_node_actor` only indexes actors whose `(zone_id,
+    /// unique_id)` is a known gather node, and `gather_node_identity`
+    /// resolves the live actor id back to that key. This is the bridge
+    /// from the player's clicked/target actor to the `(zoneId, uniqueId)`
+    /// key `GetGatherNodeMetadata` reads. (Wave 3 gather partial.)
+    #[tokio::test]
+    async fn gather_node_actor_index_round_trips_known_nodes_only() {
+        let wm = WorldManager::new();
+        // Seed a single known gather node: zone 180, unique "log_1".
+        wm.gather_node_metadata.write().await.insert(
+            (180, "log_1".to_string()),
+            GatherNodeMetadata {
+                harvest_node_id: 2001,
+                harvest_type: crate::gathering::HARVEST_TYPE_LOG,
+            },
+        );
+
+        // The gather-node actor (composite id 0x4009_0001) gets indexed.
+        wm.note_gather_node_actor(0x4009_0001, 180, "log_1").await;
+        // A non-gather actor (a populace NPC seeded as "guard_1") does not,
+        // even though the note method is called for every spawned actor.
+        wm.note_gather_node_actor(0x4009_0002, 180, "guard_1").await;
+        // A gather node's unique_id in the WRONG zone is also rejected.
+        wm.note_gather_node_actor(0x4009_0003, 155, "log_1").await;
+
+        assert_eq!(
+            wm.gather_node_identity(0x4009_0001).await,
+            Some((180, "log_1".to_string())),
+            "the clicked gather node must resolve to its (zone, unique) key",
+        );
+        assert!(
+            wm.gather_node_identity(0x4009_0002).await.is_none(),
+            "a populace NPC must never be indexed as a gather node",
+        );
+        assert!(
+            wm.gather_node_identity(0x4009_0003).await.is_none(),
+            "a matching unique_id in the wrong zone must not resolve",
+        );
+        assert!(
+            wm.gather_node_identity(0xDEAD_BEEF).await.is_none(),
+            "an unknown actor id resolves to None",
+        );
     }
 
     #[tokio::test]

@@ -5865,6 +5865,16 @@ impl UserData for LuaRegionalLeveResolver {
                 .cloned()
                 .map(|inner| LuaRegionalLeve { inner }))
         });
+        // `resolver:LeveForCard(cardId)` — resolve a guildleve UI
+        // plate / card id (e.g. `0x30C3`, as rendered by
+        // PopulaceGuildlevePublisher's `eventTalkCard` grid) to its
+        // catalog leve id. Returns the leve id (u32) so the levemete
+        // accept branch can chain into
+        // `player:AcceptRegionalLeve(leveId, band)`, or `nil` when the
+        // clicked card has no seeded leve (unmapped card / plate 0).
+        methods.add_method("LeveForCard", |_, this, card_id: u32| {
+            Ok(this.resolver.leve_for_plate(card_id).map(|d| d.id))
+        });
         methods.add_method("GetNumLeves", |_, this, _: ()| {
             Ok(this.resolver.num_leves() as u32)
         });
