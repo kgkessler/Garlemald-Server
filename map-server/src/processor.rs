@@ -472,6 +472,43 @@ impl PacketProcessor {
             }
         }
 
+        // Hydrate persisted status effects into the runtime container.
+        // `load_character_status_effects` already filled
+        // `loaded.status_effects`, but that Vec was previously dropped on the
+        // floor — long-lived effects (food buffs, scripted quest effects)
+        // vanished every relog. Re-apply through the same `add_status_effect`
+        // path the runtime uses; the emitted events (gain toast, recalc) are
+        // discarded because no client socket is attached yet and the zone-in
+        // property bundle re-emits the `charaWork.status[]` /
+        // `statusShownTime[]` arrays. Mirrors C# `Player.Load` re-applying the
+        // `SavePlayerStatusEffects` rows.
+        if !loaded.status_effects.is_empty() {
+            let now_ms = common::utils::unix_timestamp() as u64 * 1000;
+            let mut hydrate_outbox = crate::status::StatusOutbox::new();
+            for entry in &loaded.status_effects {
+                let mut effect = crate::status::StatusEffect::new(
+                    actor_id,
+                    entry.status_id,
+                    entry.magnitude as f64,
+                    entry.tick,
+                    entry.duration,
+                    entry.tier,
+                    now_ms,
+                );
+                effect.extra = entry.extra as f64;
+                // No login "you gain the effect of X" spam — the effects are
+                // being restored, not freshly applied.
+                effect.silent_on_gain = true;
+                character.status_effects.add_status_effect(
+                    effect,
+                    actor_id,
+                    now_ms,
+                    crate::status::DEFAULT_GAIN_TEXT_ID,
+                    &mut hydrate_outbox,
+                );
+            }
+        }
+
         self.registry
             .insert(ActorHandle::new(
                 actor_id,
@@ -1562,13 +1599,15 @@ impl PacketProcessor {
                 sender,
                 text,
             } => {
-                tracing::info!(
-                    actor = actor_id,
-                    kind = format!("0x{:02X}", message_type),
-                    %sender,
-                    %text,
-                    "SendMessage captured (login-hook sys message; packet emit deferred)"
-                );
+                crate::runtime::quest_apply::apply_send_message(
+                    actor_id,
+                    message_type,
+                    &sender,
+                    &text,
+                    &self.registry,
+                    &self.world,
+                )
+                .await;
             }
             LC::SendGameMessage {
                 actor_id,
@@ -4286,6 +4325,11 @@ impl PacketProcessor {
                 crate::status::StatusEffectFlags::LOSE_ON_LOGOUT,
                 &mut outbox,
             );
+            // Persist the survivors so long-lived effects come back on the
+            // next login (the DbSave arm snapshots the container after the
+            // logout-losing effects have been stripped). Mirrors C#
+            // `Player.CleanupAndSave` → `Database.SavePlayerStatusEffects`.
+            c.status_effects.save_to_db(&mut outbox);
         }
         self.drain_status_outbox(outbox).await;
     }

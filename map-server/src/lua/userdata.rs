@@ -667,10 +667,15 @@ impl From<&crate::actor::Player> for PlayerSnapshot {
             current_job: p.character.chara.current_job as u8,
             current_gil: p.get_current_gil().max(0) as u32,
             initial_town: p.get_initial_town(),
-            tribe: 0,
-            guardian: 0,
-            birth_month: 0,
-            birth_day: 0,
+            // Profile fields are hydrated onto CharaState at
+            // session-begin (from LoadedPlayer). Read the real values so
+            // content scripts branching on tribe/guardian/birthday (and
+            // the playerWork.tribe emit) see the persisted character,
+            // matching build_player_snapshot_for_login.
+            tribe: p.character.chara.tribe,
+            guardian: p.character.chara.guardian,
+            birth_month: p.character.chara.birthday_month,
+            birth_day: p.character.chara.birthday_day,
             homepoint: p.player.homepoint,
             homepoint_inn: p.player.homepoint_inn,
             // Hotbar lives on CharaState (mirrored at session-begin

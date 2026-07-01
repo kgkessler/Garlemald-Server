@@ -72,10 +72,27 @@ pub async fn dispatch_status_event(
 ) {
     match event {
         StatusEvent::DbSave { owner_actor_id } => {
-            // Phase 1 logs — the actual `save_player_status_effects` wire
-            // lands alongside the status-specific SQL in a later phase.
-            tracing::debug!(owner = owner_actor_id, "status: DbSave (TODO)");
-            let _ = db;
+            // Persist the owner's active effects. `owner_actor_id` == the
+            // character id in this server's lobby flow (handle_session_begin
+            // sets `actor_id = session_id`), so it feeds
+            // `save_player_status_effects` directly. Mirrors C#
+            // `Database.SavePlayerStatusEffects`.
+            if let Some(handle) = registry.get(*owner_actor_id).await {
+                let entries = {
+                    let c = handle.character.read().await;
+                    c.status_effects.to_db_entries()
+                };
+                if let Err(e) = db
+                    .save_player_status_effects(*owner_actor_id, &entries)
+                    .await
+                {
+                    tracing::warn!(
+                        owner = owner_actor_id,
+                        err = %e,
+                        "status: save_player_status_effects failed",
+                    );
+                }
+            }
         }
         StatusEvent::PacketSetStatus {
             owner_actor_id,
@@ -91,16 +108,30 @@ pub async fn dispatch_status_event(
             slot_index,
             expires_at,
         } => {
-            // `statusShownTime[i]` updates ride on the ActorPropertyPacketUtil
-            // bundle in retail — a small batching helper that hasn't landed
-            // in our packet builders yet. Log the intent; real emission
-            // follows in Phase 2 with the rest of the property-delta flow.
-            tracing::debug!(
-                owner = owner_actor_id,
-                slot = slot_index,
-                expires_at = expires_at,
-                "status: set-status-time (pending property-util)"
+            // Buff/debuff countdown. Retail rides `statusShownTime[i]` on the
+            // ActorPropertyPacketUtil bundle keyed by the target object path
+            // `charaWork/status`, with the property named
+            // `charaWork.statusShownTime[i]` (pmeteor
+            // `StatusEffectContainer.SetTimeAtIndex`,
+            // StatusEffectContainer.cs:389-392). We emit the equivalent as a
+            // single 0x0137 SetActorProperty u32 write — the property id is the
+            // Murmur2 hash of the indexed dotted name, matching the hashing the
+            // shared `ActorPropertyPacketBuilder::add_int` uses. `expires_at`
+            // is already stance-corrected (u32::MAX sentinel) by
+            // `StatusEffect::wire_end_time`.
+            let prop_name = format!("charaWork.statusShownTime[{slot_index}]");
+            let prop_id = common::utils::murmur_hash2(&prop_name, 0);
+            let sub = tx::build_set_actor_property_u32(
+                *owner_actor_id,
+                "charaWork/status",
+                prop_id,
+                *expires_at,
             );
+            let bytes = sub.to_bytes();
+            // Owner sees their own countdown; neighbours get the nameplate
+            // buff-row time (companion to the PacketSetStatus icon arm).
+            send_to_self_if_player(registry, world, *owner_actor_id, bytes.clone()).await;
+            broadcast_to_neighbours(world, registry, *owner_actor_id, bytes).await;
         }
         StatusEvent::HpTick {
             owner_actor_id,
@@ -139,14 +170,33 @@ pub async fn dispatch_status_event(
             owner_actor_id,
             text_id,
             status_effect_id,
-            play_gain_animation: _,
+            play_gain_animation,
         } => {
-            tracing::debug!(
-                owner = owner_actor_id,
-                text = text_id,
-                effect = status_effect_id,
-                "status: WorldMasterText (TODO)"
+            // "You gain/lose the effect of X." pmeteor packs this into a
+            // CommandResult (owner.Id, textId, effectId | HitEffect flag) on
+            // the battle-action container; we render the same text sheet via
+            // the game-message builder with the effect id as a LuaParam. The
+            // header source must be the always-present WorldMaster static
+            // actor (the client dispatches game messages by header source —
+            // routing through the player is the #28 crash path), and the text
+            // owner is the WorldMaster system sheet.
+            let params = [common::luaparam::LuaParam::UInt32(*status_effect_id)];
+            let sub = tx::build_game_message_actor1_with_params(
+                tx::WORLD_MASTER_ACTOR_ID,
+                *owner_actor_id,
+                tx::WORLD_MASTER_ACTOR_ID,
+                *text_id,
+                tx::MESSAGE_TYPE_SYSTEM,
+                &params,
             );
+            let bytes = sub.to_bytes();
+            // The owner always sees the log line; neighbours only receive the
+            // packet when the gain/lose animation should splash on nearby
+            // clients (pmeteor's `playEffect` / `HitEffect.StatusEffectType`).
+            send_to_self_if_player(registry, world, *owner_actor_id, bytes.clone()).await;
+            if *play_gain_animation {
+                broadcast_to_neighbours(world, registry, *owner_actor_id, bytes).await;
+            }
         }
     }
 }

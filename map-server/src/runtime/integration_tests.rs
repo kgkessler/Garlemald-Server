@@ -15375,3 +15375,176 @@ fn real_aetheryte_parent_attunement_advances_man0l1() {
         result.commands,
     );
 }
+
+/// `player:SendMessage(messageType, sender, text)` drained through the
+/// LOGIN applier (`PacketProcessor::apply_login_lua_command`) must emit
+/// exactly one 0x0003 `SendMessagePacket` to the invoking player's own
+/// client — sender in the fixed 0x20 ASCII slot, u32 message type at
+/// 0x20, text from 0x24. Regression guard for the arm that used to only
+/// log "packet emit deferred" and send nothing.
+#[tokio::test]
+async fn send_message_login_hook_emits_0x0003_to_self() {
+    use crate::actor::{Character, Player};
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let chara = Character::new(8);
+    let _player = Player::with_helpers(8);
+    registry
+        .insert(ActorHandle::new(8, ActorKindTag::Player, 200, 8, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 8,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(8, ClientHandle::new(8, tx)).await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+    let handle = registry.get(8).await.expect("player handle");
+
+    processor
+        .apply_login_lua_command(
+            &handle,
+            LuaCommand::SendMessage {
+                actor_id: 8,
+                message_type: 0x20,
+                sender: String::new(),
+                text: "hello world".to_string(),
+            },
+        )
+        .await;
+
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    assert_eq!(
+        subs.len(),
+        1,
+        "exactly one SendMessage subpacket; saw {}",
+        subs.len()
+    );
+    let sub = &subs[0];
+    assert_eq!(
+        sub.game_message.opcode,
+        crate::packets::opcodes::OP_SEND_MESSAGE,
+        "SendMessage rides opcode 0x0003",
+    );
+    // Body: sender (empty) in the 0x20 slot, u32 message type at 0x20,
+    // text from 0x24.
+    assert!(
+        sub.data[..0x20].iter().all(|b| *b == 0),
+        "empty sender slot"
+    );
+    assert_eq!(&sub.data[0x20..0x24], &[0x20, 0, 0, 0], "message type 0x20");
+    assert_eq!(&sub.data[0x24..0x24 + 11], b"hello world", "text body");
+}
+
+/// The same command drained through the RUNTIME applier
+/// (`apply_runtime_lua_command`, the quest/NPC-hook path) must ALSO
+/// emit the 0x0003 packet. Before wiring, the runtime applier had no
+/// `SendMessage` arm and the command fell through to the
+/// "runtime lua command unhandled" log — silently dropping every
+/// `:SendMessage(...)` reached via a chat-resume drain.
+#[tokio::test]
+async fn send_message_runtime_applier_emits_0x0003_to_self() {
+    use crate::actor::{Character, Player};
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let chara = Character::new(11);
+    let _player = Player::with_helpers(11);
+    registry
+        .insert(ActorHandle::new(11, ActorKindTag::Player, 200, 11, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 11,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(11, ClientHandle::new(11, tx)).await;
+
+    let handled = crate::runtime::quest_apply::apply_runtime_lua_command(
+        LuaCommand::SendMessage {
+            actor_id: 11,
+            message_type: 0x20,
+            sender: String::new(),
+            text: "runtime line".to_string(),
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(
+        handled,
+        "runtime applier must claim the SendMessage command"
+    );
+
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    assert_eq!(
+        subs.len(),
+        1,
+        "exactly one SendMessage subpacket; saw {}",
+        subs.len()
+    );
+    assert_eq!(
+        subs[0].game_message.opcode,
+        crate::packets::opcodes::OP_SEND_MESSAGE,
+        "SendMessage rides opcode 0x0003",
+    );
+    assert_eq!(&subs[0].data[0x24..0x24 + 12], b"runtime line", "text body");
+}

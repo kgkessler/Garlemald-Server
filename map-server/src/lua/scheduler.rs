@@ -173,6 +173,7 @@ impl CoroutineScheduler {
     /// nothing is parked on the clock. Used by the headless test harness
     /// (`crate::testkit`) to sleep just past the next `wait(n)` instead of
     /// guessing a fixed duration.
+    #[cfg(feature = "testkit")]
     pub(crate) fn next_time_deadline_ms(&self) -> Option<u64> {
         self.sleeping_on_time.iter().map(|(t, _)| *t).min()
     }

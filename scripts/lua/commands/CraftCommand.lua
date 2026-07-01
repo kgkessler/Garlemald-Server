@@ -502,7 +502,7 @@ function startCrafting(player, commandactor, craftJudge, hand, recipe, quest, st
 			-- Normal synth craft success
             else                
 				player:SendGameMessage(GetWorldMaster(), 40111, 0x20, player, recipe.resultItemID, 1, recipe.resultQuantity);  -- "You create <#3 quantity> <#1 item> <#2 quality>."				
-				player:getItemPackage(location):addItem(recipe.resultItemID, recipe.resultQuantity, 1);
+				player:getItemPackage(INVENTORY_NORMAL):addItem(recipe.resultItemID, recipe.resultQuantity, 1);
 				break;
             end
         end		

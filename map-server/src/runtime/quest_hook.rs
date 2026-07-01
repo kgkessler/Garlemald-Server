@@ -102,6 +102,16 @@ pub async fn fire_on_kill_bnpc(
                 })
                 .collect(),
             completed_quests: c.quest_journal.iter_completed().collect(),
+            // Profile fields hydrated onto CharaState at session-begin
+            // (from LoadedPlayer). `..Default::default()` below would
+            // zero these; carry the real values through so onKillBNpc
+            // handlers reading GetInitialTown / tribe / guardian /
+            // birthday branch against the persisted character.
+            initial_town: c.chara.initial_town,
+            tribe: c.chara.tribe,
+            guardian: c.chara.guardian,
+            birth_month: c.chara.birthday_month,
+            birth_day: c.chara.birthday_day,
             ..Default::default()
         };
         (ids, snap)
