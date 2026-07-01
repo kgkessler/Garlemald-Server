@@ -208,6 +208,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
+cargo run --locked -p content-test        # Lua quest walkthroughs (SEQ_000/005/010)
+PROFILE=debug scripts/smoke-local.sh      # boot-smoke all four services
 ```
 
 ---

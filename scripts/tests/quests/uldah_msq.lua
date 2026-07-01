@@ -25,7 +25,8 @@ describe("Ul'dah - Flowers for All (Man0u0)", function()
 
         w:onStart():expectStartSequence(0)
 
-        -- Fresh Merchant Strip: only Ascilia is lit; passengers gated off.
+        -- Fresh Merchant Strip: only Ascilia is lit (talk + proximity push);
+        -- the passengers stay gated until the sequential chain reaches them.
         w:stateChange(0)
             :expectEnpc(ASCILIA, QFLAG_TALK)
             :expectEnpc(FRETFUL, QFLAG_OFF)
@@ -34,20 +35,29 @@ describe("Ul'dah - Flowers for All (Man0u0)", function()
         -- Proximity push beat (no flag change) - exercises push + ack.
         w:push(ASCILIA):expectDelegate("processTtrNomal002"):ack()
 
-        -- First Ascilia talk -> MINITUT0; the passengers light up.
+        -- First Ascilia talk -> MINITUT0. She stays lit for her follow-up
+        -- talk; the passengers are still gated (Fretful needs MINITUT1).
         w:talk(ASCILIA):expectDelegate("processTtrNomal003"):ack():expectFlagSet(MINITUT0)
         w:stateChange(0)
+            :expectEnpc(ASCILIA, QFLAG_TALK)
+            :expectEnpc(FRETFUL, QFLAG_OFF)
+            :expectEnpc(GILDIGGING, QFLAG_OFF)
+
+        -- Second Ascilia talk -> MINITUT1. Ascilia goes dark; Fretful lights.
+        w:talk(ASCILIA):expectDelegate("processTtrMini001"):ack():expectFlagSet(MINITUT1)
+        w:stateChange(0)
+            :expectEnpc(ASCILIA, QFLAG_OFF)
             :expectEnpc(FRETFUL, QFLAG_TALK)
+            :expectEnpc(GILDIGGING, QFLAG_OFF)
+
+        -- Fretful -> MINITUT2. Fretful goes dark; Gil-digging lights next.
+        w:talk(FRETFUL):expectDelegate("processTtrMini002_first"):ack():expectFlagSet(MINITUT2)
+        w:stateChange(0)
+            :expectEnpc(FRETFUL, QFLAG_OFF)
             :expectEnpc(GILDIGGING, QFLAG_TALK)
 
-        -- Both passengers.
-        w:talk(FRETFUL):expectDelegate("processTtrMini002_first"):ack():expectFlagSet(MINITUT2)
+        -- Gil-digging -> MINITUT3. All four beats done (flags 0xF): the exit arms.
         w:talk(GILDIGGING):expectDelegate("processTtrMini003_first"):ack():expectFlagSet(MINITUT3)
-
-        -- Ascilia again -> MINITUT1 (the closing tutorial beat).
-        w:talk(ASCILIA):expectDelegate("processTtrMini001"):ack():expectFlagSet(MINITUT1)
-
-        -- All four beats done (flags 0xF): the exit trigger arms its push.
         w:stateChange(0):expectEnpc(EXIT_TRIGGER, QFLAG_PUSH)
 
         -- Push the exit: doExitTrigger runs straight through (no ack) into

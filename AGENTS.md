@@ -118,17 +118,20 @@ combined-work rule — read `NOTICE.md` and prefer "read, re-derive, cite".
 
 ---
 
-## The gates your work MUST pass (CI runs all four)
+## The gates your work MUST pass (CI runs all six)
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
+cargo run --locked -p content-test        # Lua quest walkthroughs (SEQ_000/005/010)
+PROFILE=debug scripts/smoke-local.sh      # boot-smoke all four services
 ```
 
 `--locked` means: if you change dependencies, commit the updated `Cargo.lock`.
-**Do not open a PR until all four are green.**
+`scripts/test.sh` bundles fmt + clippy + test + content-test; `scripts/smoke-local.sh`
+is the boot smoke. **Do not open a PR until all six are green.**
 
 ---
 
