@@ -20,8 +20,6 @@
 //! returns canned data; we mirror that here so the client's "party
 //! finder" UI resolves without crashing.
 
-#![allow(dead_code)]
-
 use super::outbox::{SocialEvent, SocialOutbox};
 
 pub struct CannedRecruitmentDetails {

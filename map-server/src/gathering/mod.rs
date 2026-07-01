@@ -34,8 +34,6 @@
 //! a strike, and the minigame runs via `callClientFunction` RPCs so it
 //! couldn't be driven headlessly even if there were one.
 
-#![allow(dead_code)]
-
 pub mod node;
 pub mod resolver;
 pub mod spawn;

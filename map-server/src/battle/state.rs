@@ -28,8 +28,6 @@
 //! BattleState` method dispatches on the kind. The actual lifecycle
 //! (push/pop, interrupt checks) is managed by `AIContainer`.
 
-#![allow(dead_code)]
-
 use super::command::BattleCommand;
 
 /// Stack depth cap — matches the C# `AIContainer.MAX_STATES = 10`.

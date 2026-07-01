@@ -29,8 +29,6 @@
 //! sitting in the quest journal with a difficulty + attempt counters)
 //! lives alongside the quest system; this module stays value-type only.
 
-#![allow(dead_code)]
-
 pub mod passive_guildleve;
 pub mod passive_guildleve_data;
 pub mod recipe;

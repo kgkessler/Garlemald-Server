@@ -19,8 +19,6 @@
 //! Stubbed support-desk responses. Matches the C# `PacketProcessor`
 //! canned replies so the "help" UI resolves.
 
-#![allow(dead_code)]
-
 use super::outbox::{SocialEvent, SocialOutbox};
 
 pub const CANNED_FAQ_TITLES: &[&str] = &["Testing FAQ1", "Coded style!"];

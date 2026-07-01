@@ -49,8 +49,6 @@
 //!
 //! [`PassiveGuildleveData`]: crate::crafting::PassiveGuildleveData
 
-#![allow(dead_code)]
-
 pub mod data;
 pub mod resolver;
 pub mod view;

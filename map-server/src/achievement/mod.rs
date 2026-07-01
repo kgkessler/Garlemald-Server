@@ -26,7 +26,7 @@
 //! scripts calling into the host. Our port matches that with the
 //! outbox-first pattern already established in Phases 4/5/6/7.
 
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 pub mod dispatcher;
 pub mod outbox;

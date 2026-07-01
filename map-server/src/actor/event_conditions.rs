@@ -27,8 +27,6 @@
 //! client ignores subsequent `KickEvent` calls on the matching
 //! `conditionName`.
 
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default)]

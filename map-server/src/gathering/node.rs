@@ -28,8 +28,6 @@
 //! sentinel. Matches the shape of the Lua `BuildHarvestNode` helper the
 //! hardcoded DummyCommand.lua version was building client-side.
 
-#![allow(dead_code)]
-
 /// Maximum number of item keys a single [`GatherNode`] can reference.
 /// Mirrors the 11-slot aim gauge on the 1.x minigame widget — each
 /// aim slot is either empty or pinned to one [`GatherNodeItem`].

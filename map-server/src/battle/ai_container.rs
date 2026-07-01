@@ -30,8 +30,6 @@
 //! 4. Emit a `RecalcStats` event if the state stack emptied during the
 //!    tick (mirrors `Character.PostUpdate`).
 
-#![allow(dead_code)]
-
 use common::Vector3;
 
 use super::command::BattleCommand;

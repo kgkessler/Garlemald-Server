@@ -28,8 +28,6 @@
 //! functions are intentionally small and independently callable so the
 //! game ticker can sequence them explicitly per tick.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use tokio::sync::RwLock;

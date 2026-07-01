@@ -27,8 +27,6 @@
 //! The `Arc<Mutex<CommandQueue>>` inside each userdata is shared so *all*
 //! userdata created for one script invocation write into the same bucket.
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use mlua::{AnyUserData, UserData, UserDataFields, UserDataMethods, Value};

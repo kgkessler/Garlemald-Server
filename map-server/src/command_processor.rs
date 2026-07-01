@@ -26,7 +26,6 @@
 //! name → character id via the DB, then look up the live `ActorHandle`
 //! through `ActorRegistry::by_session` (safe because for Players
 //! `character_id == session_id == actor_id`, see `processor.rs:133`).
-#![allow(dead_code)]
 
 use std::sync::Arc;
 

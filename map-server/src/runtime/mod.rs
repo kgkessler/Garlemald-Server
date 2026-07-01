@@ -24,7 +24,7 @@
 //! `ActorRegistry` holds live `Character` state for every player/npc/mob;
 //! the `dispatcher` submodule turns individual events into side effects.
 
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 pub mod actor_registry;
 pub mod broadcast;

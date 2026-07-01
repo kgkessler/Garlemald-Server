@@ -28,8 +28,6 @@
 //! Keep this table sorted ascending by aetheryte id; [`lookup`] uses
 //! binary search and a debug-build assertion enforces monotonicity.
 
-#![allow(dead_code)]
-
 #[derive(Debug, Clone, Copy)]
 pub struct AetheryteSpawn {
     pub aetheryte_id: u32,

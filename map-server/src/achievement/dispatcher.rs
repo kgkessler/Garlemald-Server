@@ -18,8 +18,6 @@
 
 //! Turn `AchievementEvent`s into real packets on the player's queue.
 
-#![allow(dead_code)]
-
 use crate::packets::send as tx;
 use crate::runtime::actor_registry::ActorRegistry;
 use crate::world_manager::WorldManager;

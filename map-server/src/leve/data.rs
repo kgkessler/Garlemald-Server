@@ -19,8 +19,6 @@
 //! [`RegionalLeveData`] — static definition of one fieldcraft or
 //! battlecraft leve. Row in `gamedata_regional_leves`.
 
-#![allow(dead_code)]
-
 /// Which progress pipeline a given leve plugs into. The numeric values
 /// match the DB `leveType` discriminator column exactly so loads round
 /// trip without a separate decoder table.

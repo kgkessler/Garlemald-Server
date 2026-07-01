@@ -26,8 +26,6 @@
 //! member-facing side effects: music, game messages, remove packets on
 //! end, property packets for guildleve-work.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use crate::database::Database;

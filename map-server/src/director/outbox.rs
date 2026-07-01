@@ -19,8 +19,6 @@
 //! Events emitted by director mutations. Drained by the game-loop
 //! dispatcher and turned into packet sends, DB writes, and Lua calls.
 
-#![allow(dead_code)]
-
 #[derive(Debug, Clone)]
 pub enum DirectorEvent {
     // ---- Lifecycle ----------------------------------------------------
