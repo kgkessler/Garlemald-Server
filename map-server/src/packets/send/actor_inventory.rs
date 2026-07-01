@@ -183,12 +183,14 @@ fn build_inventory_list_n(
     SubPacket::new(opcode, actor_id, data)
 }
 
-/// 0x0152 InventoryRemoveX01Packet — one slot.
+/// 0x0152 InventoryRemoveX01Packet — one slot. Body is an 8-byte payload
+/// (`PACKET_SIZE 0x28` − the 0x20 header) carrying only the `u16` slot, per
+/// pmeteor's `InventoryRemoveX01Packet.BuildPacket` (which writes nothing
+/// else — the earlier `data[0x10] = 1` "max" write was both wrong and an
+/// out-of-bounds index into the 8-byte body).
 pub fn build_inventory_remove_x01(actor_id: u32, slot: u16) -> SubPacket {
     let mut data = body(0x28);
     data[..2].copy_from_slice(&slot.to_le_bytes());
-    // C# writes max=1 at offset 0x10.
-    data[0x10] = 1;
     SubPacket::new(OP_INVENTORY_REMOVE_X01, actor_id, data)
 }
 

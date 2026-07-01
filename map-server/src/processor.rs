@@ -1520,11 +1520,13 @@ impl PacketProcessor {
                 .await;
             }
             // `onLogin` init items + every `HarvestReward` call route
-            // through here. Persistence is direct-DB via `add_harvest_item`
-            // (see `runtime::quest_apply::apply_add_item` for the shape);
-            // the in-memory `ItemPackage` pipeline isn't wired to the
-            // registry yet, so the player sees the new stack on the
-            // next inventory resync.
+            // through here. Persistence is direct-DB via `add_harvest_item`;
+            // NORMAL adds now also emit a live no-wipe single-package
+            // refresh to the owning client (see
+            // `runtime::quest_apply::apply_add_item`), so the bag renders
+            // the new stack mid-session without a re-zone. Non-NORMAL
+            // packages (key items etc.) stay DB-only until their per-table
+            // persistence lands.
             LC::AddItem {
                 actor_id,
                 item_package,
@@ -1535,6 +1537,23 @@ impl PacketProcessor {
                     actor_id,
                     item_package,
                     item_id,
+                    quantity,
+                    &self.registry,
+                    Some(&self.world),
+                    &self.db,
+                )
+                .await;
+            }
+            LC::RemoveItem {
+                actor_id,
+                item_package,
+                catalog_id,
+                quantity,
+            } => {
+                crate::runtime::quest_apply::apply_remove_item(
+                    actor_id,
+                    item_package,
+                    catalog_id,
                     quantity,
                     &self.registry,
                     Some(&self.world),
