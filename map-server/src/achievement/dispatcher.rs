@@ -29,34 +29,34 @@ pub async fn dispatch_achievement_event(
     registry: &ActorRegistry,
     world: &WorldManager,
 ) {
-    let (player_actor_id, bytes) = match event {
+    let (player_actor_id, mut sub) = match event {
         AchievementEvent::Earned {
             player_actor_id,
             achievement_id,
         } => {
             let sub = tx::build_achievement_earned(*player_actor_id, *achievement_id);
-            (*player_actor_id, sub.to_bytes())
+            (*player_actor_id, sub)
         }
         AchievementEvent::SetPoints {
             player_actor_id,
             points,
         } => {
             let sub = tx::build_set_achievement_points(*player_actor_id, *points);
-            (*player_actor_id, sub.to_bytes())
+            (*player_actor_id, sub)
         }
         AchievementEvent::SetLatest {
             player_actor_id,
             latest_ids,
         } => {
             let sub = tx::build_set_latest_achievements(*player_actor_id, latest_ids);
-            (*player_actor_id, sub.to_bytes())
+            (*player_actor_id, sub)
         }
         AchievementEvent::SetCompleted {
             player_actor_id,
             bits,
         } => {
             let sub = tx::build_set_completed_achievements(*player_actor_id, bits);
-            (*player_actor_id, sub.to_bytes())
+            (*player_actor_id, sub)
         }
         AchievementEvent::SendRate {
             player_actor_id,
@@ -70,14 +70,14 @@ pub async fn dispatch_achievement_event(
                 *progress_count,
                 *progress_flags,
             );
-            (*player_actor_id, sub.to_bytes())
+            (*player_actor_id, sub)
         }
         AchievementEvent::SetPlayerTitle {
             player_actor_id,
             title_id,
         } => {
             let sub = tx::build_set_player_title(*player_actor_id, *title_id);
-            (*player_actor_id, sub.to_bytes())
+            (*player_actor_id, sub)
         }
     };
 
@@ -87,5 +87,10 @@ pub async fn dispatch_achievement_event(
     let Some(client) = world.client(handle.session_id).await else {
         return;
     };
-    client.send_bytes(bytes).await;
+    // Self-bound state: stamp the receiving player's actor id as the
+    // subpacket target — the world proxy drops `target_id == 0` frames
+    // (see the "wire send rules"). Without this, a runtime-earned
+    // achievement / title change would be silently dropped en route.
+    sub.set_target_id(player_actor_id);
+    client.send_bytes(sub.to_bytes()).await;
 }

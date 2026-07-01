@@ -638,6 +638,27 @@ impl StatusEffectContainer {
         });
     }
 
+    /// Snapshot every active effect into the DB-persistable
+    /// `StatusEffectEntry` shape consumed by
+    /// `Database::save_player_status_effects`. The full effect id (e.g.
+    /// 223011) is stored in `status_id`; `load_character_status_effects`
+    /// reads it back the same way so `StatusEffect::new` recomputes the
+    /// 16-bit short id via `status_id_of`. Mirrors the C#
+    /// `Database.SavePlayerStatusEffects` row projection.
+    pub fn to_db_entries(&self) -> Vec<crate::gamedata::StatusEffectEntry> {
+        self.effects
+            .values()
+            .map(|e| crate::gamedata::StatusEffectEntry {
+                status_id: e.id,
+                duration: e.duration,
+                magnitude: e.magnitude as u64,
+                tick: e.tick_ms,
+                tier: e.tier,
+                extra: e.extra as u64,
+            })
+            .collect()
+    }
+
     // --- charaWork slot helpers -------------------------------------------
 
     fn set_status_at_index(&mut self, index: u16, status_id: u16, outbox: &mut StatusOutbox) {
@@ -811,6 +832,55 @@ mod tests {
         assert_eq!(c.len(), MAX_EFFECTS);
         let overflow = mk(999_999, 100);
         assert!(!c.add_status_effect(overflow, 1, 0, DEFAULT_GAIN_TEXT_ID, &mut ob));
+    }
+
+    #[test]
+    fn db_entry_snapshot_and_hydrate_round_trip() {
+        // Arrange — a container with two effects carrying distinct
+        // duration/magnitude/tick/tier/extra so a lossy snapshot would show.
+        let mut c = StatusEffectContainer::new(7);
+        let mut ob = StatusOutbox::new();
+        let mut a = StatusEffect::new(7, STATUS_POISON, 5.0, 3000, 120, 2, 0);
+        a.extra = 9.0;
+        a.overwrite = StatusEffectOverwrite::Always;
+        let b = StatusEffect::new(7, STATUS_STUN, 1.0, 0, 30, 0, 0);
+        c.add_status_effect(a, 7, 0, DEFAULT_GAIN_TEXT_ID, &mut ob);
+        c.add_status_effect(b, 7, 0, DEFAULT_GAIN_TEXT_ID, &mut ob);
+
+        // Act — snapshot to the DB-persistable shape (what the DbSave arm
+        // hands `save_player_status_effects`), then rehydrate a fresh
+        // container the way `handle_session_begin` does from the loaded rows.
+        let entries = c.to_db_entries();
+        assert_eq!(entries.len(), 2);
+
+        let mut restored = StatusEffectContainer::new(7);
+        let mut ob2 = StatusOutbox::new();
+        for entry in &entries {
+            let mut e = StatusEffect::new(
+                7,
+                entry.status_id,
+                entry.magnitude as f64,
+                entry.tick,
+                entry.duration,
+                entry.tier,
+                0,
+            );
+            e.extra = entry.extra as f64;
+            e.overwrite = StatusEffectOverwrite::Always;
+            restored.add_status_effect(e, 7, 0, DEFAULT_GAIN_TEXT_ID, &mut ob2);
+        }
+
+        // Assert — every effect survives the round-trip with matching fields.
+        assert_eq!(restored.len(), 2);
+        let rp = restored.get(STATUS_POISON).expect("poison restored");
+        assert_eq!(rp.duration, 120);
+        assert_eq!(rp.magnitude, 5.0);
+        assert_eq!(rp.tick_ms, 3000);
+        assert_eq!(rp.tier, 2);
+        assert_eq!(rp.extra, 9.0);
+        assert!(restored.has(STATUS_STUN));
+        // The client-visible short-id slot is recomputed from the full id.
+        assert!(restored.status.contains(&status_id_of(STATUS_POISON)));
     }
 
     #[test]

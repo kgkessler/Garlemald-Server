@@ -1358,8 +1358,18 @@ impl Database {
 
     /// Grant a stack of a gathered item to `chara_id`'s NORMAL bag.
     /// Matches the C# `Player.GetItemPackage(INVENTORY_NORMAL).AddItem(...)`
-    /// contract: if a partial stack of the same item+quality already
-    /// exists, top it up first; otherwise insert a fresh stack.
+    /// contract: fill existing partial stacks of the same item+quality
+    /// (in slot order) up to the per-item stack cap first, then spill any
+    /// leftover into fresh stacks — each itself capped at `stackSize` —
+    /// appended to the next free slots.
+    ///
+    /// The per-item cap is `COALESCE(NULLIF(gamedata_items.stackSize, 0),
+    /// 99)` keyed by `catalogID`, clamped to `>= 1`. Both a missing catalog
+    /// row (common in the test harness) and an unpopulated `stackSize` of 0
+    /// (the schema default — the bundled seed leaves `stackSize` unset, so
+    /// real items read 0 today) fall back to 99; a genuinely seeded
+    /// `stackSize` (e.g. 5 for a stack-capped material) makes spill
+    /// deterministic.
     ///
     /// This is the direct-DB write path used while the live ItemPackage
     /// runtime state isn't yet addressable from the runtime command
@@ -1368,7 +1378,14 @@ impl Database {
     /// ore" style flows where the grant is acknowledged on the next
     /// inventory resync — which is also how the retail 1.x client
     /// behaves while the minigame's `textInputWidget` is still shown.
-    /// Returns the new quantity of the stack that absorbed the grant.
+    /// The [`send_inventory_package_update`] send path emits one `list_x01`
+    /// per matching row, so spilled stacks render with no send-side change.
+    ///
+    /// Package-capacity (`CAP_NORMAL`) enforcement is still deferred — this
+    /// only bounds per-stack size, not the total slot count.
+    ///
+    /// Returns the total quantity of this item+quality the character owns
+    /// across ALL its NORMAL stacks after the add.
     pub async fn add_harvest_item(
         &self,
         chara_id: u32,
@@ -1383,87 +1400,206 @@ impl Database {
             .conn
             .call_db(move |c| {
                 let tx = c.transaction()?;
-                // Merge into a pre-existing partial stack if one
-                // exists. `item_packages` NORMAL = 0. `stackSize` lives
-                // on `gamedata_items` (keyed by catalogID), not
-                // `server_items` — the LEFT JOIN lets the merge work
-                // even when the catalog row isn't seeded yet (common
-                // in the test harness). Stack-cap enforcement is
-                // deferred; treat any existing stack as capable of
-                // absorbing the delta.
-                let existing: Option<(i64, i32, i32, i32)> = tx
+                // Per-item stack cap. The authentic 1.x cap lives in
+                // `gamedata_items.maxStack` (keyed by catalogID) — the
+                // bundled `006_gamedata_items.sql` seed DOES populate it
+                // (e.g. Copper Ore = 99). Two "unset" cases fall back to 99:
+                // a missing catalog row (via `.optional()` → `unwrap_or`) AND
+                // a present row whose `maxStack` is the schema DEFAULT of 0 —
+                // `NULLIF(_, 0)` maps that 0 to NULL so COALESCE picks 99.
+                // Finally clamp to `>= 1` so a zero/garbage cap can never make
+                // progress impossible. (The sibling `stackSize` column is a
+                // separate, currently-unpopulated field — do NOT read it here.)
+                let stack_max: i32 = tx
                     .query_row(
-                        r"SELECT si.id, si.quantity, ci.slot, COALESCE(gi.stackSize, 99)
+                        r"SELECT COALESCE(NULLIF(maxStack, 0), 99)
+                          FROM gamedata_items
+                          WHERE catalogID = :iid",
+                        named_params! { ":iid": item_catalog_id },
+                        |r| r.get::<_, i32>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(99)
+                    .max(1);
+
+                // All existing NORMAL (package 0) stacks of this
+                // item+quality, in slot order, as (server_items.id, qty).
+                let existing: Vec<(i64, i32)> = {
+                    let mut stmt = tx.prepare(
+                        r"SELECT si.id, si.quantity
                           FROM characters_inventory ci
                           INNER JOIN server_items si ON ci.serverItemId = si.id
-                          LEFT JOIN gamedata_items gi ON si.itemId = gi.catalogID
                           WHERE ci.characterId = :cid
                             AND ci.itemPackage = 0
                             AND si.itemId = :iid
-                            AND si.quality = :q",
+                            AND si.quality = :q
+                          ORDER BY ci.slot ASC",
+                    )?;
+                    stmt.query_map(
                         named_params! {
                             ":cid": chara_id,
                             ":iid": item_catalog_id,
                             ":q": quality as i64,
                         },
-                        |r| {
-                            Ok((
-                                r.get::<_, i64>(0)?,
-                                r.get::<_, i32>(1)?,
-                                r.get::<_, i32>(2)?,
-                                r.get::<_, i32>(3).unwrap_or(99),
-                            ))
-                        },
-                    )
-                    .optional()?;
-                let new_total = match existing {
-                    Some((sid, qty, _slot, _stack_max)) => {
-                        let updated = qty.saturating_add(delta).max(0);
-                        tx.execute(
-                            "UPDATE server_items SET quantity = :q WHERE id = :id",
-                            named_params! { ":q": updated, ":id": sid },
-                        )?;
-                        updated
-                    }
-                    None => {
-                        let seed = delta.max(0);
-                        tx.execute(
-                            r"INSERT INTO server_items (itemId, quantity, quality)
-                              VALUES (:iid, :q, :qual)",
-                            named_params! {
-                                ":iid": item_catalog_id,
-                                ":q": seed,
-                                ":qual": quality as i64,
-                            },
-                        )?;
-                        let sid = tx.last_insert_rowid();
-                        // Next empty slot = current NORMAL row count.
-                        // Matches `ItemPackage.end_of_list_index` in Rust.
-                        let next_slot: i32 = tx
-                            .query_row(
-                                r"SELECT COALESCE(MAX(slot), -1) + 1
-                                  FROM characters_inventory
-                                  WHERE characterId = :cid AND itemPackage = 0",
-                                named_params! { ":cid": chara_id },
-                                |r| r.get::<_, i32>(0),
-                            )
-                            .unwrap_or(0);
-                        tx.execute(
-                            r"INSERT INTO characters_inventory
-                                (characterId, itemPackage, serverItemId, slot)
-                              VALUES (:cid, 0, :sid, :slot)",
-                            named_params! {
-                                ":cid": chara_id, ":sid": sid, ":slot": next_slot,
-                            },
-                        )?;
-                        seed
-                    }
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
                 };
+
+                let mut remaining = delta;
+
+                // Phase 1 — top up existing partial stacks (slot order)
+                // up to `stack_max` before opening any new slot.
+                for (sid, qty) in existing {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if qty >= stack_max {
+                        continue;
+                    }
+                    let room = stack_max - qty;
+                    let take = remaining.min(room);
+                    if take > 0 {
+                        tx.execute(
+                            "UPDATE server_items SET quantity = quantity + :t WHERE id = :id",
+                            named_params! { ":t": take, ":id": sid },
+                        )?;
+                        remaining -= take;
+                    }
+                }
+
+                // Phase 2 — spill leftover into fresh capped stacks at the
+                // next free slots. Recompute `next_slot` each iteration
+                // since the prior insert just consumed one.
+                while remaining > 0 {
+                    let take = remaining.min(stack_max);
+                    tx.execute(
+                        r"INSERT INTO server_items (itemId, quantity, quality)
+                          VALUES (:iid, :q, :qual)",
+                        named_params! {
+                            ":iid": item_catalog_id,
+                            ":q": take,
+                            ":qual": quality as i64,
+                        },
+                    )?;
+                    let sid = tx.last_insert_rowid();
+                    // Next empty slot = current NORMAL row count.
+                    // Matches `ItemPackage.end_of_list_index` in Rust.
+                    let next_slot: i32 = tx.query_row(
+                        r"SELECT COALESCE(MAX(slot), -1) + 1
+                          FROM characters_inventory
+                          WHERE characterId = :cid AND itemPackage = 0",
+                        named_params! { ":cid": chara_id },
+                        |r| r.get::<_, i32>(0),
+                    )?;
+                    tx.execute(
+                        r"INSERT INTO characters_inventory
+                            (characterId, itemPackage, serverItemId, slot)
+                          VALUES (:cid, 0, :sid, :slot)",
+                        named_params! {
+                            ":cid": chara_id, ":sid": sid, ":slot": next_slot,
+                        },
+                    )?;
+                    remaining -= take;
+                }
+
+                // Total owned across ALL NORMAL stacks of this
+                // item+quality after the add (stable return contract).
+                let new_total: i32 = tx.query_row(
+                    r"SELECT COALESCE(SUM(si.quantity), 0)
+                      FROM characters_inventory ci
+                      INNER JOIN server_items si ON ci.serverItemId = si.id
+                      WHERE ci.characterId = :cid
+                        AND ci.itemPackage = 0
+                        AND si.itemId = :iid
+                        AND si.quality = :q",
+                    named_params! {
+                        ":cid": chara_id,
+                        ":iid": item_catalog_id,
+                        ":q": quality as i64,
+                    },
+                    |r| r.get::<_, i32>(0),
+                )?;
                 tx.commit()?;
                 Ok(new_total)
             })
             .await?;
         Ok(total)
+    }
+
+    /// Inventory increment 2 — grant a single key item to the KEYITEMS
+    /// bag (`itemPackage = PKG_KEYITEMS = 100`) on `chara_id`.
+    ///
+    /// Key items are **unique / non-stacking**: a character either owns
+    /// one copy or none, so this is idempotent — if a row already exists
+    /// at package 100 for `key_item_id`, no duplicate is inserted and the
+    /// method returns `Ok(false)`. When the item is newly granted it
+    /// inserts a `server_items` row (quantity 1, quality 1) plus the
+    /// `characters_inventory` link at the next free KEYITEMS slot and
+    /// returns `Ok(true)`.
+    ///
+    /// Mirrors [`Database::add_harvest_item`]'s fresh-insert branch but
+    /// scoped to `itemPackage = 100` and fronted by an existence guard
+    /// (there is no stack-merge because key items never stack). Runs in a
+    /// single transaction so the existence check and the paired inserts
+    /// can't interleave.
+    ///
+    /// Returns `true` iff the key item was newly added.
+    pub async fn add_key_item(&self, chara_id: u32, key_item_id: u32) -> Result<bool> {
+        if key_item_id == 0 {
+            return Ok(false);
+        }
+        let added = self
+            .conn
+            .call_db(move |c| {
+                let tx = c.transaction()?;
+                // Existence guard: a key item is owned at most once.
+                let already_owned: Option<i64> = tx
+                    .query_row(
+                        r"SELECT si.id
+                          FROM characters_inventory ci
+                          INNER JOIN server_items si ON ci.serverItemId = si.id
+                          WHERE ci.characterId = :cid
+                            AND ci.itemPackage = 100
+                            AND si.itemId = :iid",
+                        named_params! { ":cid": chara_id, ":iid": key_item_id },
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if already_owned.is_some() {
+                    // No dup insert; leave the existing row untouched.
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                tx.execute(
+                    r"INSERT INTO server_items (itemId, quantity, quality)
+                      VALUES (:iid, 1, 1)",
+                    named_params! { ":iid": key_item_id },
+                )?;
+                let sid = tx.last_insert_rowid();
+                // Next empty KEYITEMS slot = current row count in package 100.
+                let next_slot: i32 = tx
+                    .query_row(
+                        r"SELECT COALESCE(MAX(slot), -1) + 1
+                          FROM characters_inventory
+                          WHERE characterId = :cid AND itemPackage = 100",
+                        named_params! { ":cid": chara_id },
+                        |r| r.get::<_, i32>(0),
+                    )
+                    .unwrap_or(0);
+                tx.execute(
+                    r"INSERT INTO characters_inventory
+                        (characterId, itemPackage, serverItemId, slot)
+                      VALUES (:cid, 100, :sid, :slot)",
+                    named_params! {
+                        ":cid": chara_id, ":sid": sid, ":slot": next_slot,
+                    },
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await?;
+        Ok(added)
     }
 
     /// Tier 4 #14 C — grant a stack to `retainer_id`'s personal
@@ -2814,7 +2950,8 @@ impl Database {
                         sd.dealingAttached2, sd.dealingAttached3, sd.dealingTag, sd.bazaarMode,
                         sm.durability, sm.mainQuality, sm.subQuality1, sm.subQuality2, sm.subQuality3,
                         sm.param1, sm.param2, sm.param3, sm.spiritbind,
-                        sm.materia1, sm.materia2, sm.materia3, sm.materia4, sm.materia5
+                        sm.materia1, sm.materia2, sm.materia3, sm.materia4, sm.materia5,
+                        ci.slot
                       FROM characters_inventory ci
                       INNER JOIN server_items si ON ci.serverItemId = si.id
                       LEFT JOIN server_items_modifiers sm ON si.id = sm.id
@@ -2829,6 +2966,15 @@ impl Database {
                             item_id: r.get::<_, u32>(1).unwrap_or_default(),
                             quantity: r.get::<_, i32>(3).unwrap_or(1),
                             quality: r.get::<_, u8>(4).unwrap_or(1),
+                            // ci.slot is the authoritative in-package
+                            // position; `link_slot = 0xFFFF` (not-linked)
+                            // makes `encode_item` render `slot` on the wire
+                            // rather than a stale 0. `item_package` echoes
+                            // the queried package so downstream builders can
+                            // read it back off the row.
+                            slot: r.get::<_, u16>(26).unwrap_or_default(),
+                            link_slot: 0xFFFF,
+                            item_package: item_package as u16,
                             tag: ItemTag {
                                 durability: r.get::<_, u32>(12).unwrap_or_default(),
                                 main_quality: r.get::<_, u8>(13).unwrap_or_default(),
@@ -2839,7 +2985,6 @@ impl Database {
                                 materia_id: r.get::<_, u32>(21).unwrap_or_default(),
                                 ..Default::default()
                             },
-                            ..Default::default()
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -3081,6 +3226,126 @@ impl Database {
             })
             .await?;
         Ok(v.unwrap_or((0, 0)))
+    }
+
+    /// Persist an earned achievement for a character. Idempotent — a
+    /// re-earn of an already-`timeDone` row is a silent no-op. Returns
+    /// `true` iff this was a *first-time* earn (the only case that pops
+    /// the in-game earned toast), matching `PlayerHelperState::earn_achievement`.
+    ///
+    /// Also ensures a `gamedata_achievements` catalog row exists (with the
+    /// caller-supplied `points` and `packetOffsetId == achievement_id`) so
+    /// the downstream points-sum and completed-bitfield reads — which
+    /// INNER JOIN the catalog — resolve even on a fresh DB where the
+    /// catalog wasn't separately seeded.
+    pub async fn award_achievement(
+        &self,
+        chara_id: u32,
+        achievement_id: u32,
+        points: u32,
+    ) -> Result<bool> {
+        let now = common::utils::unix_timestamp();
+        let newly = self
+            .conn
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT OR IGNORE INTO gamedata_achievements
+                          (achievementId, name, packetOffsetId, rewardPoints)
+                      VALUES (:aid, '', :aid, :pts)",
+                    named_params! { ":aid": achievement_id, ":pts": points },
+                )?;
+                let already: Option<Option<i64>> = c
+                    .query_row(
+                        "SELECT timeDone FROM characters_achievements
+                         WHERE characterId = :cid AND achievementId = :aid",
+                        named_params! { ":cid": chara_id, ":aid": achievement_id },
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?;
+                if matches!(already, Some(Some(_))) {
+                    return Ok(false);
+                }
+                c.execute(
+                    r"INSERT INTO characters_achievements
+                          (characterId, achievementId, timeDone, progress, progressFlags)
+                      VALUES (:cid, :aid, :now, 0, 0)
+                      ON CONFLICT(characterId, achievementId)
+                          DO UPDATE SET timeDone = :now",
+                    named_params! { ":cid": chara_id, ":aid": achievement_id, ":now": now },
+                )?;
+                Ok(true)
+            })
+            .await?;
+        Ok(newly)
+    }
+
+    /// Sum of `rewardPoints` over the character's earned (`timeDone` set)
+    /// achievements — the value the client renders in the points display
+    /// (`SetAchievementPointsPacket`).
+    pub async fn get_achievement_points(&self, chara_id: u32) -> Result<u32> {
+        let pts = self
+            .conn
+            .call_db(move |c| {
+                let v: i64 = c.query_row(
+                    r"SELECT COALESCE(SUM(ga.rewardPoints), 0)
+                      FROM characters_achievements ca
+                      INNER JOIN gamedata_achievements ga
+                          ON ca.achievementId = ga.achievementId
+                      WHERE ca.characterId = :cid AND ca.timeDone IS NOT NULL",
+                    named_params! { ":cid": chara_id },
+                    |r| r.get(0),
+                )?;
+                Ok(v)
+            })
+            .await?;
+        Ok(pts.max(0) as u32)
+    }
+
+    /// Persist the character's equipped title (`characters.currentTitle`)
+    /// so a runtime `player:SetTitle(...)` survives relog (the login path
+    /// reads `currentTitle` back into `chara.current_title`).
+    pub async fn set_current_title(&self, chara_id: u32, title_id: u32) -> Result<()> {
+        self.conn
+            .call_db(move |c| {
+                c.execute(
+                    "UPDATE characters SET currentTitle = :t WHERE id = :cid",
+                    named_params! { ":t": title_id, ":cid": chara_id },
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert per-achievement progress (`progress` + `progressFlags`)
+    /// without marking the achievement done — feeds the 0x0135
+    /// progress-bar read (`get_achievement_progress`).
+    pub async fn set_achievement_progress(
+        &self,
+        chara_id: u32,
+        achievement_id: u32,
+        progress: u32,
+        progress_flags: u32,
+    ) -> Result<()> {
+        self.conn
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT INTO characters_achievements
+                          (characterId, achievementId, progress, progressFlags)
+                      VALUES (:cid, :aid, :p, :f)
+                      ON CONFLICT(characterId, achievementId)
+                          DO UPDATE SET progress = :p, progressFlags = :f",
+                    named_params! {
+                        ":cid": chara_id,
+                        ":aid": achievement_id,
+                        ":p": progress,
+                        ":f": progress_flags,
+                    },
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     // =======================================================================
@@ -4650,6 +4915,134 @@ mod battle_npc_spawn_tests {
     }
 }
 
+/// Wave 3 — achievement earn/persist DB round-trip. These back the
+/// runtime `player:EarnAchievement`/`:SetTitle` path, the zone-in sync,
+/// and the 0x0135 progress read, all of which now read the DB instead of
+/// hardcoding zeros.
+#[cfg(test)]
+mod achievement_persist_tests {
+    use super::*;
+
+    fn tempdb(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "garlemald-achievement-{label}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// earn → persist → read: awarding an achievement writes a
+    /// `characters_achievements` row (and its catalog reward), so the
+    /// subsequent points-sum, latest-5, and completed-id reads — the exact
+    /// reads the zone-in sync now performs — reflect it. A re-earn is a
+    /// silent no-op that leaves points unchanged.
+    #[tokio::test]
+    async fn award_achievement_round_trip() {
+        let path = tempdb("award");
+        let db = Database::open(&path).await.expect("open db");
+        let chara_id = 4242u32;
+
+        // First-time earn returns true and persists.
+        let newly = db.award_achievement(chara_id, 7, 10).await.expect("award");
+        assert!(newly, "first earn is a first-time earn");
+        assert_eq!(db.get_achievement_points(chara_id).await.unwrap(), 10);
+
+        // Zone-in sync reads: latest-5 leads with the just-earned id and
+        // the completed-id list (via packetOffsetId) contains it.
+        let latest = db.get_latest_achievements(chara_id).await.unwrap();
+        assert_eq!(latest[0], 7, "most-recent earn leads latest-5");
+        let completed = db.get_achievements(chara_id).await.unwrap();
+        assert!(
+            completed.contains(&7),
+            "completed offset-ids include the earned achievement; saw {completed:?}",
+        );
+
+        // A second achievement stacks points.
+        assert!(db.award_achievement(chara_id, 9, 5).await.unwrap());
+        assert_eq!(db.get_achievement_points(chara_id).await.unwrap(), 15);
+
+        // Re-earning is idempotent: false, and points don't move.
+        let again = db.award_achievement(chara_id, 7, 10).await.unwrap();
+        assert!(!again, "re-earn is not a first-time earn");
+        assert_eq!(db.get_achievement_points(chara_id).await.unwrap(), 15);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `set_current_title` persists to `characters.currentTitle` so a
+    /// runtime title change survives relog (login reads it back).
+    #[tokio::test]
+    async fn set_current_title_persists() {
+        let path = tempdb("title");
+        let db = Database::open(&path).await.expect("open db");
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (55, 0, 0, 0, 'Titled Tester')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        db.set_current_title(55, 777).await.expect("set title");
+        let stored: u32 = db
+            .conn_for_test()
+            .call_db(|c| {
+                let v = c.query_row(
+                    "SELECT currentTitle FROM characters WHERE id = 55",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(v)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, 777, "currentTitle persisted for relog");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `set_achievement_progress` upserts progress that the 0x0135 handler
+    /// now reads via `get_achievement_progress` (previously hardcoded to
+    /// (0, 0)).
+    #[tokio::test]
+    async fn achievement_progress_round_trip() {
+        let path = tempdb("progress");
+        let db = Database::open(&path).await.expect("open db");
+        let chara_id = 88u32;
+
+        // No row yet → (0, 0).
+        assert_eq!(
+            db.get_achievement_progress(chara_id, 100).await.unwrap(),
+            (0, 0),
+        );
+
+        db.set_achievement_progress(chara_id, 100, 3, 0b101)
+            .await
+            .expect("set progress");
+        assert_eq!(
+            db.get_achievement_progress(chara_id, 100).await.unwrap(),
+            (3, 0b101),
+        );
+
+        // Upsert overwrites in place.
+        db.set_achievement_progress(chara_id, 100, 7, 0)
+            .await
+            .expect("update progress");
+        assert_eq!(
+            db.get_achievement_progress(chara_id, 100).await.unwrap(),
+            (7, 0),
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Garlemald-Server #28 — the bag-slot resolver + gear-slot occupancy
 /// check that back the `EquipFromPackage` (`player:GetEquipment():Set`)
 /// applier.
@@ -4759,6 +5152,261 @@ mod equip_from_package_tests {
                 .expect("query"),
             "undergarment (class 0) should be visible from any class"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod key_item_tests {
+    use super::*;
+    use common::db::ConnCallExt;
+
+    fn tempdb(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "garlemald-key-item-{label}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// `add_key_item` inserts one non-stacking row into the KEYITEMS bag
+    /// (package 100) and is idempotent: granting the same key item twice
+    /// leaves exactly one row and reports `false` on the second call.
+    #[tokio::test]
+    async fn add_key_item_persists_and_is_idempotent() {
+        const KEY_ITEM_ID: u32 = 2_001_007;
+        let path = tempdb("idempotent");
+        let db = Database::open(&path).await.expect("open db");
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (42, 0, 0, 0, 'Key Keeper')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed character");
+
+        // First grant is newly added.
+        assert!(
+            db.add_key_item(42, KEY_ITEM_ID)
+                .await
+                .expect("add key item"),
+            "first grant should be newly added",
+        );
+
+        let rows = db
+            .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+            .await
+            .expect("read keyitems");
+        assert_eq!(rows.len(), 1, "exactly one key-item row");
+        assert_eq!(rows[0].item_id, KEY_ITEM_ID, "row carries the key item id");
+        assert_eq!(rows[0].quantity, 1, "key items are single-copy");
+
+        // Second grant is a no-op (already owned) and does not duplicate.
+        assert!(
+            !db.add_key_item(42, KEY_ITEM_ID)
+                .await
+                .expect("add key item again"),
+            "second grant should report already-owned",
+        );
+        let rows = db
+            .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+            .await
+            .expect("read keyitems");
+        assert_eq!(rows.len(), 1, "still exactly one key-item row after re-add");
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Inventory increment 3 — per-item stack-cap enforcement + multi-slot
+/// spill inside [`Database::add_harvest_item`]. Seeds a `gamedata_items`
+/// row with a deterministic `stackSize` so the cap is not the 99 default,
+/// then asserts fill-partials-then-spill slotting and the total-owned
+/// return contract.
+#[cfg(test)]
+mod add_harvest_item_stack_cap_tests {
+    use super::*;
+    use common::db::ConnCallExt;
+
+    fn tempdb(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "garlemald-harvest-cap-{label}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Seed one `gamedata_items` row so `add_harvest_item` reads a
+    /// deterministic per-item cap instead of the missing-row default.
+    /// The cap source is `maxStack` (the seed-populated authentic 1.x
+    /// column), matching the query in `add_harvest_item`.
+    async fn seed_item_cap(db: &Database, catalog_id: u32, max_stack: i32) {
+        db.conn_for_test()
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT INTO gamedata_items (catalogID, maxStack)
+                      VALUES (:id, :ms)",
+                    named_params! { ":id": catalog_id, ":ms": max_stack },
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed gamedata_items cap");
+    }
+
+    /// (serverItemId, itemId, quantity, slot) tuples for every NORMAL row,
+    /// slot-ordered — enough to assert the spill layout precisely.
+    async fn normal_rows(db: &Database, item: u32) -> Vec<(u32, i32, u16)> {
+        db.get_item_package(0, 0)
+            .await
+            .expect("read NORMAL bag")
+            .into_iter()
+            .filter(|r| r.item_id == item)
+            .map(|r| (r.item_id, r.quantity, r.slot))
+            .collect()
+    }
+
+    /// stackSize=5, add 12 in one shot → three rows [5,5,2] at slots
+    /// [0,1,2]; return is the full 12 owned.
+    #[tokio::test]
+    async fn add_harvest_item_caps_and_spills() {
+        const ITEM: u32 = 90_000_001;
+        let path = tempdb("caps-spills");
+        let db = Database::open(&path).await.expect("open db");
+        seed_item_cap(&db, ITEM, 5).await;
+
+        let total = db
+            .add_harvest_item(0, ITEM, 12, 1)
+            .await
+            .expect("add harvest");
+        assert_eq!(total, 12, "return is total owned across all stacks");
+
+        let rows = normal_rows(&db, ITEM).await;
+        let qtys: Vec<i32> = rows.iter().map(|r| r.1).collect();
+        let slots: Vec<u16> = rows.iter().map(|r| r.2).collect();
+        assert_eq!(qtys, vec![5, 5, 2], "12 spills into capped stacks");
+        assert_eq!(slots, vec![0, 1, 2], "spilled stacks take next free slots");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// stackSize=5, add 3 → single stack [3]; then add 4 → fills the first
+    /// stack to 5, spills 2 into a second stack → [5,2]; return is 7.
+    #[tokio::test]
+    async fn add_harvest_item_fills_partial_before_spilling() {
+        const ITEM: u32 = 90_000_002;
+        let path = tempdb("fill-partial");
+        let db = Database::open(&path).await.expect("open db");
+        seed_item_cap(&db, ITEM, 5).await;
+
+        assert_eq!(
+            db.add_harvest_item(0, ITEM, 3, 1).await.expect("first add"),
+            3,
+        );
+        let first = normal_rows(&db, ITEM).await;
+        assert_eq!(
+            first.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![3],
+            "first grant makes one sub-cap stack",
+        );
+
+        assert_eq!(
+            db.add_harvest_item(0, ITEM, 4, 1)
+                .await
+                .expect("second add"),
+            7,
+            "return is total owned after fill + spill",
+        );
+        let second = normal_rows(&db, ITEM).await;
+        assert_eq!(
+            second.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![5, 2],
+            "existing partial fills to cap before a new stack opens",
+        );
+        assert_eq!(second.iter().map(|r| r.2).collect::<Vec<_>>(), vec![0, 1],);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No `gamedata_items` row → the COALESCE default cap of 99 applies:
+    /// adding 100 spills into [99,1]; return is 100.
+    #[tokio::test]
+    async fn add_harvest_item_default_cap_99() {
+        const ITEM: u32 = 90_000_003;
+        let path = tempdb("default-99");
+        let db = Database::open(&path).await.expect("open db");
+        // Intentionally NOT seeding gamedata_items — exercises the fallback.
+
+        let total = db
+            .add_harvest_item(0, ITEM, 100, 1)
+            .await
+            .expect("add harvest");
+        assert_eq!(total, 100);
+
+        let rows = normal_rows(&db, ITEM).await;
+        assert_eq!(
+            rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![99, 1],
+            "default cap 99 splits 100 into [99, 1]",
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A seeded row whose `stackSize` is the schema DEFAULT of 0 (exactly
+    /// what the bundled `006_gamedata_items.sql` seed produces for every
+    /// real item) must be treated as "unset" and fall back to the 99 cap —
+    /// NOT clamped to a 1-stack. This guards the `NULLIF(stackSize, 0)`
+    /// mapping that keeps real seeded materials (Copper Ore, etc.) merging
+    /// instead of spilling one-per-slot.
+    #[tokio::test]
+    async fn add_harvest_item_zero_stacksize_falls_back_to_99() {
+        const ITEM: u32 = 90_000_005;
+        let path = tempdb("zero-stacksize");
+        let db = Database::open(&path).await.expect("open db");
+        seed_item_cap(&db, ITEM, 0).await; // stackSize=0, the schema default
+
+        let total = db
+            .add_harvest_item(0, ITEM, 100, 1)
+            .await
+            .expect("add harvest");
+        assert_eq!(total, 100);
+
+        let rows = normal_rows(&db, ITEM).await;
+        assert_eq!(
+            rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![99, 1],
+            "stackSize=0 is unset → 99 cap, not a 1-stack",
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sub-cap add against an existing sub-cap stack still merges in
+    /// place (one row), preserving the pre-existing return + slotting
+    /// contract the older tests rely on.
+    #[tokio::test]
+    async fn add_harvest_item_sub_cap_still_merges_in_place() {
+        const ITEM: u32 = 90_000_004;
+        let path = tempdb("sub-cap-merge");
+        let db = Database::open(&path).await.expect("open db");
+        seed_item_cap(&db, ITEM, 99).await;
+
+        assert_eq!(db.add_harvest_item(0, ITEM, 3, 1).await.unwrap(), 3);
+        assert_eq!(db.add_harvest_item(0, ITEM, 2, 1).await.unwrap(), 5);
+        let rows = normal_rows(&db, ITEM).await;
+        assert_eq!(rows.len(), 1, "sub-cap adds merge, not spill");
+        assert_eq!(rows[0].1, 5);
+        assert_eq!(rows[0].2, 0);
+
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -667,10 +667,15 @@ impl From<&crate::actor::Player> for PlayerSnapshot {
             current_job: p.character.chara.current_job as u8,
             current_gil: p.get_current_gil().max(0) as u32,
             initial_town: p.get_initial_town(),
-            tribe: 0,
-            guardian: 0,
-            birth_month: 0,
-            birth_day: 0,
+            // Profile fields are hydrated onto CharaState at
+            // session-begin (from LoadedPlayer). Read the real values so
+            // content scripts branching on tribe/guardian/birthday (and
+            // the playerWork.tribe emit) see the persisted character,
+            // matching build_player_snapshot_for_login.
+            tribe: p.character.chara.tribe,
+            guardian: p.character.chara.guardian,
+            birth_month: p.character.chara.birthday_month,
+            birth_day: p.character.chara.birthday_day,
             homepoint: p.player.homepoint,
             homepoint_inn: p.player.homepoint_inn,
             // Hotbar lives on CharaState (mirrored at session-begin
@@ -1409,15 +1414,36 @@ impl UserData for LuaPlayer {
         // --- Guildleve trio ---------------------------------------
         // GM-side leve management (gm/addguildleve.lua,
         // gm/removeguildleve.lua) + CraftCommand.lua's quest
-        // lookup. The full leve subsystem (LeveDirector,
-        // characters_guildleve table, leve completion state
-        // machine) isn't ported yet; logged stubs let the
-        // commands not crash. 3 sites total.
+        // lookup. The full C# tradecraft leve subsystem
+        // (LeveDirector, `gamedata_guildleves` catalog, leve
+        // completion state machine) isn't ported yet, so ids
+        // outside the regional range stay a logged stub.
+        //
+        // Ids inside the fieldcraft/battlecraft range
+        // (`130_001..=130_450` / `140_001..=140_450`) DO have a
+        // built accept pipeline, so route them into it: this is the
+        // content-side entry point that turns `!addguildleve <id>`
+        // (gm/addguildleve.lua) into a real journal accept — the
+        // leve then ticks via the live fieldcraft/battlecraft
+        // progress hooks and can be handed in via
+        // `HandInRegionalLeve`. Band 0 (easiest) is used since the
+        // GM command carries no difficulty argument.
         methods.add_method("AddGuildleve", |_, this, gl_id: u32| {
+            if crate::leve::is_regional_leve_quest_id(gl_id) {
+                push(
+                    &this.queue,
+                    LuaCommand::AcceptRegionalLeve {
+                        player_id: this.snapshot.actor_id,
+                        leve_id: gl_id,
+                        difficulty: 0,
+                    },
+                );
+                return Ok(());
+            }
             tracing::debug!(
                 player = this.snapshot.actor_id,
                 gl_id,
-                "AddGuildleve captured (leve subsystem not wired)",
+                "AddGuildleve captured (non-regional id — C# guildleve subsystem not wired)",
             );
             Ok(())
         });
@@ -2188,6 +2214,40 @@ impl UserData for LuaPlayer {
                 LuaCommand::AddGil {
                     actor_id: this.snapshot.actor_id,
                     amount,
+                },
+            );
+            Ok(())
+        });
+
+        // `player:EarnAchievement(achievementId[, points])` — pop the
+        // earned toast, persist to `characters_achievements`, and re-sync
+        // the points total + latest-5 (Phase 8 achievement subsystem).
+        // Idempotent on a re-earn. `points` (default 0) seeds the catalog
+        // reward when the achievement isn't otherwise in
+        // `gamedata_achievements`.
+        methods.add_method(
+            "EarnAchievement",
+            |_, this, (achievement_id, points): (u32, Option<u32>)| {
+                push(
+                    &this.queue,
+                    LuaCommand::EarnAchievement {
+                        actor_id: this.snapshot.actor_id,
+                        achievement_id,
+                        points: points.unwrap_or(0),
+                    },
+                );
+                Ok(())
+            },
+        );
+
+        // `player:SetTitle(titleId)` — equip / clear the current title,
+        // persist it (survives relog), and broadcast SetPlayerTitle.
+        methods.add_method("SetTitle", |_, this, title_id: u32| {
+            push(
+                &this.queue,
+                LuaCommand::SetTitle {
+                    actor_id: this.snapshot.actor_id,
+                    title_id,
                 },
             );
             Ok(())
@@ -4810,17 +4870,21 @@ impl UserData for LuaItemPackage {
             }
             Ok(())
         });
-        methods.add_method("RemoveItem", |_, this, catalog: u32| {
-            push(
-                &this.queue,
-                LuaCommand::RemoveItem {
-                    actor_id: this.owner_actor_id,
-                    item_package: this.package_code,
-                    server_item_id: catalog as u64,
-                },
-            );
-            Ok(())
-        });
+        methods.add_method(
+            "RemoveItem",
+            |_, this, (catalog, quantity): (u32, Option<i32>)| {
+                push(
+                    &this.queue,
+                    LuaCommand::RemoveItem {
+                        actor_id: this.owner_actor_id,
+                        item_package: this.package_code,
+                        catalog_id: catalog,
+                        quantity: quantity.unwrap_or(1),
+                    },
+                );
+                Ok(())
+            },
+        );
         // `package:HasItem(catalogId, [minQty])` — answer locally from
         // the inventory snapshot the owning `LuaPlayer` cloned in at
         // `GetItemPackage(...)` time. Mirrors C#
@@ -5821,6 +5885,16 @@ impl UserData for LuaRegionalLeveResolver {
                 .by_id(id)
                 .cloned()
                 .map(|inner| LuaRegionalLeve { inner }))
+        });
+        // `resolver:LeveForCard(cardId)` — resolve a guildleve UI
+        // plate / card id (e.g. `0x30C3`, as rendered by
+        // PopulaceGuildlevePublisher's `eventTalkCard` grid) to its
+        // catalog leve id. Returns the leve id (u32) so the levemete
+        // accept branch can chain into
+        // `player:AcceptRegionalLeve(leveId, band)`, or `nil` when the
+        // clicked card has no seeded leve (unmapped card / plate 0).
+        methods.add_method("LeveForCard", |_, this, card_id: u32| {
+            Ok(this.resolver.leve_for_plate(card_id).map(|d| d.id))
         });
         methods.add_method("GetNumLeves", |_, this, _: ()| {
             Ok(this.resolver.num_leves() as u32)

@@ -1111,6 +1111,494 @@ async fn apply_add_gil_emits_currency_bracket_and_obtain_toast() {
     );
 }
 
+/// Inventory live-producer increment 1 — a mid-session NORMAL `AddItem`
+/// persists via `add_harvest_item` AND pushes a no-wipe single-package
+/// bracket to the owning client: `0x016D(no-wipe) → 0x0146(200, 0) →
+/// 0x0148(ListX01) → 0x0147 → 0x016E`, every subpacket target-stamped
+/// (proxy rule), the X01 row carrying the new stack's total. DB reflects
+/// the granted quantity.
+#[tokio::test]
+async fn live_add_item_emits_normal_no_wipe_bracket() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const ITEM_ID: u32 = 10_009_001;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Baggins Bagholder')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    registry
+        .insert(ActorHandle::new(
+            42,
+            ActorKindTag::Player,
+            230,
+            42,
+            Character::new(42),
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_add_item(
+        42,
+        crate::inventory::PKG_NORMAL,
+        ITEM_ID,
+        5,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+
+    // DB reflects the grant.
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_NORMAL as u32)
+        .await
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.item_id == ITEM_ID)
+        .expect("NORMAL row for the granted item");
+    assert_eq!(row.quantity, 5, "DB carries the granted quantity");
+
+    // Wire: exactly the 5-subpacket no-wipe bracket.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_LIST_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "no-wipe NORMAL bracket; saw {opcodes:?}",
+    );
+    // BeginChange data[0] == 0 → no wipe.
+    assert_eq!(subs[0].data[0], 0, "begin_change must be no-wipe");
+    // SetBegin body: u32 actor, u16 capacity 200, u16 code 0 (NORMAL).
+    let set_begin = &subs[1].data;
+    assert_eq!(
+        u16::from_le_bytes([set_begin[4], set_begin[5]]),
+        crate::inventory::CAP_NORMAL,
+    );
+    assert_eq!(
+        u16::from_le_bytes([set_begin[6], set_begin[7]]),
+        crate::inventory::PKG_NORMAL,
+    );
+    // X01 record: u64 unique_id, i32 quantity @8, u32 item_id @12.
+    let item = &subs[2].data;
+    let qty = i32::from_le_bytes([item[8], item[9], item[10], item[11]]);
+    let item_id = u32::from_le_bytes([item[12], item[13], item[14], item[15]]);
+    let unique_id = u64::from_le_bytes(item[..8].try_into().unwrap());
+    assert_eq!(qty, 5, "X01 carries the post-grant stack total");
+    assert_eq!(item_id, ITEM_ID, "X01 carries the granted catalog id");
+    assert_ne!(unique_id, 0, "X01 carries the real server_items.id");
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+}
+
+/// Inventory live-producer increment 2 — a mid-session KEYITEMS
+/// `AddItem` persists via `add_key_item` AND pushes a no-wipe
+/// single-package bracket to the owning client: `0x016D(no-wipe) →
+/// 0x0146(500, 100) → 0x0148(ListX01) → 0x0147 → 0x016E`, every subpacket
+/// target-stamped (proxy rule), the X01 row carrying the granted key item.
+/// A SECOND grant of the same key item is idempotent — no wire traffic.
+#[tokio::test]
+async fn live_add_key_item_emits_keyitems_bracket() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const KEY_ITEM_ID: u32 = 2_001_007;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Key Keeper')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    registry
+        .insert(ActorHandle::new(
+            42,
+            ActorKindTag::Player,
+            230,
+            42,
+            Character::new(42),
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_add_item(
+        42,
+        crate::inventory::PKG_KEYITEMS,
+        KEY_ITEM_ID,
+        1,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+
+    // DB reflects the key item in package 100.
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one key-item row persisted");
+    assert_eq!(rows[0].item_id, KEY_ITEM_ID, "DB carries the key item id");
+
+    // Wire: exactly the 5-subpacket no-wipe KEYITEMS bracket.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_LIST_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "no-wipe KEYITEMS bracket; saw {opcodes:?}",
+    );
+    // BeginChange data[0] == 0 → no wipe.
+    assert_eq!(subs[0].data[0], 0, "begin_change must be no-wipe");
+    // SetBegin body: u32 actor, u16 capacity 500, u16 code 100 (KEYITEMS).
+    let set_begin = &subs[1].data;
+    assert_eq!(
+        u16::from_le_bytes([set_begin[4], set_begin[5]]),
+        crate::inventory::CAP_KEYITEMS,
+    );
+    assert_eq!(
+        u16::from_le_bytes([set_begin[6], set_begin[7]]),
+        crate::inventory::PKG_KEYITEMS,
+    );
+    // X01 record: u64 unique_id, u32 item_id @12.
+    let item = &subs[2].data;
+    let item_id = u32::from_le_bytes([item[12], item[13], item[14], item[15]]);
+    let unique_id = u64::from_le_bytes(item[..8].try_into().unwrap());
+    assert_eq!(item_id, KEY_ITEM_ID, "X01 carries the granted key item id");
+    assert_ne!(unique_id, 0, "X01 carries the real server_items.id");
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+
+    // A SECOND grant of the same key item is idempotent: already owned,
+    // so nothing new persists AND no wire traffic is emitted.
+    crate::runtime::quest_apply::apply_add_item(
+        42,
+        crate::inventory::PKG_KEYITEMS,
+        KEY_ITEM_ID,
+        1,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "still exactly one key-item row after re-add");
+    assert!(
+        rx.try_recv().is_err(),
+        "idempotent re-add must emit no wire traffic",
+    );
+}
+
+/// Inventory live-producer increment 1 — a mid-session `RemoveItem` that
+/// fully drains a stack frees its slot: DB row deleted, and the owning
+/// client sees a no-wipe bracket carrying a `RemoveX01` for the freed
+/// slot (`0x016D(no-wipe) → 0x0146(200, 0) → 0x0152(RemoveX01) → 0x0147 →
+/// 0x016E`), every subpacket target-stamped.
+#[tokio::test]
+async fn live_remove_item_emits_remove_bracket() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const ITEM_ID: u32 = 10_009_002;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Baggins Bagholder')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Seed a 5-stack in the NORMAL bag (slot 0).
+    assert_eq!(db.add_harvest_item(42, ITEM_ID, 5, 1).await.unwrap(), 5);
+
+    registry
+        .insert(ActorHandle::new(
+            42,
+            ActorKindTag::Player,
+            230,
+            42,
+            Character::new(42),
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    // Remove the whole stack → depleted → slot freed.
+    crate::runtime::quest_apply::apply_remove_item(
+        42,
+        crate::inventory::PKG_NORMAL,
+        ITEM_ID,
+        5,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+
+    // DB row is gone.
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_NORMAL as u32)
+        .await
+        .unwrap();
+    assert!(
+        !rows.iter().any(|r| r.item_id == ITEM_ID),
+        "depleted stack must be deleted from the bag; got {rows:?}",
+    );
+
+    // Wire: no-wipe bracket with a RemoveX01 for the freed slot 0.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_REMOVE_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "no-wipe remove bracket; saw {opcodes:?}",
+    );
+    assert_eq!(subs[0].data[0], 0, "begin_change must be no-wipe");
+    // RemoveX01 body: u16 slot @0 == freed slot 0.
+    let remove = &subs[2].data;
+    assert_eq!(
+        u16::from_le_bytes([remove[0], remove[1]]),
+        0,
+        "RemoveX01 must free the depleted slot (0)",
+    );
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+}
+
+/// Wave 3 — `apply_earn_achievement` end-to-end: a first-time earn
+/// persists to `characters_achievements` AND dispatches the earned toast
+/// (0x019E) + points (0x019C) + latest-5 (0x019B) to the owning client,
+/// every subpacket target-stamped. A re-earn is a silent no-op (no
+/// packets, points unchanged), matching retail idempotency.
+#[tokio::test]
+async fn apply_earn_achievement_persists_and_syncs() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+
+    let chara = Character::new(42);
+    registry
+        .insert(ActorHandle::new(42, ActorKindTag::Player, 230, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_earn_achievement(42, 7, 10, &registry, &world, &db).await;
+
+    // Persisted: the DB reads the zone-in sync performs now reflect it.
+    assert_eq!(db.get_achievement_points(42).await.unwrap(), 10);
+    assert_eq!(db.get_latest_achievements(42).await.unwrap()[0], 7);
+    assert!(db.get_achievements(42).await.unwrap().contains(&7));
+
+    let mut opcodes = Vec::new();
+    let mut targets = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            opcodes.push(sub.game_message.opcode);
+            targets.push(sub.header.target_id);
+        }
+    }
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_ACHIEVEMENT_EARNED,
+            crate::packets::opcodes::OP_SET_ACHIEVEMENT_POINTS,
+            crate::packets::opcodes::OP_SET_LATEST_ACHIEVEMENTS,
+        ],
+        "earn dispatches toast + points + latest",
+    );
+    assert!(
+        targets.iter().all(|&t| t == 42),
+        "every self-bound subpacket is session-stamped; saw {targets:?}",
+    );
+
+    // Re-earn: idempotent — no new packets, points unchanged.
+    crate::runtime::quest_apply::apply_earn_achievement(42, 7, 10, &registry, &world, &db).await;
+    assert!(rx.try_recv().is_err(), "re-earn dispatches nothing");
+    assert_eq!(db.get_achievement_points(42).await.unwrap(), 10);
+}
+
+/// Wave 3 — `apply_set_title` persists `characters.currentTitle`, mirrors
+/// it onto the live registry Character (so a same-session zone-in renders
+/// it), and dispatches SetPlayerTitle (0x019D).
+#[tokio::test]
+async fn apply_set_title_persists_and_dispatches() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Titled')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let chara = Character::new(42);
+    registry
+        .insert(ActorHandle::new(42, ActorKindTag::Player, 230, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_set_title(42, 777, &registry, &world, &db).await;
+
+    // Persisted for relog.
+    let stored: u32 = db
+        .conn_for_test()
+        .call_db(|c| {
+            let v = c.query_row(
+                "SELECT currentTitle FROM characters WHERE id = 42",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(v)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, 777);
+
+    // Mirrored onto the live Character (drives same-session zone-in).
+    let handle = registry.get(42).await.unwrap();
+    assert_eq!(handle.character.read().await.chara.current_title, 777);
+
+    // Dispatched exactly one SetPlayerTitle, session-stamped.
+    let bytes = rx.try_recv().expect("title packet");
+    let mut offset = 0;
+    let sub = common::subpacket::SubPacket::parse(&bytes, &mut offset).unwrap();
+    assert_eq!(
+        sub.game_message.opcode,
+        crate::packets::opcodes::OP_SET_PLAYER_TITLE,
+    );
+    assert_eq!(sub.header.target_id, 42);
+    assert!(rx.try_recv().is_err(), "exactly one title packet");
+}
+
 #[tokio::test]
 async fn set_exp_persists_per_class_column() {
     use common::db::ConnCallExt;
@@ -3858,6 +4346,189 @@ async fn ported_dummy_command_lua_parses() {
     engine
         .load_script(&script)
         .expect("DummyCommand.lua should parse after the resolver-driven rewrite");
+}
+
+/// Lua binding: `GetGatherNodeMetadata(zoneId, uniqueId)` resolves an
+/// installed `(zone_id, unique_id) → (harvestNodeId, harvestType)`
+/// snapshot to a `{ harvestNodeId, harvestType }` table, and returns
+/// `nil` for an unknown key. This is the per-node routing surface
+/// `DummyCommand.lua` reads to pick the clicked node's template +
+/// discipline instead of the hardcoded tutorial mine.
+#[tokio::test]
+async fn lua_gather_node_metadata_binding_resolves_installed_key() {
+    use crate::lua::LuaEngine;
+    use crate::world_manager::GatherNodeMetadata;
+    use std::collections::HashMap;
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts/lua");
+    let engine = LuaEngine::new(&script_root);
+
+    // A logging node in zone 180 and a fishing node in zone 155.
+    let mut metadata: HashMap<(u32, String), GatherNodeMetadata> = HashMap::new();
+    metadata.insert(
+        (180, "logging_bramble_gridania_1".to_string()),
+        GatherNodeMetadata {
+            harvest_node_id: 2001,
+            harvest_type: crate::gathering::HARVEST_TYPE_LOG,
+        },
+    );
+    metadata.insert(
+        (155, "fishing_hole_la_noscea_1".to_string()),
+        GatherNodeMetadata {
+            harvest_node_id: 3001,
+            harvest_type: crate::gathering::HARVEST_TYPE_FISH,
+        },
+    );
+    engine.catalogs().install_gather_node_metadata(metadata);
+
+    // Rust accessor resolves both keys and rejects an unknown one.
+    let cats = engine.catalogs();
+    let logging = cats
+        .gather_node_metadata(180, "logging_bramble_gridania_1")
+        .expect("logging node metadata present");
+    assert_eq!(logging.harvest_node_id, 2001);
+    assert_eq!(logging.harvest_type, crate::gathering::HARVEST_TYPE_LOG);
+    assert!(cats.gather_node_metadata(180, "does_not_exist").is_none());
+    assert!(
+        cats.gather_node_metadata(999, "logging_bramble_gridania_1")
+            .is_none()
+    );
+
+    // Lua binding surfaces the same tuple as a table and nil for a miss.
+    let probe = script_root.join("commands/__probe_gather_meta.lua");
+    std::fs::write(&probe, "").unwrap();
+    let (lua, _queue) = engine.load_script(&probe).expect("load probe");
+
+    let (log_node, log_type, fish_node, fish_type, miss_is_nil): (i64, i64, i64, i64, bool) = lua
+        .load(
+            r#"
+            local logMeta = GetGatherNodeMetadata(180, "logging_bramble_gridania_1")
+            local fishMeta = GetGatherNodeMetadata(155, "fishing_hole_la_noscea_1")
+            local miss = GetGatherNodeMetadata(180, "nope")
+            return logMeta.harvestNodeId, logMeta.harvestType,
+                   fishMeta.harvestNodeId, fishMeta.harvestType,
+                   miss == nil
+        "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(log_node, 2001);
+    assert_eq!(log_type, crate::gathering::HARVEST_TYPE_LOG as i64);
+    assert_eq!(fish_node, 3001);
+    assert_eq!(fish_type, crate::gathering::HARVEST_TYPE_FISH as i64);
+    assert!(miss_is_nil);
+
+    let _ = std::fs::remove_file(&probe);
+}
+
+/// End-to-end clicked-node threading: the harvest-command dispatch stamps
+/// the struck gather node's `(zone_id, unique_id)` onto the `commandActor`
+/// userdata, so a command script can resolve the node's template via
+/// `GetGatherNodeMetadata(commandActor:GetZoneID(), commandActor:GetUniqueId())`
+/// instead of the hardcoded tutorial mine. Drives the real
+/// `LuaEngine::call_command_on_event_started` command path (the same one
+/// `DummyCommand.lua` runs through) with a minimal probe script.
+/// (Wave 3 gather partial.)
+#[tokio::test]
+async fn command_actor_identity_threads_clicked_gather_node() {
+    use crate::lua::LuaEngine;
+    use crate::lua::command::LuaCommand;
+    use crate::lua::userdata::PlayerSnapshot;
+    use crate::world_manager::GatherNodeMetadata;
+    use std::collections::HashMap;
+
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-gather-cmd-identity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("commands")).unwrap();
+    // Probe command script: resolve the clicked node off `commandActor`
+    // and echo the resolved template via an AddItem so the test can
+    // inspect it. Empty identity (no node) resolves to nil → no AddItem.
+    let probe = root.join("commands/__probe_gather_identity.lua");
+    std::fs::write(
+        &probe,
+        r#"
+        function onEventStarted(player, commandActor, triggerName)
+            local meta = GetGatherNodeMetadata(commandActor:GetZoneID(), commandActor:GetUniqueId())
+            if meta ~= nil then
+                player:GetItemPackage(0):AddItem(meta.harvestNodeId, meta.harvestType)
+            end
+        end
+        "#,
+    )
+    .unwrap();
+
+    let engine = LuaEngine::new(&root);
+    let mut metadata: HashMap<(u32, String), GatherNodeMetadata> = HashMap::new();
+    metadata.insert(
+        (180, "logging_bramble_gridania_1".to_string()),
+        GatherNodeMetadata {
+            harvest_node_id: 2001,
+            harvest_type: crate::gathering::HARVEST_TYPE_LOG,
+        },
+    );
+    engine.catalogs().install_gather_node_metadata(metadata);
+
+    let snapshot = PlayerSnapshot {
+        actor_id: 0x1234_5678,
+        ..Default::default()
+    };
+
+    // Resolved node → the probe reads its (zone, unique) off commandActor
+    // and resolves the LOG template (2001 / HARVEST_TYPE_LOG).
+    let resolved = engine.call_command_on_event_started(
+        &probe,
+        snapshot.clone(),
+        0xA0F0_0000 | crate::gathering::HARVEST_TYPE_LOG, // Log command static actor
+        "commandRequest".to_string(),
+        0,
+        Vec::new(),
+        Some((180, "logging_bramble_gridania_1".to_string())),
+    );
+    assert!(
+        resolved.error.is_none(),
+        "probe onEventStarted errored: {:?}",
+        resolved.error,
+    );
+    assert!(
+        resolved.commands.iter().any(|c| matches!(
+            c,
+            LuaCommand::AddItem { item_id, quantity, .. }
+                if *item_id == 2001 && *quantity == crate::gathering::HARVEST_TYPE_LOG as i32
+        )),
+        "clicked node must resolve to its own template; got {:?}",
+        resolved.commands,
+    );
+
+    // No resolved node (server couldn't map the target) → empty identity,
+    // GetGatherNodeMetadata(0, "") is nil, no template echoed.
+    let unresolved = engine.call_command_on_event_started(
+        &probe,
+        snapshot,
+        0xA0F0_0000 | crate::gathering::HARVEST_TYPE_MINE,
+        "commandRequest".to_string(),
+        0,
+        Vec::new(),
+        None,
+    );
+    assert!(unresolved.error.is_none());
+    assert!(
+        !unresolved
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::AddItem { .. })),
+        "an unresolved node must not echo any template; got {:?}",
+        unresolved.commands,
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -11196,6 +11867,78 @@ async fn accept_regional_leve_installs_journal_entry_and_persists() {
     );
 }
 
+/// Seed 066 wiring: a levemete UI card (guildleve plate) id resolves
+/// through the catalog to the expected seeded battlecraft leve id, and
+/// feeding that resolved id into `apply_accept_regional_leve` journals
+/// the leve. Exercises the full levemete-side path the
+/// PopulaceGuildlevePublisher accept branch now drives:
+/// `resolver:LeveForCard(card)` -> `player:AcceptRegionalLeve(leveId, 0)`.
+#[tokio::test]
+async fn card_id_resolves_to_seeded_leve_and_accept_journals() {
+    use crate::runtime::quest_apply::apply_accept_regional_leve;
+    use common::db::ConnCallExt;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (311, 0, 0, 0, 'CardAccepter')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let lua = Arc::new(crate::lua::LuaEngine::new(&script_root));
+    let resolver = db.load_regional_leve_resolver().await.unwrap();
+
+    // Card 0x30C3 is the first battlecraft card the levemete script
+    // renders; seed 066 maps it to leve 140_001.
+    let leve = resolver
+        .leve_for_plate(0x30C3)
+        .expect("card 0x30C3 maps to a seeded leve");
+    assert_eq!(leve.id, 140_001, "plate 0x30C3 -> leve 140_001");
+    let leve_id = leve.id;
+    // Plate 0 (the DB default) must never resolve — guards against the
+    // unmapped fieldcraft rows collapsing onto a single key.
+    assert!(
+        resolver.leve_for_plate(0).is_none(),
+        "unmapped plate id never resolves",
+    );
+
+    lua.catalogs().install_regional_leve_resolver(resolver);
+
+    let registry = Arc::new(ActorRegistry::new());
+    let character = crate::actor::Character::new(311);
+    registry
+        .insert(ActorHandle::new(
+            311,
+            ActorKindTag::Player,
+            180,
+            311,
+            character,
+        ))
+        .await;
+
+    let accepted = apply_accept_regional_leve(311, leve_id, 0, &registry, &db, Some(&lua)).await;
+    assert!(accepted, "resolved card leve accepts");
+
+    let h = registry.get(311).await.unwrap();
+    let c = h.character.read().await;
+    let q = c.quest_journal.get(leve_id).expect("leve in journal");
+    assert!(q.get_flag(crate::leve::ACCEPTED_FLAG_BIT));
+}
+
 /// Accept on a leve id the catalog doesn't know about returns false
 /// without touching the journal. Guards against client-side typos
 /// ghost-writing empty quest slots.
@@ -11476,6 +12219,77 @@ async fn lua_player_accept_regional_leve_emits_command() {
         } => {
             assert_eq!(*leve_id, 140_001);
             assert_eq!(*difficulty, 0, "omitted band defaults to 0");
+        }
+        other => panic!("expected AcceptRegionalLeve, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&probe);
+}
+
+/// `player:AddGuildleve(id)` — the GM `!addguildleve` entry point —
+/// routes ids in the regional (fieldcraft/battlecraft) leve range
+/// into the built accept pipeline (emitting `AcceptRegionalLeve` at
+/// band 0), while ids outside that range stay a no-op stub (the C#
+/// tradecraft guildleve catalog isn't ported). This is the content
+/// wiring that lets a regional leve actually be accepted.
+#[tokio::test]
+async fn lua_player_add_guildleve_routes_regional_ids_to_accept() {
+    use crate::lua::command::CommandQueue;
+    use crate::lua::userdata::{LuaPlayer, PlayerSnapshot};
+    use crate::lua::{LuaCommandKind, LuaEngine};
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let engine = LuaEngine::new(&script_root);
+    let probe = script_root.join("commands/__probe_add_guildleve.lua");
+    std::fs::write(&probe, "").unwrap();
+    let (lua, _queue) = engine.load_script(&probe).expect("load probe");
+
+    let queue = CommandQueue::new();
+    let snapshot = PlayerSnapshot {
+        actor_id: 909,
+        name: "Levemete".to_string(),
+        ..Default::default()
+    };
+    let player = LuaPlayer {
+        snapshot,
+        queue: queue.clone(),
+    };
+    lua.globals().set("player", player).unwrap();
+
+    lua.load(
+        r#"
+        player:AddGuildleve(140001) -- battlecraft: routes to accept
+        player:AddGuildleve(130450) -- fieldcraft upper bound: routes
+        player:AddGuildleve(50)     -- C# tradecraft id: no-op stub
+        "#,
+    )
+    .exec()
+    .unwrap();
+
+    let cmds = CommandQueue::drain(&queue);
+    assert_eq!(
+        cmds.len(),
+        2,
+        "only the two regional-range ids emit a command; the tradecraft id is a stub"
+    );
+    match &cmds[0] {
+        LuaCommandKind::AcceptRegionalLeve {
+            player_id,
+            leve_id,
+            difficulty,
+        } => {
+            assert_eq!(*player_id, 909);
+            assert_eq!(*leve_id, 140_001);
+            assert_eq!(*difficulty, 0, "GM add carries no band → easiest");
+        }
+        other => panic!("expected AcceptRegionalLeve, got {other:?}"),
+    }
+    match &cmds[1] {
+        LuaCommandKind::AcceptRegionalLeve { leve_id, .. } => {
+            assert_eq!(*leve_id, 130_450, "fieldcraft upper bound still routes");
         }
         other => panic!("expected AcceptRegionalLeve, got {other:?}"),
     }
@@ -15374,4 +16188,177 @@ fn real_aetheryte_parent_attunement_advances_man0l1() {
         "attunement at man0l1 SEQ_003 must fire processEvent025; got {:?}",
         result.commands,
     );
+}
+
+/// `player:SendMessage(messageType, sender, text)` drained through the
+/// LOGIN applier (`PacketProcessor::apply_login_lua_command`) must emit
+/// exactly one 0x0003 `SendMessagePacket` to the invoking player's own
+/// client — sender in the fixed 0x20 ASCII slot, u32 message type at
+/// 0x20, text from 0x24. Regression guard for the arm that used to only
+/// log "packet emit deferred" and send nothing.
+#[tokio::test]
+async fn send_message_login_hook_emits_0x0003_to_self() {
+    use crate::actor::{Character, Player};
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let chara = Character::new(8);
+    let _player = Player::with_helpers(8);
+    registry
+        .insert(ActorHandle::new(8, ActorKindTag::Player, 200, 8, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 8,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(8, ClientHandle::new(8, tx)).await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+    let handle = registry.get(8).await.expect("player handle");
+
+    processor
+        .apply_login_lua_command(
+            &handle,
+            LuaCommand::SendMessage {
+                actor_id: 8,
+                message_type: 0x20,
+                sender: String::new(),
+                text: "hello world".to_string(),
+            },
+        )
+        .await;
+
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    assert_eq!(
+        subs.len(),
+        1,
+        "exactly one SendMessage subpacket; saw {}",
+        subs.len()
+    );
+    let sub = &subs[0];
+    assert_eq!(
+        sub.game_message.opcode,
+        crate::packets::opcodes::OP_SEND_MESSAGE,
+        "SendMessage rides opcode 0x0003",
+    );
+    // Body: sender (empty) in the 0x20 slot, u32 message type at 0x20,
+    // text from 0x24.
+    assert!(
+        sub.data[..0x20].iter().all(|b| *b == 0),
+        "empty sender slot"
+    );
+    assert_eq!(&sub.data[0x20..0x24], &[0x20, 0, 0, 0], "message type 0x20");
+    assert_eq!(&sub.data[0x24..0x24 + 11], b"hello world", "text body");
+}
+
+/// The same command drained through the RUNTIME applier
+/// (`apply_runtime_lua_command`, the quest/NPC-hook path) must ALSO
+/// emit the 0x0003 packet. Before wiring, the runtime applier had no
+/// `SendMessage` arm and the command fell through to the
+/// "runtime lua command unhandled" log — silently dropping every
+/// `:SendMessage(...)` reached via a chat-resume drain.
+#[tokio::test]
+async fn send_message_runtime_applier_emits_0x0003_to_self() {
+    use crate::actor::{Character, Player};
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let chara = Character::new(11);
+    let _player = Player::with_helpers(11);
+    registry
+        .insert(ActorHandle::new(11, ActorKindTag::Player, 200, 11, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 11,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(11, ClientHandle::new(11, tx)).await;
+
+    let handled = crate::runtime::quest_apply::apply_runtime_lua_command(
+        LuaCommand::SendMessage {
+            actor_id: 11,
+            message_type: 0x20,
+            sender: String::new(),
+            text: "runtime line".to_string(),
+        },
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+    assert!(
+        handled,
+        "runtime applier must claim the SendMessage command"
+    );
+
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    assert_eq!(
+        subs.len(),
+        1,
+        "exactly one SendMessage subpacket; saw {}",
+        subs.len()
+    );
+    assert_eq!(
+        subs[0].game_message.opcode,
+        crate::packets::opcodes::OP_SEND_MESSAGE,
+        "SendMessage rides opcode 0x0003",
+    );
+    assert_eq!(&subs[0].data[0x24..0x24 + 12], b"runtime line", "text body");
 }

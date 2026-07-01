@@ -85,6 +85,16 @@ Notes:
 
 minerAnim = {0x14001000, 0x14002000, 0x14003000};
 
+-- Per-harvest-type strike animation set. Only the mining ids are
+-- attested (from the ioncannon mining slice); logging/fishing/quarry/
+-- botany/spearfish reuse the mining set as a documented fallback until
+-- their real PlayAnimation ids are recovered. The minigame RPC sequence
+-- itself is type-agnostic — the client's HarvestJudge script branches on
+-- `harvestType` internally for the per-discipline visuals — so driving
+-- the same server-side loop for every type is correct; only the anim
+-- table is a placeholder.
+harvestAnimByType = {};
+
 --[[ Mooglebox - Aim
 +5  +4  +3  +2  +1   0  -1  -2  -3  -4   -5
  0  10  20  30  40  50  60  70  80  90  100
@@ -108,13 +118,41 @@ function onEventStarted(player, commandActor, triggerName, arg1, arg2, arg3, arg
     commandMine = 22002;
     commandLog = 22003;
     commandFish = 22004;
+    commandQuarry = 22005;
+    commandBotany = 22006;   -- "Harvest" discipline.
+    commandSpearfish = 22007;
 
-    -- TODO: once `server_gather_node_spawns` drives actor creation and
-    -- the clicked node's harvestNodeId is threaded through the command
-    -- args, read it from there. For now the first grade-2 tutorial
-    -- template (1001) is fine — every harvest flow falls back to the
-    -- same scripted experience.
-    harvestNodeId = 1001;
+    harvestAnimByType[commandMine] = minerAnim;
+    harvestAnimByType[commandLog] = minerAnim;
+    harvestAnimByType[commandFish] = minerAnim;
+    harvestAnimByType[commandQuarry] = minerAnim;
+    harvestAnimByType[commandBotany] = minerAnim;
+    harvestAnimByType[commandSpearfish] = minerAnim;
+
+    -- Per-node routing. `GetGatherNodeMetadata(zoneId, uniqueId)` resolves
+    -- the CLICKED node's `(harvestNodeId, harvestType)` from its actor
+    -- identity.
+    --
+    -- The command static actor (0xA0F0xxxx) is identical for every
+    -- gathering node, so the server-side harvest-command dispatch resolves
+    -- the player's current target (the node they struck) and stamps its
+    -- `(zoneId, uniqueId)` onto THIS `commandActor` userdata before the
+    -- script runs. When the server couldn't resolve a node (no gather
+    -- node under the reticle) the fields stay empty/zero and we fall back
+    -- to the grade-2 tutorial mining template (1001 / commandMine).
+    local nodeUniqueId = commandActor:GetUniqueId();
+    local nodeZoneId = commandActor:GetZoneID();
+
+    harvestNodeId = 1001;     -- Tutorial grade-2 mining fallback.
+    harvestType = commandMine;
+
+    if nodeUniqueId ~= nil and nodeUniqueId ~= "" and nodeZoneId ~= nil and nodeZoneId ~= 0 then
+        local meta = GetGatherNodeMetadata(nodeZoneId, nodeUniqueId);
+        if meta ~= nil then
+            harvestNodeId = meta.harvestNodeId;
+            harvestType = meta.harvestType;
+        end
+    end
 
     local resolver = GetGatherResolver();
     if resolver == nil then
@@ -133,7 +171,7 @@ function onEventStarted(player, commandActor, triggerName, arg1, arg2, arg3, arg
     harvestAttempts = nodeMeta.attempts or 0;
     nodeRemainder = 0;
 
-    harvestType = commandMine;
+    strikeAnim = harvestAnimByType[harvestType] or minerAnim;
 
     worldMaster = GetWorldMaster();
     harvestJudge = GetStaticActor("HarvestJudge");
@@ -144,7 +182,21 @@ function onEventStarted(player, commandActor, triggerName, arg1, arg2, arg3, arg
     player:ChangeState(50);
 
 
-    if harvestType == commandMine then
+    -- The aim/strike minigame RPC sequence is identical across all six
+    -- gather disciplines (mine/log/fish/quarry/botany/spearfish) — the
+    -- client's HarvestJudge script keys the per-type visuals off
+    -- `harvestType` internally, so the server drives one loop for every
+    -- type. Before 2026-07 only the mining branch was populated and
+    -- log/fish were empty no-ops; the loop now runs for any resolved
+    -- harvest type. (Wave 3 content-loop glue.)
+    local isValidHarvestType = harvestType == commandMine
+        or harvestType == commandLog
+        or harvestType == commandFish
+        or harvestType == commandQuarry
+        or harvestType == commandBotany
+        or harvestType == commandSpearfish;
+
+    if isValidHarvestType then
         player:SendGameMessage(harvestJudge, 26, MESSAGE_TYPE_SYSTEM, 1, harvestGrade);
 
         callClientFunction(player, "delegateCommand", harvestJudge, "openInputWidget", commandActor, harvestType, harvestGrade);
@@ -215,7 +267,7 @@ function onEventStarted(player, commandActor, triggerName, arg1, arg2, arg3, arg
 
                         callClientFunction(player, "delegateCommand", harvestJudge, "textInputWidget", commandActor, harvestType, harvestJudge, nil, 0, 0, 0, 0);
 
-                        player:PlayAnimation(minerAnim[math.random(1,3)]);
+                        player:PlayAnimation(strikeAnim[math.random(1,3)]);
                         wait(2);
                         sweetspotDifference = math.abs(powerCurrent - nodeSweetspot);
 
@@ -296,10 +348,6 @@ function onEventStarted(player, commandActor, triggerName, arg1, arg2, arg3, arg
                 SendTutorial(player, harvestJudge, 1);
             end
         end
-
-    elseif harvestType == commandLog then
-
-    elseif harvestType == commandFish then
 
     end
 

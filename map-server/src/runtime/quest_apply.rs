@@ -246,6 +246,21 @@ pub async fn apply_runtime_lua_command(
             .await;
             true
         }
+        // `player:SendMessage(messageType, sender, text)` from a
+        // quest/NPC hook — the raw 0x0003 chat-log line (shop/retainer
+        // error feedback, new-player notices, NPC-linkshell glow toast
+        // `[sheet:...]`). Previously fell through to the "unhandled" log,
+        // so all 101 live `:SendMessage(...)` call sites were silently
+        // dropped on the runtime drain path.
+        LC::SendMessage {
+            actor_id,
+            message_type,
+            sender,
+            text,
+        } => {
+            apply_send_message(actor_id, message_type, &sender, &text, registry, world).await;
+            true
+        }
         // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
         // linkshell narration line (0x0161 DispId-sender family).
         LC::SendGameMessageLocalizedDisplayName {
@@ -279,6 +294,18 @@ pub async fn apply_runtime_lua_command(
         }
         LC::AddGil { actor_id, amount } => {
             apply_add_gil(actor_id, amount, registry, Some(world), db).await;
+            true
+        }
+        LC::EarnAchievement {
+            actor_id,
+            achievement_id,
+            points,
+        } => {
+            apply_earn_achievement(actor_id, achievement_id, points, registry, world, db).await;
+            true
+        }
+        LC::SetTitle { actor_id, title_id } => {
+            apply_set_title(actor_id, title_id, registry, world, db).await;
             true
         }
         // NPC-linkshell scratchpad writes — these ride quest hooks that
@@ -3280,8 +3307,50 @@ pub async fn apply_add_item(
         apply_add_gil(actor_id, quantity, registry, world, db).await;
         return;
     }
-    // Everything else lands in NORMAL for the first cut. Key-items /
-    // bazaar / trade bags get their own paths as they're wired up.
+    // Key items live in their own KEYITEMS bag (package 100). They are
+    // unique / non-stacking, so the grant is idempotent: `add_key_item`
+    // inserts at most one row and reports whether it was newly added.
+    if item_package == crate::inventory::PKG_KEYITEMS {
+        match db.add_key_item(actor_id, item_id).await {
+            Ok(true) => {
+                tracing::info!(actor = actor_id, item = item_id, "AddKeyItem applied",);
+                // Live no-wipe refresh of the KEYITEMS bag, same shape as
+                // the NORMAL path. `world: None` keeps DB-only behaviour
+                // for callers without a live zone (tests, batch seeders).
+                if let Some(world) = world {
+                    send_inventory_package_update(
+                        actor_id,
+                        crate::inventory::PKG_KEYITEMS,
+                        crate::inventory::CAP_KEYITEMS,
+                        Some(item_id),
+                        registry,
+                        world,
+                        db,
+                    )
+                    .await;
+                }
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    actor = actor_id,
+                    item = item_id,
+                    "AddKeyItem: key item already owned — no-op",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    actor = actor_id,
+                    item = item_id,
+                    err = %e,
+                    "AddKeyItem: DB persist failed",
+                );
+            }
+        }
+        return;
+    }
+    // Everything else (bazaar / trade / loot / meld) still lands in
+    // NORMAL for the first cut; those bags get their own paths as they're
+    // wired up. Key items are now handled above.
     if item_package != crate::inventory::PKG_NORMAL {
         tracing::debug!(
             actor = actor_id,
@@ -3301,6 +3370,27 @@ pub async fn apply_add_item(
                 total,
                 "AddItem applied",
             );
+            // Live no-wipe refresh: push the freshly-changed NORMAL rows to
+            // the owning client mid-session so the bag renders the new
+            // stack without a re-zone (mirrors `apply_add_gil` →
+            // `send_gil_update`). `world: None` keeps the DB-only behaviour
+            // for callers without a live zone (tests, batch seeders).
+            // NOTE: mid-session-added items still vanish on the NEXT
+            // zone-in because `send_zone_in_bundle` re-sends empty NORMAL
+            // brackets — a documented limitation gated behind the separate
+            // bulk bag-load Wine RCA, not a regression here.
+            if let Some(world) = world {
+                send_inventory_package_update(
+                    actor_id,
+                    crate::inventory::PKG_NORMAL,
+                    crate::inventory::CAP_NORMAL,
+                    Some(item_id),
+                    registry,
+                    world,
+                    db,
+                )
+                .await;
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -4210,6 +4300,104 @@ pub async fn apply_add_gil(
     }
 }
 
+/// `player:EarnAchievement(id[, points])` drain. Persists to
+/// `characters_achievements`, then — only on a first-time earn — pops the
+/// earned toast and re-syncs the authoritative points total + latest-5
+/// (read back from the DB) to the owning client via the achievement
+/// dispatcher. `chara_id == actor_id` in this server's lobby flow
+/// (processor.rs: "`chara_id` == session id"). Re-earns are silent.
+pub async fn apply_earn_achievement(
+    actor_id: u32,
+    achievement_id: u32,
+    points: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    let newly = match db.award_achievement(actor_id, achievement_id, points).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                actor = actor_id,
+                id = achievement_id,
+                err = %e,
+                "EarnAchievement: DB persist failed",
+            );
+            return;
+        }
+    };
+    if !newly {
+        // Already earned — no toast, no state re-sync (retail parity).
+        return;
+    }
+    let points_total = db.get_achievement_points(actor_id).await.unwrap_or(0);
+    let latest_ids = db
+        .get_latest_achievements(actor_id)
+        .await
+        .unwrap_or([0u32; 5]);
+
+    let mut ob = crate::achievement::AchievementOutbox::new();
+    ob.push(crate::achievement::AchievementEvent::Earned {
+        player_actor_id: actor_id,
+        achievement_id,
+    });
+    ob.push(crate::achievement::AchievementEvent::SetPoints {
+        player_actor_id: actor_id,
+        points: points_total,
+    });
+    ob.push(crate::achievement::AchievementEvent::SetLatest {
+        player_actor_id: actor_id,
+        latest_ids,
+    });
+    for e in ob.drain() {
+        crate::achievement::dispatch_achievement_event(&e, registry, world).await;
+    }
+    tracing::info!(
+        actor = actor_id,
+        id = achievement_id,
+        points = points_total,
+        "EarnAchievement applied",
+    );
+}
+
+/// `player:SetTitle(titleId)` drain. Persists `characters.currentTitle`
+/// (so it survives relog — login reads it back into `chara.current_title`),
+/// mirrors it onto the live registry Character so a same-session zone-in
+/// renders it, and broadcasts `SetPlayerTitle` (0x019D). `title_id == 0`
+/// clears the title.
+pub async fn apply_set_title(
+    actor_id: u32,
+    title_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    if let Err(e) = db.set_current_title(actor_id, title_id).await {
+        tracing::warn!(
+            actor = actor_id,
+            title = title_id,
+            err = %e,
+            "SetTitle: DB persist failed",
+        );
+        return;
+    }
+    // Mirror onto the live Character so a same-session zone-in bundle
+    // (which reads `c.chara.current_title`) reflects the change without a
+    // relog.
+    if let Some(handle) = registry.get(actor_id).await {
+        handle.character.write().await.chara.current_title = title_id;
+    }
+    let mut ob = crate::achievement::AchievementOutbox::new();
+    ob.push(crate::achievement::AchievementEvent::SetPlayerTitle {
+        player_actor_id: actor_id,
+        title_id,
+    });
+    for e in ob.drain() {
+        crate::achievement::dispatch_achievement_event(&e, registry, world).await;
+    }
+    tracing::info!(actor = actor_id, title = title_id, "SetTitle applied");
+}
+
 /// Push the player's post-grant gil balance to their client as a
 /// currency-package delta bracket, then (for positive deltas) the
 /// retail "You obtain [item]." toast.
@@ -4291,6 +4479,194 @@ async fn send_gil_update(
         );
         pkt.set_target_id(session_id);
         client.send_bytes(pkt.to_bytes()).await;
+    }
+}
+
+/// Resolve `actor_id`'s owning client and emit a NO-WIPE single-package
+/// inventory bracket wrapping `middle` (the per-row `ListX01` / `RemoveX01`
+/// subpackets). Every subpacket is stamped with the session id — the world
+/// proxy drops `target_id == 0` frames.
+///
+/// Shape mirrors `send_gil_update`:
+///   `InventoryBeginChange(no-wipe) 0x016D` →
+///   `InventorySetBegin(cap, code) 0x0146` → `middle…` →
+///   `InventorySetEnd 0x0147` → `InventoryEndChange 0x016E`.
+///
+/// No-ops cleanly when the player isn't registered or has no live session.
+async fn send_inventory_bracket(
+    actor_id: u32,
+    cap: u16,
+    code: u16,
+    middle: Vec<common::subpacket::SubPacket>,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    use crate::packets::send::actor_inventory as inv;
+    let mut subs = Vec::with_capacity(middle.len() + 4);
+    subs.push(inv::build_inventory_begin_change(actor_id, false));
+    subs.push(inv::build_inventory_set_begin(actor_id, cap, code));
+    subs.extend(middle);
+    subs.push(inv::build_inventory_set_end(actor_id));
+    subs.push(inv::build_inventory_end_change(actor_id));
+    for mut sub in subs {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+}
+
+/// Package-generic mid-session inventory refresh. Re-reads the authoritative
+/// rows from the DB AFTER the mutation (so the wire carries the real
+/// `server_items.id` the client tracks by), then emits a no-wipe bracket for
+/// the changed rows via [`send_inventory_bracket`].
+///
+/// `changed_item_id = Some(id)` emits a `ListX01` for EVERY row whose
+/// `item_id == id` — critical for multi-slot spill, where a stack that hit
+/// the cap spilled into a second slot and both rows must render. `None`
+/// emits every row in the package.
+///
+/// Written cap+code-generic (the proven `send_gil_update` template) so
+/// key-items / loot / bazaar can reuse it once their per-table persistence
+/// lands. Never wipes and never touches the crashy bulk zone-in bag-load.
+pub(crate) async fn send_inventory_package_update(
+    actor_id: u32,
+    package_code: u16,
+    cap: u16,
+    changed_item_id: Option<u32>,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Database,
+) {
+    let rows = db
+        .get_item_package(actor_id, package_code as u32)
+        .await
+        .unwrap_or_default();
+    use crate::packets::send::actor_inventory as inv;
+    let middle: Vec<common::subpacket::SubPacket> = rows
+        .iter()
+        .filter(|r| changed_item_id.map(|id| r.item_id == id).unwrap_or(true))
+        .map(|r| inv::build_inventory_list_x01(actor_id, r))
+        .collect();
+    if middle.is_empty() {
+        return;
+    }
+    send_inventory_bracket(actor_id, cap, package_code, middle, registry, world).await;
+}
+
+/// `package:RemoveItem(catalogId[, quantity])` drain. Removes up to
+/// `quantity` of `catalog_id` from `item_package`, walking the matching
+/// stacks back-to-front (highest slot first, mirroring
+/// `ItemPackage::remove`): a stack larger than the remaining count is
+/// decremented in place (`db.set_quantity`, emits an updated `ListX01`); a
+/// stack that fully drains frees its slot (`db.remove_item`, emits a
+/// `RemoveX01` for the freed slot). The updates + removes ship in one
+/// no-wipe bracket stamped to the owning client.
+///
+/// `world: None` keeps the DB-only behaviour for callers without a live
+/// zone (integration tests, batch tooling).
+pub async fn apply_remove_item(
+    actor_id: u32,
+    item_package: u16,
+    catalog_id: u32,
+    quantity: i32,
+    registry: &ActorRegistry,
+    world: Option<&WorldManager>,
+    db: &Database,
+) {
+    if quantity <= 0 || catalog_id == 0 {
+        return;
+    }
+    let rows = match db.get_item_package(actor_id, item_package as u32).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                actor = actor_id,
+                package = item_package,
+                item = catalog_id,
+                err = %e,
+                "RemoveItem: DB read failed",
+            );
+            return;
+        }
+    };
+    let mut remaining = quantity;
+    let mut updated: Vec<crate::data::InventoryItem> = Vec::new();
+    let mut freed_slots: Vec<u16> = Vec::new();
+    // Back-to-front: drain the tail stacks before the head so the head
+    // (lowest slot) stack is the last to shrink/disappear.
+    for row in rows.iter().rev() {
+        if remaining <= 0 {
+            break;
+        }
+        if row.item_id != catalog_id {
+            continue;
+        }
+        if row.quantity > remaining {
+            let new_qty = row.quantity - remaining;
+            if let Err(e) = db.set_quantity(row.unique_id, new_qty).await {
+                tracing::warn!(
+                    actor = actor_id,
+                    item = catalog_id,
+                    err = %e,
+                    "RemoveItem: set_quantity failed",
+                );
+                return;
+            }
+            let mut r = row.clone();
+            r.quantity = new_qty;
+            updated.push(r);
+            remaining = 0;
+        } else {
+            if let Err(e) = db.remove_item(actor_id, row.unique_id).await {
+                tracing::warn!(
+                    actor = actor_id,
+                    item = catalog_id,
+                    err = %e,
+                    "RemoveItem: remove_item failed",
+                );
+                return;
+            }
+            freed_slots.push(row.slot);
+            remaining -= row.quantity;
+        }
+    }
+    if updated.is_empty() && freed_slots.is_empty() {
+        tracing::debug!(
+            actor = actor_id,
+            item = catalog_id,
+            qty = quantity,
+            "RemoveItem: no matching stack — no-op",
+        );
+        return;
+    }
+    tracing::info!(
+        actor = actor_id,
+        package = item_package,
+        item = catalog_id,
+        removed = quantity - remaining.max(0),
+        "RemoveItem applied",
+    );
+    if let Some(world) = world {
+        use crate::packets::send::actor_inventory as inv;
+        let mut middle: Vec<common::subpacket::SubPacket> =
+            Vec::with_capacity(updated.len() + freed_slots.len());
+        for r in &updated {
+            middle.push(inv::build_inventory_list_x01(actor_id, r));
+        }
+        for slot in &freed_slots {
+            middle.push(inv::build_inventory_remove_x01(actor_id, *slot));
+        }
+        let cap = crate::inventory::default_capacity(item_package);
+        send_inventory_bracket(actor_id, cap, item_package, middle, registry, world).await;
     }
 }
 
@@ -4445,6 +4821,50 @@ pub(crate) async fn apply_send_game_message(
         log = format!("0x{log_type:02X}"),
         params = params.len(),
         "SendGameMessage emitted",
+    );
+}
+
+/// `player:SendMessage(messageType, sender, text)` — emit one raw
+/// chat-log line (0x0003 `SendMessagePacket`) into the invoking
+/// player's own client. Covers MESSAGE_TYPE_SYSTEM (0x20) yellow log
+/// lines, new-player notices, shop/retainer error feedback, and
+/// quest-script debug/progress echoes. Self-only, target-stamped (the
+/// builder stamps the target session so the world proxy relays it).
+/// Mirrors the send/target-stamp shape of [`apply_send_game_message`].
+pub(crate) async fn apply_send_message(
+    actor_id: u32,
+    message_type: u8,
+    sender: &str,
+    text: &str,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    // build_send_message stamps target_id = session_id internally; for a
+    // self-message the source and target sessions are the same player.
+    let sub = crate::packets::send::build_send_message(
+        session_id,
+        session_id,
+        message_type,
+        sender,
+        text,
+    );
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        actor = actor_id,
+        kind = format!("0x{message_type:02X}"),
+        %sender,
+        %text,
+        "SendMessage emitted",
     );
 }
 
