@@ -294,14 +294,24 @@ impl Database {
         Ok(taken)
     }
 
-    pub async fn delete_character(&self, character_id: u32, name: &str) -> Result<()> {
-        tracing::debug!(character_id, name, "db: delete_character");
+    pub async fn delete_character(
+        &self,
+        user_id: u32,
+        character_id: u32,
+        name: &str,
+    ) -> Result<()> {
+        tracing::debug!(user_id, character_id, name, "db: delete_character");
         let name = name.to_owned();
         self.conn
             .call_db(move |c| {
+                // Scope the soft-delete to the authenticated owner: without the
+                // `userId = :uid` predicate any logged-in user could delete
+                // another user's character by supplying its id + (publicly
+                // visible) name — an IDOR. Mirrors the `get_character` guard.
                 c.execute(
-                    "UPDATE characters SET state = 1 WHERE id = :cid AND name = :name",
-                    named_params! { ":cid": character_id, ":name": name },
+                    "UPDATE characters SET state = 1 \
+                     WHERE id = :cid AND name = :name AND userId = :uid",
+                    named_params! { ":cid": character_id, ":name": name, ":uid": user_id },
                 )?;
                 Ok(())
             })
@@ -664,5 +674,48 @@ mod tests {
             .expect("query reserved character");
 
         assert!(found.is_none(), "state=2 row must NOT be returned");
+    }
+
+    /// Read a character's raw `state` column by id (test-only helper).
+    async fn character_state(db: &Database, cid: u32) -> u32 {
+        db.conn
+            .call_db(move |c| {
+                c.query_row(
+                    "SELECT state FROM characters WHERE id = :cid",
+                    named_params! { ":cid": cid },
+                    |r| r.get::<_, u32>(0),
+                )
+            })
+            .await
+            .expect("read character state")
+    }
+
+    #[tokio::test]
+    async fn delete_character_is_scoped_to_the_owning_user() {
+        let db = fresh_db().await;
+        let owner = 100;
+        let attacker = 200;
+        let cid = insert_made_character(&db, owner, "Owned Char").await;
+
+        // A different user supplying the (publicly visible) id + name must NOT
+        // be able to soft-delete the character — IDOR closed.
+        db.delete_character(attacker, cid, "Owned Char")
+            .await
+            .expect("attacker delete call");
+        assert_eq!(
+            character_state(&db, cid).await,
+            2,
+            "delete_character must not soft-delete a character owned by a different userId"
+        );
+
+        // The owner can soft-delete their own character (state 2 -> 1).
+        db.delete_character(owner, cid, "Owned Char")
+            .await
+            .expect("owner delete call");
+        assert_eq!(
+            character_state(&db, cid).await,
+            1,
+            "owner's own delete must soft-delete the character"
+        );
     }
 }

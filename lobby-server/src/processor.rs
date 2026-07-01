@@ -482,7 +482,9 @@ impl PacketProcessor {
                 tracing::info!(user_id = session.current_user_id, name = %name, "character renamed");
             }
             CharacterModifyPacket::CMD_DELETE => {
-                self.db.delete_character(req.character_id, &name).await?;
+                self.db
+                    .delete_character(session.current_user_id, req.character_id, &name)
+                    .await?;
                 tracing::info!(user_id = session.current_user_id, name = %name, "character deleted");
             }
             CharacterModifyPacket::CMD_RENAME_RETAINER => {
