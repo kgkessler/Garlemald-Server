@@ -3307,8 +3307,50 @@ pub async fn apply_add_item(
         apply_add_gil(actor_id, quantity, registry, world, db).await;
         return;
     }
-    // Everything else lands in NORMAL for the first cut. Key-items /
-    // bazaar / trade bags get their own paths as they're wired up.
+    // Key items live in their own KEYITEMS bag (package 100). They are
+    // unique / non-stacking, so the grant is idempotent: `add_key_item`
+    // inserts at most one row and reports whether it was newly added.
+    if item_package == crate::inventory::PKG_KEYITEMS {
+        match db.add_key_item(actor_id, item_id).await {
+            Ok(true) => {
+                tracing::info!(actor = actor_id, item = item_id, "AddKeyItem applied",);
+                // Live no-wipe refresh of the KEYITEMS bag, same shape as
+                // the NORMAL path. `world: None` keeps DB-only behaviour
+                // for callers without a live zone (tests, batch seeders).
+                if let Some(world) = world {
+                    send_inventory_package_update(
+                        actor_id,
+                        crate::inventory::PKG_KEYITEMS,
+                        crate::inventory::CAP_KEYITEMS,
+                        Some(item_id),
+                        registry,
+                        world,
+                        db,
+                    )
+                    .await;
+                }
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    actor = actor_id,
+                    item = item_id,
+                    "AddKeyItem: key item already owned — no-op",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    actor = actor_id,
+                    item = item_id,
+                    err = %e,
+                    "AddKeyItem: DB persist failed",
+                );
+            }
+        }
+        return;
+    }
+    // Everything else (bazaar / trade / loot / meld) still lands in
+    // NORMAL for the first cut; those bags get their own paths as they're
+    // wired up. Key items are now handled above.
     if item_package != crate::inventory::PKG_NORMAL {
         tracing::debug!(
             actor = actor_id,
