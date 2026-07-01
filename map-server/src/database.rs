@@ -1466,6 +1466,81 @@ impl Database {
         Ok(total)
     }
 
+    /// Inventory increment 2 — grant a single key item to the KEYITEMS
+    /// bag (`itemPackage = PKG_KEYITEMS = 100`) on `chara_id`.
+    ///
+    /// Key items are **unique / non-stacking**: a character either owns
+    /// one copy or none, so this is idempotent — if a row already exists
+    /// at package 100 for `key_item_id`, no duplicate is inserted and the
+    /// method returns `Ok(false)`. When the item is newly granted it
+    /// inserts a `server_items` row (quantity 1, quality 1) plus the
+    /// `characters_inventory` link at the next free KEYITEMS slot and
+    /// returns `Ok(true)`.
+    ///
+    /// Mirrors [`Database::add_harvest_item`]'s fresh-insert branch but
+    /// scoped to `itemPackage = 100` and fronted by an existence guard
+    /// (there is no stack-merge because key items never stack). Runs in a
+    /// single transaction so the existence check and the paired inserts
+    /// can't interleave.
+    ///
+    /// Returns `true` iff the key item was newly added.
+    pub async fn add_key_item(&self, chara_id: u32, key_item_id: u32) -> Result<bool> {
+        if key_item_id == 0 {
+            return Ok(false);
+        }
+        let added = self
+            .conn
+            .call_db(move |c| {
+                let tx = c.transaction()?;
+                // Existence guard: a key item is owned at most once.
+                let already_owned: Option<i64> = tx
+                    .query_row(
+                        r"SELECT si.id
+                          FROM characters_inventory ci
+                          INNER JOIN server_items si ON ci.serverItemId = si.id
+                          WHERE ci.characterId = :cid
+                            AND ci.itemPackage = 100
+                            AND si.itemId = :iid",
+                        named_params! { ":cid": chara_id, ":iid": key_item_id },
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if already_owned.is_some() {
+                    // No dup insert; leave the existing row untouched.
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                tx.execute(
+                    r"INSERT INTO server_items (itemId, quantity, quality)
+                      VALUES (:iid, 1, 1)",
+                    named_params! { ":iid": key_item_id },
+                )?;
+                let sid = tx.last_insert_rowid();
+                // Next empty KEYITEMS slot = current row count in package 100.
+                let next_slot: i32 = tx
+                    .query_row(
+                        r"SELECT COALESCE(MAX(slot), -1) + 1
+                          FROM characters_inventory
+                          WHERE characterId = :cid AND itemPackage = 100",
+                        named_params! { ":cid": chara_id },
+                        |r| r.get::<_, i32>(0),
+                    )
+                    .unwrap_or(0);
+                tx.execute(
+                    r"INSERT INTO characters_inventory
+                        (characterId, itemPackage, serverItemId, slot)
+                      VALUES (:cid, 100, :sid, :slot)",
+                    named_params! {
+                        ":cid": chara_id, ":sid": sid, ":slot": next_slot,
+                    },
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await?;
+        Ok(added)
+    }
+
     /// Tier 4 #14 C — grant a stack to `retainer_id`'s personal
     /// inventory. Parallels [`Database::add_harvest_item`] but writes
     /// to `characters_retainer_inventory` (keyed by `retainerId`)
@@ -5016,6 +5091,74 @@ mod equip_from_package_tests {
                 .expect("query"),
             "undergarment (class 0) should be visible from any class"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod key_item_tests {
+    use super::*;
+    use common::db::ConnCallExt;
+
+    fn tempdb(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "garlemald-key-item-{label}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// `add_key_item` inserts one non-stacking row into the KEYITEMS bag
+    /// (package 100) and is idempotent: granting the same key item twice
+    /// leaves exactly one row and reports `false` on the second call.
+    #[tokio::test]
+    async fn add_key_item_persists_and_is_idempotent() {
+        const KEY_ITEM_ID: u32 = 2_001_007;
+        let path = tempdb("idempotent");
+        let db = Database::open(&path).await.expect("open db");
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (42, 0, 0, 0, 'Key Keeper')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed character");
+
+        // First grant is newly added.
+        assert!(
+            db.add_key_item(42, KEY_ITEM_ID)
+                .await
+                .expect("add key item"),
+            "first grant should be newly added",
+        );
+
+        let rows = db
+            .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+            .await
+            .expect("read keyitems");
+        assert_eq!(rows.len(), 1, "exactly one key-item row");
+        assert_eq!(rows[0].item_id, KEY_ITEM_ID, "row carries the key item id");
+        assert_eq!(rows[0].quantity, 1, "key items are single-copy");
+
+        // Second grant is a no-op (already owned) and does not duplicate.
+        assert!(
+            !db.add_key_item(42, KEY_ITEM_ID)
+                .await
+                .expect("add key item again"),
+            "second grant should report already-owned",
+        );
+        let rows = db
+            .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+            .await
+            .expect("read keyitems");
+        assert_eq!(rows.len(), 1, "still exactly one key-item row after re-add");
+
         let _ = std::fs::remove_file(&path);
     }
 }

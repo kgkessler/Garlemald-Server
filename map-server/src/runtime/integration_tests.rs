@@ -1228,6 +1228,140 @@ async fn live_add_item_emits_normal_no_wipe_bracket() {
     }
 }
 
+/// Inventory live-producer increment 2 — a mid-session KEYITEMS
+/// `AddItem` persists via `add_key_item` AND pushes a no-wipe
+/// single-package bracket to the owning client: `0x016D(no-wipe) →
+/// 0x0146(500, 100) → 0x0148(ListX01) → 0x0147 → 0x016E`, every subpacket
+/// target-stamped (proxy rule), the X01 row carrying the granted key item.
+/// A SECOND grant of the same key item is idempotent — no wire traffic.
+#[tokio::test]
+async fn live_add_key_item_emits_keyitems_bracket() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const KEY_ITEM_ID: u32 = 2_001_007;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Key Keeper')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    registry
+        .insert(ActorHandle::new(
+            42,
+            ActorKindTag::Player,
+            230,
+            42,
+            Character::new(42),
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_add_item(
+        42,
+        crate::inventory::PKG_KEYITEMS,
+        KEY_ITEM_ID,
+        1,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+
+    // DB reflects the key item in package 100.
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one key-item row persisted");
+    assert_eq!(rows[0].item_id, KEY_ITEM_ID, "DB carries the key item id");
+
+    // Wire: exactly the 5-subpacket no-wipe KEYITEMS bracket.
+    let mut subs = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            subs.push(sub);
+        }
+    }
+    let opcodes: Vec<u16> = subs.iter().map(|s| s.game_message.opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_INVENTORY_BEGIN_CHANGE,
+            crate::packets::opcodes::OP_INVENTORY_SET_BEGIN,
+            crate::packets::opcodes::OP_INVENTORY_LIST_X01,
+            crate::packets::opcodes::OP_INVENTORY_SET_END,
+            crate::packets::opcodes::OP_INVENTORY_END_CHANGE,
+        ],
+        "no-wipe KEYITEMS bracket; saw {opcodes:?}",
+    );
+    // BeginChange data[0] == 0 → no wipe.
+    assert_eq!(subs[0].data[0], 0, "begin_change must be no-wipe");
+    // SetBegin body: u32 actor, u16 capacity 500, u16 code 100 (KEYITEMS).
+    let set_begin = &subs[1].data;
+    assert_eq!(
+        u16::from_le_bytes([set_begin[4], set_begin[5]]),
+        crate::inventory::CAP_KEYITEMS,
+    );
+    assert_eq!(
+        u16::from_le_bytes([set_begin[6], set_begin[7]]),
+        crate::inventory::PKG_KEYITEMS,
+    );
+    // X01 record: u64 unique_id, u32 item_id @12.
+    let item = &subs[2].data;
+    let item_id = u32::from_le_bytes([item[12], item[13], item[14], item[15]]);
+    let unique_id = u64::from_le_bytes(item[..8].try_into().unwrap());
+    assert_eq!(item_id, KEY_ITEM_ID, "X01 carries the granted key item id");
+    assert_ne!(unique_id, 0, "X01 carries the real server_items.id");
+    for sub in &subs {
+        assert_eq!(
+            sub.header.target_id, 42,
+            "every self-bound subpacket must be session-stamped (proxy drops target 0)",
+        );
+    }
+
+    // A SECOND grant of the same key item is idempotent: already owned,
+    // so nothing new persists AND no wire traffic is emitted.
+    crate::runtime::quest_apply::apply_add_item(
+        42,
+        crate::inventory::PKG_KEYITEMS,
+        KEY_ITEM_ID,
+        1,
+        &registry,
+        Some(&world),
+        &db,
+    )
+    .await;
+    let rows = db
+        .get_item_package(42, crate::inventory::PKG_KEYITEMS as u32)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "still exactly one key-item row after re-add");
+    assert!(
+        rx.try_recv().is_err(),
+        "idempotent re-add must emit no wire traffic",
+    );
+}
+
 /// Inventory live-producer increment 1 — a mid-session `RemoveItem` that
 /// fully drains a stack frees its slot: DB row deleted, and the owning
 /// client sees a no-wipe bracket carrying a `RemoveX01` for the freed
