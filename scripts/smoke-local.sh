@@ -23,7 +23,11 @@ else
 fi
 
 echo "==> building workspace ($PROFILE)"
-cargo build --workspace "${BUILD_FLAGS[@]}"
+# Expand safely under `set -u`: on bash 3.2 (macOS default) a bare
+# "${BUILD_FLAGS[@]}" errors as "unbound variable" when the array is empty
+# (PROFILE=debug). The `+` alt-value form expands to nothing when unset/empty
+# and to the quoted elements otherwise — portable across bash 3.2..5.x.
+cargo build --workspace ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
 
 TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }

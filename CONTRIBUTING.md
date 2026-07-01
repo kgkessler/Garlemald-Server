@@ -80,7 +80,7 @@ Get the stack building and running once before you change anything — see
 
 ### Keep CI green
 
-Every PR must pass four gates. Run them locally before you push — they are exactly
+Every PR must pass six gates. Run them locally before you push — they are exactly
 what CI runs (`.github/workflows/ci.yml`):
 
 ```sh
@@ -88,11 +88,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
+cargo run --locked -p content-test        # Lua quest walkthroughs (SEQ_000/005/010)
+PROFILE=debug scripts/smoke-local.sh      # boot-smoke all four services
 ```
 
 `--locked` means a dependency change must come with the updated `Cargo.lock`
 committed. (`cargo fmt --all` will fix formatting; `cargo fmt --all --check` only
-verifies it.)
+verifies it.) `scripts/test.sh` bundles the first four plus content-test;
+`scripts/smoke-local.sh` is the boot smoke.
 
 ---
 

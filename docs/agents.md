@@ -70,7 +70,7 @@ paste them in.
    > before you finish, and make sure `cargo fmt`, `cargo clippy -- -D warnings`,
    > and `cargo test` all pass.
 
-4. **Let it build + test.** The agent should iterate until the four gates pass
+4. **Let it build + test.** The agent should iterate until the six gates pass
    (see below). Review its diff yourself — you are responsible for the PR.
 
 5. **Open a PR into upstream `develop`.** Push your branch to your fork and open a
@@ -92,6 +92,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
+cargo run --locked -p content-test        # Lua quest walkthroughs (SEQ_000/005/010)
+PROFILE=debug scripts/smoke-local.sh      # boot-smoke all four services
 ```
 
 `--locked` means a dependency change must be reflected in a committed `Cargo.lock`
