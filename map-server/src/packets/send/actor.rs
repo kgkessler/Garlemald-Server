@@ -704,6 +704,17 @@ pub fn build_player_property_init(
     // never sees the scenario quest a fresh-character `onBeginLogin` adds, so
     // the journal stays empty and Yda/Papalymo's quest icons never light up.
     active_quests: &[(u32, u32)],
+    // Local levequest slots `(slot, raw_quest_id)`. C# `Player.GetInitPackets`
+    // (Player.cs:547-551) emits `playerWork.questGuildleve[slot]` (uint) per
+    // non-zero slot; the wire VALUE carries the `0xA0F00000` quest mask that
+    // C# `Database.cs:1285` bakes in on load. garlemald stores the raw quest
+    // id, so the mask is OR'd in at emit time below.
+    local_leves: &[(u16, u32)],
+    // Regional levequest slots `(slot, guildleveId, abandoned, completed)`.
+    // C# (Player.cs:553-563) emits `work.guildleveId[slot]` (ushort, raw — NO
+    // mask, Database.cs:1305) plus the `guildleveDone` (garlemald `abandoned`)
+    // / `guildleveChecked` (garlemald `completed`) bool companions when set.
+    regional_leves: &[(u16, u16, bool, bool)],
     // Pre-resolved equipped hotbar: `(slot0, masked_command_id,
     // max_recast_seconds, recast_end_unix)` per populated slot. pmeteor
     // `Database.LoadHotbar` + `Player.GetInitPackets` (Player.cs:474-505)
@@ -897,6 +908,29 @@ pub fn build_player_property_init(
             &format!("playerWork.questScenario[{slot}]"),
             *quest_actor_id,
         );
+    }
+
+    // Local levequests — C# `Player.GetInitPackets` (Player.cs:547-551) emits
+    // `playerWork.questGuildleve[slot]` (uint) per non-zero slot. The value
+    // carries the `0xA0F00000` quest mask (C# `Database.cs:1285`); garlemald
+    // stores the raw quest id, so OR it in here.
+    for (slot, quest_id) in local_leves {
+        b.add_int(
+            &format!("playerWork.questGuildleve[{slot}]"),
+            0xA0F0_0000 | *quest_id,
+        );
+    }
+    // Regional levequests — C# (Player.cs:553-563) emits `work.guildleveId`
+    // (ushort, raw) plus the `guildleveDone`/`guildleveChecked` bool
+    // companions when set. No id mask (C# `Database.cs:1305`).
+    for (slot, guildleve_id, abandoned, completed) in regional_leves {
+        b.add_short(&format!("work.guildleveId[{slot}]"), *guildleve_id);
+        if *abandoned {
+            b.add_byte(&format!("work.guildleveDone[{slot}]"), 1);
+        }
+        if *completed {
+            b.add_byte(&format!("work.guildleveChecked[{slot}]"), 1);
+        }
     }
 
     b.done()
@@ -1337,6 +1371,8 @@ mod player_property_init_tests {
             0,
             &[],
             &[],
+            &[],
+            &[],
         );
         let stream: Vec<u8> = subs.iter().flat_map(|s| s.to_bytes()).collect();
         let activate = 0xA0F0_5209u32.to_le_bytes();
@@ -1387,6 +1423,8 @@ mod player_property_init_tests {
             1,
             0,
             &[],
+            &[],
+            &[],
             &hotbar,
         );
         let stream: Vec<u8> = subs.iter().flat_map(|s| s.to_bytes()).collect();
@@ -1421,6 +1459,77 @@ mod player_property_init_tests {
                 "init stream missing {label}",
             );
         }
+    }
+
+    /// Kodama parity — the `/_init` bundle emits levequest slots with the
+    /// exact wire types + mask C# `Player.GetInitPackets` uses: local
+    /// `playerWork.questGuildleve[slot]` as int carrying the `0xA0F00000`
+    /// quest mask (Database.cs:1285), regional `work.guildleveId[slot]` as
+    /// short with the RAW id (no mask, Database.cs:1305), and the
+    /// `guildleveDone` byte companion only when abandoned. A `completed=false`
+    /// regional slot must NOT emit `guildleveChecked`.
+    #[test]
+    fn init_properties_carry_levequest_slots() {
+        let local = [(2u16, 0x1234u32)];
+        let regional = [(3u16, 0x0056u16, true, false)];
+        let subs = build_player_property_init(
+            7,
+            100,
+            100,
+            100,
+            100,
+            0,
+            2,
+            1,
+            0,
+            32,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            &[],
+            &local,
+            &regional,
+            &[],
+        );
+        let stream: Vec<u8> = subs.iter().flat_map(|s| s.to_bytes()).collect();
+        // Local leve: int, value carries the 0xA0F00000 quest mask.
+        let local_needle = property_needle(
+            4,
+            "playerWork.questGuildleve[2]",
+            &(0xA0F0_0000u32 | 0x1234).to_le_bytes(),
+        );
+        assert!(
+            stream
+                .windows(local_needle.len())
+                .any(|w| w == local_needle),
+            "missing masked local questGuildleve[2]",
+        );
+        // Regional leve: short, raw guildleve id (no mask).
+        let regional_needle = property_needle(2, "work.guildleveId[3]", &0x0056u16.to_le_bytes());
+        assert!(
+            stream
+                .windows(regional_needle.len())
+                .any(|w| w == regional_needle),
+            "missing raw regional guildleveId[3]",
+        );
+        // abandoned=true -> guildleveDone byte present.
+        let done_needle = property_needle(1, "work.guildleveDone[3]", &[1]);
+        assert!(
+            stream.windows(done_needle.len()).any(|w| w == done_needle),
+            "missing guildleveDone[3] for abandoned slot",
+        );
+        // completed=false -> guildleveChecked must be absent (match the
+        // type+id prefix so any value would fail the search).
+        let checked_prefix = property_needle(1, "work.guildleveChecked[3]", &[]);
+        assert!(
+            !stream
+                .windows(checked_prefix.len())
+                .any(|w| w == checked_prefix),
+            "guildleveChecked[3] must not be emitted when completed=false",
+        );
     }
 
     /// #28 S3.1 — the post-equip `UpdateHotbar` pair carries the

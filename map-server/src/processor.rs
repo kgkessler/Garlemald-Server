@@ -374,6 +374,15 @@ impl PacketProcessor {
         // (Garlemald-Server #46). The PlayerSetNpcLs apply path keeps
         // the DB row authoritative; this mirror is read-only at zone-in.
         character.chara.npc_linkshells = loaded.npc_linkshells.clone();
+        // Levequest journal hydration — mirror the loaded regional/local
+        // guildleve slots into CharaState so the zone-in `/_init` bundle
+        // re-emits them (previously loaded into LoadedPlayer, then dropped).
+        character.chara.guildleves_local = loaded.guildleves_local.clone();
+        character.chara.guildleves_regional = loaded.guildleves_regional.clone();
+        // Equipped-title hydration — mirror `currentTitle` so the zone-in
+        // bundle can emit `SetPlayerTitle`; the DB column already loaded into
+        // `loaded.current_title` but was never applied to the runtime actor.
+        character.chara.current_title = loaded.current_title;
         // SNpc / Path Companion hydration — same registry-reachability
         // motivation. The SetSNpc apply path mutates these in-place +
         // persists via db.save_snpc.
