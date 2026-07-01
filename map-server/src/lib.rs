@@ -281,6 +281,40 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Per-node gather metadata snapshot. Same `server_gather_node_spawns`
+    // rows the world manager materialises into live actors, but keyed by
+    // `(zone_id, unique_id)` on the synchronous catalog surface so
+    // `GetGatherNodeMetadata(zoneId, uniqueId)` can resolve the clicked
+    // node's `(harvestNodeId, harvestType)` from Lua without `await`.
+    // Load failure is non-fatal: the binding returns nil and
+    // DummyCommand.lua keeps its tutorial-node fallback.
+    match db.load_gather_node_spawns().await {
+        Ok(rows) => {
+            let mut metadata = std::collections::HashMap::new();
+            for row in rows {
+                if !crate::gathering::is_valid_harvest_type(row.harvest_type) {
+                    continue;
+                }
+                metadata.insert(
+                    (row.zone_id, row.unique_id),
+                    crate::world_manager::GatherNodeMetadata {
+                        harvest_node_id: row.harvest_node_id,
+                        harvest_type: row.harvest_type,
+                    },
+                );
+            }
+            let count = metadata.len();
+            lua.catalogs().install_gather_node_metadata(metadata);
+            tracing::info!(count, "gather-node metadata snapshot loaded");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "gather-node metadata load failed: GetGatherNodeMetadata will return nil",
+            );
+        }
+    }
+
     // Regional leves (Tier 3 #13): fieldcraft + battlecraft. Progress
     // hooks in `runtime::quest_apply` resolve through
     // `GetRegionalLeveResolver()` to decide which active leve ticks on

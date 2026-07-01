@@ -1111,6 +1111,136 @@ async fn apply_add_gil_emits_currency_bracket_and_obtain_toast() {
     );
 }
 
+/// Wave 3 — `apply_earn_achievement` end-to-end: a first-time earn
+/// persists to `characters_achievements` AND dispatches the earned toast
+/// (0x019E) + points (0x019C) + latest-5 (0x019B) to the owning client,
+/// every subpacket target-stamped. A re-earn is a silent no-op (no
+/// packets, points unchanged), matching retail idempotency.
+#[tokio::test]
+async fn apply_earn_achievement_persists_and_syncs() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+
+    let chara = Character::new(42);
+    registry
+        .insert(ActorHandle::new(42, ActorKindTag::Player, 230, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_earn_achievement(42, 7, 10, &registry, &world, &db).await;
+
+    // Persisted: the DB reads the zone-in sync performs now reflect it.
+    assert_eq!(db.get_achievement_points(42).await.unwrap(), 10);
+    assert_eq!(db.get_latest_achievements(42).await.unwrap()[0], 7);
+    assert!(db.get_achievements(42).await.unwrap().contains(&7));
+
+    let mut opcodes = Vec::new();
+    let mut targets = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            opcodes.push(sub.game_message.opcode);
+            targets.push(sub.header.target_id);
+        }
+    }
+    assert_eq!(
+        opcodes,
+        vec![
+            crate::packets::opcodes::OP_ACHIEVEMENT_EARNED,
+            crate::packets::opcodes::OP_SET_ACHIEVEMENT_POINTS,
+            crate::packets::opcodes::OP_SET_LATEST_ACHIEVEMENTS,
+        ],
+        "earn dispatches toast + points + latest",
+    );
+    assert!(
+        targets.iter().all(|&t| t == 42),
+        "every self-bound subpacket is session-stamped; saw {targets:?}",
+    );
+
+    // Re-earn: idempotent — no new packets, points unchanged.
+    crate::runtime::quest_apply::apply_earn_achievement(42, 7, 10, &registry, &world, &db).await;
+    assert!(rx.try_recv().is_err(), "re-earn dispatches nothing");
+    assert_eq!(db.get_achievement_points(42).await.unwrap(), 10);
+}
+
+/// Wave 3 — `apply_set_title` persists `characters.currentTitle`, mirrors
+/// it onto the live registry Character (so a same-session zone-in renders
+/// it), and dispatches SetPlayerTitle (0x019D).
+#[tokio::test]
+async fn apply_set_title_persists_and_dispatches() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use common::db::ConnCallExt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name)
+                  VALUES (42, 0, 0, 0, 'Titled')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let chara = Character::new(42);
+    registry
+        .insert(ActorHandle::new(42, ActorKindTag::Player, 230, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    crate::runtime::quest_apply::apply_set_title(42, 777, &registry, &world, &db).await;
+
+    // Persisted for relog.
+    let stored: u32 = db
+        .conn_for_test()
+        .call_db(|c| {
+            let v = c.query_row(
+                "SELECT currentTitle FROM characters WHERE id = 42",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(v)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, 777);
+
+    // Mirrored onto the live Character (drives same-session zone-in).
+    let handle = registry.get(42).await.unwrap();
+    assert_eq!(handle.character.read().await.chara.current_title, 777);
+
+    // Dispatched exactly one SetPlayerTitle, session-stamped.
+    let bytes = rx.try_recv().expect("title packet");
+    let mut offset = 0;
+    let sub = common::subpacket::SubPacket::parse(&bytes, &mut offset).unwrap();
+    assert_eq!(
+        sub.game_message.opcode,
+        crate::packets::opcodes::OP_SET_PLAYER_TITLE,
+    );
+    assert_eq!(sub.header.target_id, 42);
+    assert!(rx.try_recv().is_err(), "exactly one title packet");
+}
+
 #[tokio::test]
 async fn set_exp_persists_per_class_column() {
     use common::db::ConnCallExt;
@@ -3858,6 +3988,82 @@ async fn ported_dummy_command_lua_parses() {
     engine
         .load_script(&script)
         .expect("DummyCommand.lua should parse after the resolver-driven rewrite");
+}
+
+/// Lua binding: `GetGatherNodeMetadata(zoneId, uniqueId)` resolves an
+/// installed `(zone_id, unique_id) → (harvestNodeId, harvestType)`
+/// snapshot to a `{ harvestNodeId, harvestType }` table, and returns
+/// `nil` for an unknown key. This is the per-node routing surface
+/// `DummyCommand.lua` reads to pick the clicked node's template +
+/// discipline instead of the hardcoded tutorial mine.
+#[tokio::test]
+async fn lua_gather_node_metadata_binding_resolves_installed_key() {
+    use crate::lua::LuaEngine;
+    use crate::world_manager::GatherNodeMetadata;
+    use std::collections::HashMap;
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts/lua");
+    let engine = LuaEngine::new(&script_root);
+
+    // A logging node in zone 180 and a fishing node in zone 155.
+    let mut metadata: HashMap<(u32, String), GatherNodeMetadata> = HashMap::new();
+    metadata.insert(
+        (180, "logging_bramble_gridania_1".to_string()),
+        GatherNodeMetadata {
+            harvest_node_id: 2001,
+            harvest_type: crate::gathering::HARVEST_TYPE_LOG,
+        },
+    );
+    metadata.insert(
+        (155, "fishing_hole_la_noscea_1".to_string()),
+        GatherNodeMetadata {
+            harvest_node_id: 3001,
+            harvest_type: crate::gathering::HARVEST_TYPE_FISH,
+        },
+    );
+    engine.catalogs().install_gather_node_metadata(metadata);
+
+    // Rust accessor resolves both keys and rejects an unknown one.
+    let cats = engine.catalogs();
+    let logging = cats
+        .gather_node_metadata(180, "logging_bramble_gridania_1")
+        .expect("logging node metadata present");
+    assert_eq!(logging.harvest_node_id, 2001);
+    assert_eq!(logging.harvest_type, crate::gathering::HARVEST_TYPE_LOG);
+    assert!(cats.gather_node_metadata(180, "does_not_exist").is_none());
+    assert!(
+        cats.gather_node_metadata(999, "logging_bramble_gridania_1")
+            .is_none()
+    );
+
+    // Lua binding surfaces the same tuple as a table and nil for a miss.
+    let probe = script_root.join("commands/__probe_gather_meta.lua");
+    std::fs::write(&probe, "").unwrap();
+    let (lua, _queue) = engine.load_script(&probe).expect("load probe");
+
+    let (log_node, log_type, fish_node, fish_type, miss_is_nil): (i64, i64, i64, i64, bool) = lua
+        .load(
+            r#"
+            local logMeta = GetGatherNodeMetadata(180, "logging_bramble_gridania_1")
+            local fishMeta = GetGatherNodeMetadata(155, "fishing_hole_la_noscea_1")
+            local miss = GetGatherNodeMetadata(180, "nope")
+            return logMeta.harvestNodeId, logMeta.harvestType,
+                   fishMeta.harvestNodeId, fishMeta.harvestType,
+                   miss == nil
+        "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(log_node, 2001);
+    assert_eq!(log_type, crate::gathering::HARVEST_TYPE_LOG as i64);
+    assert_eq!(fish_node, 3001);
+    assert_eq!(fish_type, crate::gathering::HARVEST_TYPE_FISH as i64);
+    assert!(miss_is_nil);
+
+    let _ = std::fs::remove_file(&probe);
 }
 
 // ---------------------------------------------------------------------------
@@ -11476,6 +11682,77 @@ async fn lua_player_accept_regional_leve_emits_command() {
         } => {
             assert_eq!(*leve_id, 140_001);
             assert_eq!(*difficulty, 0, "omitted band defaults to 0");
+        }
+        other => panic!("expected AcceptRegionalLeve, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&probe);
+}
+
+/// `player:AddGuildleve(id)` — the GM `!addguildleve` entry point —
+/// routes ids in the regional (fieldcraft/battlecraft) leve range
+/// into the built accept pipeline (emitting `AcceptRegionalLeve` at
+/// band 0), while ids outside that range stay a no-op stub (the C#
+/// tradecraft guildleve catalog isn't ported). This is the content
+/// wiring that lets a regional leve actually be accepted.
+#[tokio::test]
+async fn lua_player_add_guildleve_routes_regional_ids_to_accept() {
+    use crate::lua::command::CommandQueue;
+    use crate::lua::userdata::{LuaPlayer, PlayerSnapshot};
+    use crate::lua::{LuaCommandKind, LuaEngine};
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let engine = LuaEngine::new(&script_root);
+    let probe = script_root.join("commands/__probe_add_guildleve.lua");
+    std::fs::write(&probe, "").unwrap();
+    let (lua, _queue) = engine.load_script(&probe).expect("load probe");
+
+    let queue = CommandQueue::new();
+    let snapshot = PlayerSnapshot {
+        actor_id: 909,
+        name: "Levemete".to_string(),
+        ..Default::default()
+    };
+    let player = LuaPlayer {
+        snapshot,
+        queue: queue.clone(),
+    };
+    lua.globals().set("player", player).unwrap();
+
+    lua.load(
+        r#"
+        player:AddGuildleve(140001) -- battlecraft: routes to accept
+        player:AddGuildleve(130450) -- fieldcraft upper bound: routes
+        player:AddGuildleve(50)     -- C# tradecraft id: no-op stub
+        "#,
+    )
+    .exec()
+    .unwrap();
+
+    let cmds = CommandQueue::drain(&queue);
+    assert_eq!(
+        cmds.len(),
+        2,
+        "only the two regional-range ids emit a command; the tradecraft id is a stub"
+    );
+    match &cmds[0] {
+        LuaCommandKind::AcceptRegionalLeve {
+            player_id,
+            leve_id,
+            difficulty,
+        } => {
+            assert_eq!(*player_id, 909);
+            assert_eq!(*leve_id, 140_001);
+            assert_eq!(*difficulty, 0, "GM add carries no band → easiest");
+        }
+        other => panic!("expected AcceptRegionalLeve, got {other:?}"),
+    }
+    match &cmds[1] {
+        LuaCommandKind::AcceptRegionalLeve { leve_id, .. } => {
+            assert_eq!(*leve_id, 130_450, "fieldcraft upper bound still routes");
         }
         other => panic!("expected AcceptRegionalLeve, got {other:?}"),
     }

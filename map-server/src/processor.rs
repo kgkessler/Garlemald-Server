@@ -1466,6 +1466,33 @@ impl PacketProcessor {
                 )
                 .await;
             }
+            LC::EarnAchievement {
+                actor_id,
+                achievement_id,
+                points,
+            } => {
+                // Shared applier: persist + earned toast + points/latest
+                // re-sync through the achievement dispatcher.
+                crate::runtime::quest_apply::apply_earn_achievement(
+                    actor_id,
+                    achievement_id,
+                    points,
+                    &self.registry,
+                    &self.world,
+                    &self.db,
+                )
+                .await;
+            }
+            LC::SetTitle { actor_id, title_id } => {
+                crate::runtime::quest_apply::apply_set_title(
+                    actor_id,
+                    title_id,
+                    &self.registry,
+                    &self.world,
+                    &self.db,
+                )
+                .await;
+            }
             LC::Die { actor_id } => {
                 let Some(zone) = self.world.zone(handle.zone_id).await else {
                     return;
@@ -9800,21 +9827,14 @@ impl PacketProcessor {
         let Some(handle) = self.registry.by_session(session_id).await else {
             return Ok(());
         };
-        // Real server reads progress from the DB. Phase 8 stubs a
-        // "earned if the player has it earned, else zero" fallback so
-        // the UI resolves — richer progress counts ride on later
-        // DB-layer work.
-        let (count, flags) = {
-            let chara = handle.character.read().await;
-            if handle.is_player() {
-                let earned = handle.character.read().await;
-                let _ = (chara, earned);
-                // Can't borrow chara twice; re-read.
-                (0u32, 0u32)
-            } else {
-                (0u32, 0u32)
-            }
-        };
+        // Real per-achievement progress from the DB. `chara_id ==
+        // actor_id == session id` in this server's lobby flow, so the
+        // actor id keys the read. Missing rows degrade to (0, 0).
+        let (count, flags) = self
+            .db
+            .get_achievement_progress(handle.actor_id, pkt.achievement_id)
+            .await
+            .unwrap_or((0, 0));
         let mut outbox = AchievementOutbox::new();
         outbox.push(AchievementEvent::SendRate {
             player_actor_id: handle.actor_id,

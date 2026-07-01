@@ -3083,6 +3083,126 @@ impl Database {
         Ok(v.unwrap_or((0, 0)))
     }
 
+    /// Persist an earned achievement for a character. Idempotent — a
+    /// re-earn of an already-`timeDone` row is a silent no-op. Returns
+    /// `true` iff this was a *first-time* earn (the only case that pops
+    /// the in-game earned toast), matching `PlayerHelperState::earn_achievement`.
+    ///
+    /// Also ensures a `gamedata_achievements` catalog row exists (with the
+    /// caller-supplied `points` and `packetOffsetId == achievement_id`) so
+    /// the downstream points-sum and completed-bitfield reads — which
+    /// INNER JOIN the catalog — resolve even on a fresh DB where the
+    /// catalog wasn't separately seeded.
+    pub async fn award_achievement(
+        &self,
+        chara_id: u32,
+        achievement_id: u32,
+        points: u32,
+    ) -> Result<bool> {
+        let now = common::utils::unix_timestamp();
+        let newly = self
+            .conn
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT OR IGNORE INTO gamedata_achievements
+                          (achievementId, name, packetOffsetId, rewardPoints)
+                      VALUES (:aid, '', :aid, :pts)",
+                    named_params! { ":aid": achievement_id, ":pts": points },
+                )?;
+                let already: Option<Option<i64>> = c
+                    .query_row(
+                        "SELECT timeDone FROM characters_achievements
+                         WHERE characterId = :cid AND achievementId = :aid",
+                        named_params! { ":cid": chara_id, ":aid": achievement_id },
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?;
+                if matches!(already, Some(Some(_))) {
+                    return Ok(false);
+                }
+                c.execute(
+                    r"INSERT INTO characters_achievements
+                          (characterId, achievementId, timeDone, progress, progressFlags)
+                      VALUES (:cid, :aid, :now, 0, 0)
+                      ON CONFLICT(characterId, achievementId)
+                          DO UPDATE SET timeDone = :now",
+                    named_params! { ":cid": chara_id, ":aid": achievement_id, ":now": now },
+                )?;
+                Ok(true)
+            })
+            .await?;
+        Ok(newly)
+    }
+
+    /// Sum of `rewardPoints` over the character's earned (`timeDone` set)
+    /// achievements — the value the client renders in the points display
+    /// (`SetAchievementPointsPacket`).
+    pub async fn get_achievement_points(&self, chara_id: u32) -> Result<u32> {
+        let pts = self
+            .conn
+            .call_db(move |c| {
+                let v: i64 = c.query_row(
+                    r"SELECT COALESCE(SUM(ga.rewardPoints), 0)
+                      FROM characters_achievements ca
+                      INNER JOIN gamedata_achievements ga
+                          ON ca.achievementId = ga.achievementId
+                      WHERE ca.characterId = :cid AND ca.timeDone IS NOT NULL",
+                    named_params! { ":cid": chara_id },
+                    |r| r.get(0),
+                )?;
+                Ok(v)
+            })
+            .await?;
+        Ok(pts.max(0) as u32)
+    }
+
+    /// Persist the character's equipped title (`characters.currentTitle`)
+    /// so a runtime `player:SetTitle(...)` survives relog (the login path
+    /// reads `currentTitle` back into `chara.current_title`).
+    pub async fn set_current_title(&self, chara_id: u32, title_id: u32) -> Result<()> {
+        self.conn
+            .call_db(move |c| {
+                c.execute(
+                    "UPDATE characters SET currentTitle = :t WHERE id = :cid",
+                    named_params! { ":t": title_id, ":cid": chara_id },
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert per-achievement progress (`progress` + `progressFlags`)
+    /// without marking the achievement done — feeds the 0x0135
+    /// progress-bar read (`get_achievement_progress`).
+    pub async fn set_achievement_progress(
+        &self,
+        chara_id: u32,
+        achievement_id: u32,
+        progress: u32,
+        progress_flags: u32,
+    ) -> Result<()> {
+        self.conn
+            .call_db(move |c| {
+                c.execute(
+                    r"INSERT INTO characters_achievements
+                          (characterId, achievementId, progress, progressFlags)
+                      VALUES (:cid, :aid, :p, :f)
+                      ON CONFLICT(characterId, achievementId)
+                          DO UPDATE SET progress = :p, progressFlags = :f",
+                    named_params! {
+                        ":cid": chara_id,
+                        ":aid": achievement_id,
+                        ":p": progress,
+                        ":f": progress_flags,
+                    },
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     // =======================================================================
     // Linkshells, support tickets, FAQ, chocobo, status save
     // =======================================================================
@@ -4646,6 +4766,134 @@ mod battle_npc_spawn_tests {
         if let Some(c) = class {
             assert_eq!(c.actor_class_id, 2_290_005);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Wave 3 — achievement earn/persist DB round-trip. These back the
+/// runtime `player:EarnAchievement`/`:SetTitle` path, the zone-in sync,
+/// and the 0x0135 progress read, all of which now read the DB instead of
+/// hardcoding zeros.
+#[cfg(test)]
+mod achievement_persist_tests {
+    use super::*;
+
+    fn tempdb(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "garlemald-achievement-{label}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// earn → persist → read: awarding an achievement writes a
+    /// `characters_achievements` row (and its catalog reward), so the
+    /// subsequent points-sum, latest-5, and completed-id reads — the exact
+    /// reads the zone-in sync now performs — reflect it. A re-earn is a
+    /// silent no-op that leaves points unchanged.
+    #[tokio::test]
+    async fn award_achievement_round_trip() {
+        let path = tempdb("award");
+        let db = Database::open(&path).await.expect("open db");
+        let chara_id = 4242u32;
+
+        // First-time earn returns true and persists.
+        let newly = db.award_achievement(chara_id, 7, 10).await.expect("award");
+        assert!(newly, "first earn is a first-time earn");
+        assert_eq!(db.get_achievement_points(chara_id).await.unwrap(), 10);
+
+        // Zone-in sync reads: latest-5 leads with the just-earned id and
+        // the completed-id list (via packetOffsetId) contains it.
+        let latest = db.get_latest_achievements(chara_id).await.unwrap();
+        assert_eq!(latest[0], 7, "most-recent earn leads latest-5");
+        let completed = db.get_achievements(chara_id).await.unwrap();
+        assert!(
+            completed.contains(&7),
+            "completed offset-ids include the earned achievement; saw {completed:?}",
+        );
+
+        // A second achievement stacks points.
+        assert!(db.award_achievement(chara_id, 9, 5).await.unwrap());
+        assert_eq!(db.get_achievement_points(chara_id).await.unwrap(), 15);
+
+        // Re-earning is idempotent: false, and points don't move.
+        let again = db.award_achievement(chara_id, 7, 10).await.unwrap();
+        assert!(!again, "re-earn is not a first-time earn");
+        assert_eq!(db.get_achievement_points(chara_id).await.unwrap(), 15);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `set_current_title` persists to `characters.currentTitle` so a
+    /// runtime title change survives relog (login reads it back).
+    #[tokio::test]
+    async fn set_current_title_persists() {
+        let path = tempdb("title");
+        let db = Database::open(&path).await.expect("open db");
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (55, 0, 0, 0, 'Titled Tester')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        db.set_current_title(55, 777).await.expect("set title");
+        let stored: u32 = db
+            .conn_for_test()
+            .call_db(|c| {
+                let v = c.query_row(
+                    "SELECT currentTitle FROM characters WHERE id = 55",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(v)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, 777, "currentTitle persisted for relog");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `set_achievement_progress` upserts progress that the 0x0135 handler
+    /// now reads via `get_achievement_progress` (previously hardcoded to
+    /// (0, 0)).
+    #[tokio::test]
+    async fn achievement_progress_round_trip() {
+        let path = tempdb("progress");
+        let db = Database::open(&path).await.expect("open db");
+        let chara_id = 88u32;
+
+        // No row yet → (0, 0).
+        assert_eq!(
+            db.get_achievement_progress(chara_id, 100).await.unwrap(),
+            (0, 0),
+        );
+
+        db.set_achievement_progress(chara_id, 100, 3, 0b101)
+            .await
+            .expect("set progress");
+        assert_eq!(
+            db.get_achievement_progress(chara_id, 100).await.unwrap(),
+            (3, 0b101),
+        );
+
+        // Upsert overwrites in place.
+        db.set_achievement_progress(chara_id, 100, 7, 0)
+            .await
+            .expect("update progress");
+        assert_eq!(
+            db.get_achievement_progress(chara_id, 100).await.unwrap(),
+            (7, 0),
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }
