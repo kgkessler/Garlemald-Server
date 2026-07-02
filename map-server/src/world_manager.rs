@@ -399,23 +399,68 @@ pub fn build_retainer_spawn_bundle(
     out
 }
 
-/// Snapshot the receiving player's quest-driven push-trigger states:
-/// `actor_class_id → is_push_enabled` across every active quest's current
-/// ENPC set. A streamed actor whose class is in this map is a quest
-/// trigger the player's journal already has an explicit enable/disable for,
-/// so the spawn bundle should honour that state rather than the actor-class
-/// `isEnabled` default — this is what lets a trigger enabled by a far-away
-/// `onStateChange` still arrive enabled when the player finally walks into
-/// streaming range (e.g. man0l1's Zephyr Gate), and conversely keeps a
-/// quest-disabled trigger (man0l1's ECHO_EXIT before its sequence) silent.
-fn quest_push_overrides(character: &crate::actor::Character) -> HashMap<u32, bool> {
+/// Radius (yalms) of the continuous actor-streaming scan around the
+/// player. pmeteor `Player.SendInstanceUpdate` scans
+/// `GetActorsAroundActor(this, 50)` in BOTH `zone` and `zone2`
+/// (Player.cs:2285-2288), and `send_zone_in_bundle`'s warp-time
+/// neighbour scan uses the same figure.
+pub(crate) const INSTANCE_STREAM_RADIUS: f32 = 50.0;
+
+/// Snapshot the receiving player's quest-driven ENPC overlay states:
+/// `actor_class_id → QuestEnpc` across every active quest's current
+/// ENPC set. A spawned/streamed actor whose class is in this map is a
+/// quest ENPC the player's journal already has explicit talk/emote/push
+/// enables and a quest-graphic marker for, so the spawn bundle should
+/// carry that state rather than the actor-class defaults — this is what
+/// lets a trigger enabled by a far-away `onStateChange` still arrive
+/// enabled when the player finally walks into streaming range (e.g.
+/// man0l1's Zephyr Gate), keeps a quest-disabled trigger (man0l1's
+/// ECHO_EXIT before its sequence) silent, and puts the quest form +
+/// journal marker on an ENPC the moment it spawns (Baderon streaming in
+/// from the seamless partner zone, Isaudorel at login). (#46.)
+fn quest_enpc_overrides(
+    character: &crate::actor::Character,
+) -> HashMap<u32, crate::actor::quest::QuestEnpc> {
     let mut map = HashMap::new();
     for quest in character.quest_journal.slots.iter().flatten() {
         for (class_id, enpc) in &quest.state.current {
-            map.insert(*class_id, enpc.is_push_enabled);
+            map.insert(*class_id, *enpc);
         }
     }
     map
+}
+
+/// Append the quest-ENPC overlay — the SetEventStatus enable-set plus
+/// the 0x0138 quest-graphic marker — to a freshly built spawn bundle.
+/// Packet construction mirrors `runtime::quest_apply::
+/// broadcast_quest_enpc_update` exactly (same builder arguments, same
+/// `base.event_conditions` source). That broadcast fires once at
+/// sequence-flip time and resolves NPCs in the player's CURRENT zone
+/// only (`QuestState::add_enpc` returns Unchanged on re-fires, so it is
+/// never retried) — an ENPC that is out of zone at flip time (Baderon
+/// in seamless partner zone 133 while the player is at camp) or not yet
+/// instantiated client-side (Isaudorel racing the login bundle; the 1.x
+/// client drops subpackets for unknown actors) rendered in populace
+/// form until the next talk-triggered re-broadcast. Riding the overlay
+/// on every spawn/stream of the actor closes that gap. (#46.)
+fn push_quest_enpc_overlay(
+    subpackets: &mut Vec<common::subpacket::SubPacket>,
+    actor_id: u32,
+    conditions: &crate::actor::event_conditions::EventConditionList,
+    enpc: &crate::actor::quest::QuestEnpc,
+) {
+    subpackets.extend(crate::packets::send::build_actor_event_status_packets(
+        actor_id,
+        conditions,
+        enpc.is_talk_enabled,
+        enpc.is_emote_enabled,
+        Some(enpc.is_push_enabled),
+        true,
+    ));
+    subpackets.push(crate::packets::send::build_set_actor_quest_graphic(
+        actor_id,
+        enpc.quest_flag_type,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -685,8 +730,49 @@ pub(crate) fn push_npc_spawn(
     let mp = character.chara.mp.max(0) as u16;
     let mp_max = character.chara.max_mp.max(0) as u16;
     let tp = character.chara.tp;
-    let npc_init =
-        tx::actor::build_npc_property_init(actor_id, property_flags, hp, hp_max, mp, mp_max, tp);
+    // hateType by archetype, pmeteor parity (see the tail-emission note
+    // below for the value table + the 2026-04-21 incident history). It
+    // must be resolved BEFORE the `/_init` dump: the client's
+    // DepictionJudge latches `npcWork.hateType` at nameplate build off
+    // the `/_init` bundle, non-retroactively (wiki note; live
+    // 2026-06-11 run), so a hostile's hateType=3 arriving only in the
+    // later `npcWork/hate` subpacket never lit the enemy HP gauge.
+    // pmeteor's `GetHateTypePacket` mutates `npcWork.hateType = 3`
+    // server-side inside `GetSpawnPackets` (BattleNpc.cs:130+145-163)
+    // before `GetInitPackets` reads it back (Session.cs:159-160).
+    //
+    // The `/_init` latch value and the `npcWork/hate` tail value are
+    // DELIBERATELY different tables: in pmeteor only a real BattleNpc
+    // mutates the field to 3 — every other actor's init reads back the
+    // NpcWork.cs:33 default 1, including populace-pipeline monsters
+    // (empty `battle_ids` at boot registers all seeded actors as plain
+    // Npc), while the tail keeps the legacy 0 for those. Feeding the
+    // tail's 0 into the init would latch them inert at nameplate build
+    // (no talk prompt / no collider — the 2026-04-21 incident class).
+    // (Garlemald-Server #46.)
+    let init_hate_type: u8 = match battle_kind {
+        Some(ActorKindTag::BattleNpc) => 3,
+        _ => 1,
+    };
+    let tail_hate_type: u8 = if is_monster || is_real_battle_npc {
+        match battle_kind {
+            Some(ActorKindTag::BattleNpc) => 3,
+            Some(ActorKindTag::Ally) => 1,
+            _ => 0,
+        }
+    } else {
+        1
+    };
+    let npc_init = tx::actor::build_npc_property_init(
+        actor_id,
+        property_flags,
+        hp,
+        hp_max,
+        mp,
+        mp_max,
+        tp,
+        init_hate_type,
+    );
     subpackets.extend(npc_init);
 
     // SetEventStatus enable-flags for every condition the spawn bundle
@@ -734,12 +820,10 @@ pub(crate) fn push_npc_spawn(
     //   * populace-pipeline monsters keep the legacy 0.
     // See `build_npc_hate_type_packet` for the judge contract. (#28.)
     if is_monster || is_real_battle_npc {
-        let hate_type = match battle_kind {
-            Some(ActorKindTag::BattleNpc) => 3,
-            Some(ActorKindTag::Ally) => 1,
-            _ => 0,
-        };
-        subpackets.push(tx::actor::build_npc_hate_type_packet(actor_id, hate_type));
+        subpackets.push(tx::actor::build_npc_hate_type_packet(
+            actor_id,
+            tail_hate_type,
+        ));
     }
 }
 
@@ -1153,6 +1237,88 @@ impl WorldManager {
             .unwrap_or_default()
     }
 
+    /// Register a single seamless boundary row. Production rows load in
+    /// bulk via `load_from_database`; this is the piecemeal entry the
+    /// integration tests use to stand up a two-zone seam.
+    pub(crate) async fn register_seamless_boundary(&self, boundary: SeamlessBoundary) {
+        self.seamless_boundaries
+            .write()
+            .await
+            .entry(boundary.region_id)
+            .or_default()
+            .push(boundary);
+    }
+
+    /// Seamless partner zones of `zone_id` in `region_id` — every zone
+    /// paired with it by a boundary row (rows pair `zone_id_1` /
+    /// `zone_id_2`). A seamless pair shares ONE world coordinate space
+    /// (Limsa: the player roams 230 `sea0Town01a` while the Drowning
+    /// Wench population — Baderon et al. — is seeded in 133
+    /// `sea0Town01`), so a partner zone's actors are addressable by the
+    /// player's live XZ position directly, without a primary-zone flip.
+    pub async fn seamless_partner_zones(&self, region_id: u32, zone_id: u32) -> Vec<u32> {
+        let mut partners: Vec<u32> = Vec::new();
+        for b in self.seamless_boundaries_for(region_id).await {
+            let partner = if b.zone_id_1 == zone_id {
+                b.zone_id_2
+            } else if b.zone_id_2 == zone_id {
+                b.zone_id_1
+            } else {
+                continue;
+            };
+            if partner != zone_id && !partners.contains(&partner) {
+                partners.push(partner);
+            }
+        }
+        partners
+    }
+
+    /// Scan the seamless-partner zones of (`region_id`, `zone_id`) for
+    /// NPC/BattleNpc/Ally actors within [`INSTANCE_STREAM_RADIUS`] of
+    /// the player's live position — the partner half of pmeteor's dual
+    /// `zone` + `zone2` scan (Player.cs:2285-2288 `GetActorsAroundActor
+    /// (this, 50)` on both). Both sides of a seamless pair share one
+    /// world coordinate space, so an XZ point query in the partner core
+    /// is well-defined. Returns `(actor_id, kind, partner_zone_name)`
+    /// triples; the partner's `zone_name` rides along because the
+    /// spawn's generated actor name embeds the OWNING zone's
+    /// abbreviation (`generate_npc_actor_name`).
+    async fn partner_zone_actors_around(
+        &self,
+        region_id: u32,
+        zone_id: u32,
+        position: Vector3,
+    ) -> Vec<(u32, crate::zone::area::ActorKind, String)> {
+        let mut out = Vec::new();
+        for partner_zone_id in self.seamless_partner_zones(region_id, zone_id).await {
+            let Some(partner_arc) = self.zone(partner_zone_id).await else {
+                tracing::warn!(
+                    zone = partner_zone_id,
+                    "seamless partner zone not on this map server — stream scan skipped",
+                );
+                continue;
+            };
+            let partner = partner_arc.read().await;
+            let partner_name = partner.core.zone_name.clone();
+            for a in
+                partner
+                    .core
+                    .actors_around_point(position.x, position.z, INSTANCE_STREAM_RADIUS)
+            {
+                if !matches!(
+                    a.kind,
+                    crate::zone::area::ActorKind::Npc
+                        | crate::zone::area::ActorKind::BattleNpc
+                        | crate::zone::area::ActorKind::Ally
+                ) {
+                    continue;
+                }
+                out.push((a.actor_id, a.kind, partner_name.clone()));
+            }
+        }
+        out
+    }
+
     // -----------------------------------------------------------------
     // Session + client registries
     // -----------------------------------------------------------------
@@ -1409,6 +1575,11 @@ impl WorldManager {
             return;
         };
         let zone_name = { zone_arc.read().await.core.zone_name.clone() };
+        // Quest-ENPC overlay snapshot — a revealed content NPC that is
+        // also a current quest ENPC must arrive with the quest's
+        // talk/emote/push enables + quest graphic, same as the zone-in
+        // and streaming spawn paths. (#46.)
+        let quest_overrides = quest_enpc_overrides(&*player_handle.character.read().await);
         let mut revealed: Vec<u32> = Vec::new();
         for &npc_id in npc_ids {
             let Some(handle) = registry.get(npc_id).await else {
@@ -1417,6 +1588,7 @@ impl WorldManager {
             let mut npc_bundle = Vec::new();
             {
                 let character = handle.character.read().await;
+                let enpc_override = quest_overrides.get(&character.chara.actor_class_id);
                 push_npc_spawn(
                     &mut npc_bundle,
                     &character,
@@ -1425,8 +1597,16 @@ impl WorldManager {
                     /* in_private_area */ false,
                     lua,
                     Some(handle.kind),
-                    /* push_enabled */ None,
+                    enpc_override.map(|e| e.is_push_enabled),
                 );
+                if let Some(enpc) = enpc_override {
+                    push_quest_enpc_overlay(
+                        &mut npc_bundle,
+                        npc_id,
+                        &character.base.event_conditions,
+                        enpc,
+                    );
+                }
             }
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
@@ -2348,7 +2528,11 @@ impl WorldManager {
             .as_ref()
             .is_some_and(|active| session.current_zone_id == active.parent_zone_id);
         const CONTENT_ACTOR_BAND_BIT: u32 = 0x0004_0000;
-        let neighbours: Vec<(u32, crate::zone::area::ActorKind)> = {
+        // Third element: `Some(zone_name)` when the actor lives in a
+        // seamless PARTNER zone (its generated actor name must embed the
+        // partner's zone abbreviation, not the primary's); `None` for
+        // actors in the player's own zone / private area.
+        let mut neighbours: Vec<(u32, crate::zone::area::ActorKind, Option<String>)> = {
             let z = zone_arc.read().await;
             // Private-area routing — sessions flagged into a named
             // PrivateArea scan that area's own actor pool (where the
@@ -2385,45 +2569,78 @@ impl WorldManager {
                     .actors
                     .values()
                     .filter(|a| a.actor_id != actor_id)
-                    .map(|a| (a.actor_id, a.kind))
+                    .map(|a| (a.actor_id, a.kind, None))
                     .collect(),
                 None => z
                     .core
-                    .actors_around(actor_id, 50.0)
+                    .actors_around(actor_id, INSTANCE_STREAM_RADIUS)
                     .into_iter()
                     .filter(|a| a.actor_id != actor_id)
                     .filter(|a| {
-                        // The player-only-bundle / deferred-reveal split is
-                        // SPECIFIC to the man0l1 same-map escort (spawnType
-                        // 0x16): there the bundle must be the player's reload
-                        // ONLY — bundling the content NPC spawns into the same
-                        // flush as the order-machine reload crashes the client,
-                        // so they're revealed in a separate flush on the
-                        // client's post-warp zone-in echo (RX 0x0007 →
-                        // `content_warp_acked`; see the handler's
-                        // reveal_content_npcs). Every OTHER content warp
-                        // (man0l0 deck tutorial, man0g0 SEQ_005 — spawnType
-                        // 0x10) does a real scene reload behind the 0x00E2
-                        // latch and expects its content NPCs IN the bundle, the
-                        // original pre-#46 behaviour; gating on
-                        // `destination_spawn_type == 0x16` keeps those intact.
-                        // (Garlemald #46.)
+                        // Content-instance keep-predicate, two independent
+                        // rules:
+                        //
+                        // 1. Base-zone populace (non-content-band, non-player)
+                        //    is ALWAYS dropped inside a content instance —
+                        //    that's the pmeteor per-Area-pool emulation the
+                        //    `in_content_instance` note above describes, and
+                        //    what seed 054's header relies on to hide the
+                        //    zone-193 deck-dressing trio (031 rows 530-532:
+                        //    opening_jelly/yshtola/stahlmann) from the man0l0
+                        //    deck tutorial. A #46 regression made the whole
+                        //    filter a no-op for non-0x16 warps, leaking all 19
+                        //    base rows (duplicate Sthalmann + a 4th enemy)
+                        //    alongside the 5 content BattleNpcs.
+                        //
+                        // 2. Content-band actors (CONTENT_ACTOR_BAND_BIT) are
+                        //    kept — but the man0l1 same-map escort (spawnType
+                        //    0x16) defers them until `content_warp_acked`: its
+                        //    bundle must be the player's reload ONLY, because
+                        //    bundling the content NPC spawns into the same
+                        //    flush as the order-machine reload crashes the
+                        //    client. They're revealed in a separate flush on
+                        //    the client's post-warp zone-in echo (RX 0x0007 →
+                        //    `content_warp_acked`; see the handler's
+                        //    reveal_content_npcs). Every OTHER content warp
+                        //    (man0l0 deck tutorial, man0g0 SEQ_005 — spawnType
+                        //    0x10) does a real scene reload behind the 0x00E2
+                        //    latch and expects its content NPCs IN the bundle,
+                        //    the original pre-#46 behaviour.
+                        //
+                        // Players are always kept. (Garlemald #46.)
                         !in_content_instance
-                            || session.destination_spawn_type != 0x16
                             || matches!(a.kind, crate::zone::area::ActorKind::Player)
                             || ((a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
-                                && session.content_warp_acked)
+                                && (session.destination_spawn_type != 0x16
+                                    || session.content_warp_acked))
                     })
-                    .map(|a| (a.actor_id, a.kind))
+                    .map(|a| (a.actor_id, a.kind, None))
                     .collect(),
             }
         };
+        // Seamless-partner-zone neighbours. pmeteor's Player.
+        // SendInstanceUpdate scans BOTH `zone` and `zone2` (Player.cs:
+        // 2285-2288); a zone-in near the 133/230 Limsa seam must do the
+        // same or relogging by the Drowning Wench entrance produces an
+        // empty tavern (its 34 root-zone actors live in partner zone
+        // 133 while the session is primary in 230). Root-zone,
+        // non-content warps only: private areas ship their full pool
+        // above, and content instances hide base populace. (#46.)
+        if session.current_private_area_name.is_none() && !in_content_instance {
+            let region_id = { zone_arc.read().await.core.region_id as u32 };
+            for (partner_id, kind, partner_zone_name) in self
+                .partner_zone_actors_around(region_id, session.current_zone_id, position)
+                .await
+            {
+                neighbours.push((partner_id, kind, Some(partner_zone_name)));
+            }
+        }
         tracing::info!(
             session = session_id,
             actor = format!("0x{actor_id:08X}"),
             zone = zone_actor_id,
             count = neighbours.len(),
-            ids = ?neighbours.iter().map(|(id, k)| format!("0x{id:08X}:{k:?}")).collect::<Vec<_>>(),
+            ids = ?neighbours.iter().map(|(id, k, _)| format!("0x{id:08X}:{k:?}")).collect::<Vec<_>>(),
             "send_zone_in_bundle: neighbours found via actors_around(50.0)",
         );
         // Send the main bundle (masters + player packets + inventory +
@@ -2452,11 +2669,12 @@ impl WorldManager {
         // (opening_jelly, opening_yshtola, opening_stahlmann) go
         // through the same populace pipeline.
         let mut spawned_npc_ids: Vec<u32> = Vec::new();
-        // Snapshot the player's quest-driven push-trigger states once so
-        // each spawned trigger arrives in the state its owning quest chose
-        // (rather than the actor-class default). (Garlemald-Server #46.)
-        let quest_push = quest_push_overrides(&*actor_handle.character.read().await);
-        for (neighbour_id, kind) in neighbours {
+        // Snapshot the player's quest-driven ENPC states once so each
+        // spawned quest ENPC arrives with the enables + quest graphic its
+        // owning quest chose (rather than the actor-class defaults) — see
+        // `push_quest_enpc_overlay`. (Garlemald-Server #46.)
+        let quest_overrides = quest_enpc_overrides(&*actor_handle.character.read().await);
+        for (neighbour_id, kind, partner_zone_name) in neighbours {
             use crate::zone::area::ActorKind;
             if !matches!(
                 kind,
@@ -2473,12 +2691,15 @@ impl WorldManager {
             }
             emitted += 1;
             spawned_npc_ids.push(neighbour_id);
-            let push_enabled = quest_push.get(&character.chara.actor_class_id).copied();
+            let enpc_override = quest_overrides.get(&character.chara.actor_class_id);
             let mut npc_bundle = Vec::new();
             push_npc_spawn(
                 &mut npc_bundle,
                 &character,
-                &zone_name,
+                // Seamless-partner actors embed THEIR zone's abbreviation
+                // in the generated actor name; everything else uses the
+                // player's current zone.
+                partner_zone_name.as_deref().unwrap_or(&zone_name),
                 // Private-area zone-ins thread the area level (=
                 // privateAreaType) into the name suffix and flip the
                 // 'P' marker; root-Zone spawns keep (0, false).
@@ -2489,8 +2710,16 @@ impl WorldManager {
                 private_area_bind.is_some(),
                 lua,
                 Some(handle.kind),
-                push_enabled,
+                enpc_override.map(|e| e.is_push_enabled),
             );
+            if let Some(enpc) = enpc_override {
+                push_quest_enpc_overlay(
+                    &mut npc_bundle,
+                    neighbour_id,
+                    &character.base.event_conditions,
+                    enpc,
+                );
+            }
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
                 client.send_bytes(sub.to_bytes()).await;
@@ -2539,19 +2768,60 @@ impl WorldManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default();
-            // Single-member roster: the player themselves. Matches
-            // `GroupMember` struct shape (localized_name=-1 ⇒ use
-            // custom name; flag1=false = not leader flag; is_online=
-            // true since they're obviously logged in).
-            let self_member = tx::groups::GroupMember {
+            // Roster: the player/leader row first (localized_name=-1 ⇒
+            // use custom name; flag1=false = not leader flag; is_online=
+            // true since they're obviously logged in), then one row per
+            // `session.transient_party_members` entry — the accumulated
+            // `currentParty:AddMember` calls from content scripts (e.g.
+            // the man0l0 deck tutorial's Y'shtola + Sthalmann). The
+            // script's pre-warp AddMember trio already carried the full
+            // roster, but re-emitting the SAME group_index here with a
+            // hardcoded single-member roster made the client REPLACE it,
+            // emptying the party HUD at zone-in. Name resolution mirrors
+            // `processor::apply_party_add_member`: registry display name,
+            // synthetic `bnpc_<id>` fallback for a not-yet-registered
+            // member (rare race window). (Garlemald-Server #46.)
+            let mut members = Vec::with_capacity(1 + session.transient_party_members.len());
+            members.push(tx::groups::GroupMember {
                 actor_id,
                 localized_name: -1,
                 unknown2: 0,
                 flag1: false,
                 is_online: true,
                 name: actor_name.clone(),
-            };
-            let members = [self_member];
+            });
+            // (id, name, position) per non-self roster member — position
+            // feeds the per-member 0x018D map marker below; `None` when
+            // the member isn't in the registry yet.
+            let mut member_details: Vec<(u32, String, Option<common::Vector3>)> = Vec::new();
+            for &mid in &session.transient_party_members {
+                // Defensive: the transient list excludes the leader by
+                // convention (see `Session.transient_party_members`), but
+                // slot[0] must stay the requester, so skip a stray self id.
+                if mid == actor_id {
+                    continue;
+                }
+                let (name, member_pos) = if let Some(h) = registry.get(mid).await {
+                    let c = h.character.read().await;
+                    (c.base.display_name().to_string(), Some(c.base.position()))
+                } else {
+                    tracing::warn!(
+                        session = session_id,
+                        member = format!("0x{mid:08X}"),
+                        "zone-in party roster: member not in registry, using placeholder name",
+                    );
+                    (format!("bnpc_{mid:08X}"), None)
+                };
+                member_details.push((mid, name.clone(), member_pos));
+                members.push(tx::groups::GroupMember {
+                    actor_id: mid,
+                    localized_name: -1,
+                    unknown2: 0,
+                    flag1: false,
+                    is_online: true,
+                    name,
+                });
+            }
             let mut offset = 0usize;
             let group_pkts = vec![
                 tx::groups::build_group_header(
@@ -2602,19 +2872,34 @@ impl WorldManager {
             // value"), and the client doesn't appear to validate it.
             // If a future capture lights up an actual constraint,
             // refine via a per-character salt.
-            let marker = tx::groups::PartyMapMarker {
+            // One marker per roster member (retail keys the overlay off
+            // the whole party). Members without a registry position (the
+            // `bnpc_<id>` fallback path above) are skipped — a 0,0,0
+            // marker would draw a bogus map dot.
+            let mut markers = vec![tx::groups::PartyMapMarker {
                 player_id: actor_id,
                 unknown: 0,
                 x: position.x,
                 y: position.y,
                 z: position.z,
                 orientation: rotation,
-            };
+            }];
+            for (mid, _name, member_pos) in &member_details {
+                let Some(p) = member_pos else { continue };
+                markers.push(tx::groups::PartyMapMarker {
+                    player_id: *mid,
+                    unknown: 0,
+                    x: p.x,
+                    y: p.y,
+                    z: p.z,
+                    orientation: 0.0,
+                });
+            }
             let mut sub = tx::groups::build_party_map_marker_update(
                 actor_id,
                 tx::groups::PARTY_MAP_MARKER_SOLO_GROUP_ID,
                 tx::groups::PARTY_MAP_MARKER_GROUP_TYPE_PLAYER_PARTY,
-                &[marker],
+                &markers,
             );
             sub.set_target_id(session_id);
             client.send_bytes(sub.to_bytes()).await;
@@ -2650,6 +2935,24 @@ impl WorldManager {
             );
             sub.set_target_id(session_id);
             client.send_bytes(sub.to_bytes()).await;
+            // …and one row per transient roster member. Display-name id
+            // follows the X08 roster convention above (localized_name=-1
+            // ⇒ the name string wins), matching how the pre-warp
+            // `apply_party_add_member` trio already presented these
+            // members to the client.
+            for (mid, name, _member_pos) in &member_details {
+                let mut sub = tx::groups::build_set_group_layout_id(
+                    actor_id,
+                    tx::groups::PARTY_MAP_MARKER_SOLO_GROUP_ID,
+                    *mid,
+                    tx::groups::SET_GROUP_LAYOUT_ID_PLAYER_DISPLAY_NAME,
+                    0,
+                    1,
+                    name,
+                );
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
         }
 
         // Director spawns (login + content) emitted AFTER all player /
@@ -2878,15 +3181,25 @@ impl WorldManager {
             );
         }
 
-        // Update session bookkeeping. Clear the merged-zone latch and
-        // the instance list: the destination zone has a different actor
-        // set, so the next `send_instance_update` must stream it fresh.
+        // Update session bookkeeping. Clear the merged-zone latch;
+        // KEEP `actor_instance_list` — a seamless flip sends no
+        // client-side deletes, so the client's actor table survives the
+        // crossing intact and wiping the list forced a duplicate full
+        // re-stream of actors the client already held. The duplicate
+        // re-AddActor left the actor RunEventFunction-unready client-
+        // side (the Charlys first-talk softlock; see
+        // reference_ffxiv_1x_actor_event_flags — a re-add resets the
+        // receiver's +0x5c/+0x7d readiness gates mid-stream). The
+        // post-flip `send_instance_update` filters against the retained
+        // list, so only genuinely new destination-zone actors stream;
+        // the next REAL zone-in (`send_zone_in_bundle`, which does mass-
+        // delete + full respawn) still resets the list to its bundle
+        // set. (Garlemald-Server #46 / #9.)
         {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
                 session.current_zone_id = destination_zone_id;
                 session.merged_zone_id = None;
-                session.actor_instance_list.clear();
             }
         }
         tracing::info!(
@@ -3041,7 +3354,11 @@ impl WorldManager {
     /// `actors_around(50)` scan — so any actor more than 50y from a warp
     /// point (the whole Camp Bearded Rock approach after the Zephyr Gate
     /// seamless crossing) never reached the client. This fans in the
-    /// actors that have walked into range since the last update.
+    /// actors that have walked into range since the last update — in the
+    /// player's own zone AND in its seamless partner zones (pmeteor's
+    /// dual `zone` + `zone2` scan, Player.cs:2285-2288; the Drowning
+    /// Wench population lives in partner zone 133 while the player roams
+    /// 230).
     ///
     /// ADD-ONLY first cut: it spawns newly-in-range actors and records
     /// them in `session.actor_instance_list`, but does NOT despawn
@@ -3086,10 +3403,18 @@ impl WorldManager {
 
         // Collect in-range NPC/Ally/BattleNpc neighbours the client does
         // NOT already have, holding the zone read-lock only for the scan.
-        let new_ids: Vec<u32> = {
+        // The player's live grid position + region ride along for the
+        // partner-zone point query below.
+        let (new_ids, player_position, region_id, zone_name): (
+            Vec<u32>,
+            Option<Vector3>,
+            u32,
+            String,
+        ) = {
             let z = zone_arc.read().await;
-            z.core
-                .actors_around(actor_id, 50.0)
+            let ids = z
+                .core
+                .actors_around(actor_id, INSTANCE_STREAM_RADIUS)
                 .into_iter()
                 .filter(|a| a.actor_id != actor_id)
                 .filter(|a| {
@@ -3102,50 +3427,92 @@ impl WorldManager {
                 })
                 .map(|a| a.actor_id)
                 .filter(|id| !session.actor_instance_list.contains(id))
-                .collect()
+                .collect();
+            (
+                ids,
+                z.core.find_actor(actor_id).map(|a| a.position),
+                z.core.region_id as u32,
+                z.core.zone_name.clone(),
+            )
         };
-        if new_ids.is_empty() {
+
+        // `(actor_id, owning-zone name)` per streamable actor — the zone
+        // name feeds the generated actor name's zone abbreviation, so a
+        // partner-zone actor must carry the PARTNER's name.
+        let mut stream_list: Vec<(u32, String)> = new_ids
+            .into_iter()
+            .map(|id| (id, zone_name.clone()))
+            .collect();
+        // Seamless partner zones. pmeteor scans BOTH `zone` and `zone2`
+        // in `Player.SendInstanceUpdate` (Player.cs:2285-2288) and keeps
+        // the player's position updated in zone2's grid (Session.cs:
+        // 119-120). Our merged-zone latch only flips inside a boundary's
+        // merge strip — for Limsa those strips sit at the west bridge/
+        // stairs and south stairs, never at the Drowning Wench plaza
+        // entrance — so zone 133's 34 root-zone actors (Baderon et al.)
+        // previously streamed only after a full primary-zone flip.
+        // Deriving the partner set from the boundary table streams them
+        // wherever the player stands. (#46 / Drowning Wench.)
+        if let Some(pos) = player_position {
+            for (partner_id, _kind, partner_zone_name) in self
+                .partner_zone_actors_around(region_id, session.current_zone_id, pos)
+                .await
+            {
+                if !session.actor_instance_list.contains(&partner_id) {
+                    stream_list.push((partner_id, partner_zone_name));
+                }
+            }
+        }
+        if stream_list.is_empty() {
             return;
         }
 
-        let zone_name = { zone_arc.read().await.core.zone_name.clone() };
-        // Snapshot the player's quest-driven push-trigger states so a
-        // trigger that streams in AFTER its owning quest enabled it (the
-        // player walked into range from afar — e.g. man0l1's Zephyr Gate)
-        // still arrives enabled, and a quest-disabled trigger near the
-        // player (man0l1's ECHO_EXIT before its sequence) stays silent.
-        // (Garlemald-Server #46.)
-        let quest_push = match registry.get(actor_id).await {
-            Some(h) => quest_push_overrides(&*h.character.read().await),
+        // Snapshot the player's quest-driven ENPC states so a trigger
+        // that streams in AFTER its owning quest enabled it (the player
+        // walked into range from afar — e.g. man0l1's Zephyr Gate) still
+        // arrives enabled, a quest-disabled trigger near the player
+        // (man0l1's ECHO_EXIT before its sequence) stays silent, and a
+        // quest ENPC streaming in from the partner zone (Baderon) lands
+        // with its quest form + journal marker. (Garlemald-Server #46.)
+        let quest_overrides = match registry.get(actor_id).await {
+            Some(h) => quest_enpc_overrides(&*h.character.read().await),
             None => HashMap::new(),
         };
         let mut added: Vec<u32> = Vec::new();
-        for neighbour_id in new_ids {
+        for (neighbour_id, npc_zone_name) in stream_list {
             let Some(handle) = registry.get(neighbour_id).await else {
                 continue;
             };
             let character = handle.character.read().await;
-            let push_enabled = quest_push.get(&character.chara.actor_class_id).copied();
+            let enpc_override = quest_overrides.get(&character.chara.actor_class_id);
             let mut npc_bundle = Vec::new();
             // push_npc_spawn registers every event condition AND emits the
             // SetEventStatus enable-flags (talk/emote/notice = true; push =
-            // `push_enabled` ?? the condition's actor-class `isEnabled`).
+            // the quest override ?? the condition's actor-class `isEnabled`).
             // pmeteor's Session.UpdateInstance does the same right after the
             // spawn bundle (Session.cs:139/161); without the enable the 1.x
             // client treats the NPC as non-talkable and never fires an
             // EventStart. Quest push triggers in the root zone are the one
             // case where the enable must NOT be unconditional — hence the
-            // per-player `push_enabled` override above.
+            // per-player quest override above.
             push_npc_spawn(
                 &mut npc_bundle,
                 &character,
-                &zone_name,
+                &npc_zone_name,
                 0,     // root zone: no private-area level suffix
                 false, // root zone: not a private-area bind
                 lua,
                 Some(handle.kind),
-                push_enabled,
+                enpc_override.map(|e| e.is_push_enabled),
             );
+            if let Some(enpc) = enpc_override {
+                push_quest_enpc_overlay(
+                    &mut npc_bundle,
+                    neighbour_id,
+                    &character.base.event_conditions,
+                    enpc,
+                );
+            }
             drop(character);
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
@@ -3183,38 +3550,57 @@ impl WorldManager {
         session_id: u32,
         new_position: Vector3,
     ) {
-        let (zone_id, private_area) = match self.session(session_id).await {
+        let (zone_id, private_area, merged_zone_id) = match self.session(session_id).await {
             Some(s) => (
                 s.current_zone_id,
                 s.current_private_area_name
                     .clone()
                     .map(|n| (n, s.current_private_area_level)),
+                s.merged_zone_id,
             ),
             None => return,
         };
         let Some(zone_arc) = self.zone(zone_id).await else {
             return;
         };
-        let mut zone = zone_arc.write().await;
-        let mut ob = crate::zone::outbox::AreaOutbox::new();
-        // Sessions routed into a named PrivateArea keep their StoredActor
-        // in that area's core (`do_zone_change_with_private_area` attach)
-        // — updating `zone.core` would silently no-op and the player's
-        // grid position would freeze at the warp-in point. Content-
-        // instance names (not in `private_areas`) fall back to the zone
-        // root, same rule as `broadcast_around_actor`. (Garlemald #28.)
-        if let Some((name, level)) = private_area
-            && let Some(pa) = zone
-                .private_areas
-                .get_mut(&name)
-                .and_then(|m| m.get_mut(&level))
         {
-            pa.core
+            let mut zone = zone_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            // Sessions routed into a named PrivateArea keep their StoredActor
+            // in that area's core (`do_zone_change_with_private_area` attach)
+            // — updating `zone.core` would silently no-op and the player's
+            // grid position would freeze at the warp-in point. Content-
+            // instance names (not in `private_areas`) fall back to the zone
+            // root, same rule as `broadcast_around_actor`. (Garlemald #28.)
+            if let Some((name, level)) = private_area
+                && let Some(pa) = zone
+                    .private_areas
+                    .get_mut(&name)
+                    .and_then(|m| m.get_mut(&level))
+            {
+                pa.core
+                    .update_actor_position(actor_id, new_position, &mut ob);
+                return;
+            }
+            zone.core
                 .update_actor_position(actor_id, new_position, &mut ob);
-            return;
         }
-        zone.core
-            .update_actor_position(actor_id, new_position, &mut ob);
+        // While straddling a seamless merge strip the player also holds a
+        // projection in the merged zone's core (`merge_zones`); keep it
+        // moving so merged-zone broadcast fan-out tracks the live
+        // position. EchoGate parity: Session.UpdatePlayerActorPosition
+        // updates BOTH `zone` and `zone2` grids (Session.cs:119-120).
+        // (Garlemald-Server #46.)
+        if let Some(mz) = merged_zone_id
+            && mz != zone_id
+            && let Some(merged_arc) = self.zone(mz).await
+        {
+            let mut merged = merged_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            merged
+                .core
+                .update_actor_position(actor_id, new_position, &mut ob);
+        }
     }
 }
 

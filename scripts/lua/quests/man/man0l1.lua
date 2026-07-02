@@ -125,6 +125,17 @@ CNTR_SEQ7_MSK		= 2;
 CNTR_SEQ40_FSH		= 3;
 CNTR_LS_MSG			= 4;
 
+-- Quest Flags
+-- Latched by the SEQ_007 ECHO_EXIT push chain right before its
+-- WarpToPublicArea. A save sitting at subseqMSK>=4 WITHOUT this flag
+-- relogged mid-chain (the pre-neutralizer processEvent060 veil hang
+-- forced exactly that kill-and-relog) and never got the exit warp —
+-- the onStateChange rescue below re-issues it once. Lua has no
+-- private-area probe (PlayerSnapshot carries zone_id only), so this
+-- flag is the "already exited the MSK Echo" signal instead.
+-- (Garlemald-Server #46.)
+FLAG_SEQ7_MSK_EXITED	= 0;
+
 -- Msg packs for the Npc LS
 NPCLS_MSGS = {
 	{339},
@@ -203,7 +214,26 @@ function onStateChange(player, quest, sequence)
 		quest:SetENpc(ADVENTURER1);
 		quest:SetENpc(ADVENTURER2);
 		quest:SetENpc(ADVENTURER3);
-		quest:SetENpc(ECHO_EXIT_TRIGGER, subseqMSK == 3 and QFLAG_PUSH or QFLAG_NONE, false, subseqMSK == 3);					
+		quest:SetENpc(ECHO_EXIT_TRIGGER, subseqMSK == 3 and QFLAG_PUSH or QFLAG_NONE, false, subseqMSK == 3);
+		-- Zone-in rescue (Garlemald-Server #46): a player who relogged
+		-- inside the MSK Echo (PrivateAreaMasterPast/3) after the counter
+		-- latched at 4 is trapped — the exit trigger above is QFLAG_NONE at
+		-- subseqMSK==4, so the doors are dead. Re-issue the exit warp the
+		-- dropped push-chain coroutine never got to. onStateChange re-runs
+		-- at login zone-in (the processor's relog re-arm) and after every
+		-- talk (quest:UpdateENPCs), so the rescue reaches the victim on the
+		-- next relog or Echo-NPC talk. One-shot and chain-safe by
+		-- construction: the flag is set BEFORE the warp here, the live
+		-- ECHO_EXIT push chain sets it before ITS warp (so this never
+		-- double-fires mid-chain), and at subseqMSK==3 (Echo still in
+		-- progress) or in the SEQ_050 escort content the sequence/counter
+		-- gates keep it dormant. A pre-flag save that already exited
+		-- cleanly eats one same-zone reload flicker on its next
+		-- onStateChange, then latches.
+		if (subseqMSK >= 4 and not data:GetFlag(FLAG_SEQ7_MSK_EXITED)) then
+			data:SetFlag(FLAG_SEQ7_MSK_EXITED);
+			GetWorldManager():WarpToPublicArea(player);
+		end
 	elseif (sequence == SEQ_035) then
 		quest:SetENpc(NNMULIKA, QFLAG_TALK);
 	elseif (sequence == SEQ_040) then
@@ -446,6 +476,18 @@ function seq007_onTalk(player, quest, npc, classId)
 		else
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent027_2");
 		end
+		-- Self-heal (Garlemald-Server #46): both guild errands latched
+		-- (CUL sale done, MSK Echo exited) but no linkshell chain pending
+		-- — the seq007_endSequence NewNpcLsMsg beat was lost (its coroutine
+		-- died in the pre-neutralizer processEvent060 veil hang), leaving
+		-- the save unable to reach onNpcLS/SEQ_035. Re-queue it: the Rust
+		-- NewNpcLsMsg apply (`set_npc_ls_from`, actor/quest.rs) resets
+		-- npc_ls_msg_step to 1, so the re-fired pack-2 chain starts at its
+		-- first message. GetNpcLsFrom()==0 guards re-fires while a chain
+		-- is already pending, so repeat Baderon talks can't spam the glow.
+		if (subseqCUL >= 1 and subseqMSK >= 4 and data:GetNpcLsFrom() == 0) then
+			quest:NewNpcLsMsg(1);
+		end
 	elseif (classId == CHARLYS) then
 		if (subseqCUL == 0) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent030");
@@ -465,8 +507,23 @@ function seq007_onTalk(player, quest, npc, classId)
 	elseif (classId == ISANDOREL) then
 		if (subseqMSK == 2) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent050");
+			-- processEvent050 ends with startFadeInCutSceneAfterWarp (decoded
+			-- Man0l1.lua:753) — it ARMS a Now-Loading veil that only a real
+			-- map-load warp-END tears down. The warp below is same-map
+			-- (230 public -> 230 PrivateAreaMasterPast/3, both sea0Town01a),
+			-- so no load ever completes and the veil hangs forever. Clear it
+			-- in place with processEvent604_3 (startFadeInCutSceneDefault)
+			-- first — the proven neutralizer from startMan0l1Content step 2.
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
 			data:IncCounter(CNTR_SEQ7_MSK);
+			-- Close the talk event, THEN warp (0x0131 ahead of the 0x00E2
+			-- reload latch — see onStart). This branch used to fall through
+			-- to the shared EndEvent below, putting the teardown AFTER the
+			-- warp; the early return keeps that shared EndEvent serving the
+			-- other branches exactly once.
+			player:EndEvent();
 			GetWorldManager():WarpToPrivateArea(player, "PrivateAreaMasterPast", 3);
+			return;
 		elseif (subseqMSK == 0) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent035");
 			data:IncCounter(CNTR_SEQ7_MSK);
@@ -539,16 +596,36 @@ function onPush(player, quest, npc)
 	if (sequence == SEQ_007) then
 		if (classId == MSK_TRIGGER) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent040");
+			-- processEvent040 ends with startFadeInCutSceneAfterWarp (decoded
+			-- Man0l1.lua:706), arming a Now-Loading veil that only a real
+			-- map-load warp-END clears — but the DoZoneChange below is
+			-- same-map (230 -> 230, sea0Town01a), so no load ever completes.
+			-- Neutralize the armed veil in place with processEvent604_3
+			-- (startFadeInCutSceneDefault), the proven pattern from
+			-- startMan0l1Content step 2. (Garlemald-Server #46.)
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
 			data:IncCounter(CNTR_SEQ7_MSK);
 			player:EndEvent();
 			quest:UpdateENPCs();
 			GetWorldManager():DoZoneChange(player, 230, nil, 0, 15, -620.0, 29.476, -70.050, 0.791);
 		elseif (classId == ECHO_EXIT_TRIGGER) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent060");
+			-- Same armed-veil neutralizer as the MSK_TRIGGER site above
+			-- (processEvent060 ends with startFadeInCutSceneAfterWarp,
+			-- decoded Man0l1.lua:1135; the WarpToPublicArea below is
+			-- same-map). It must run BEFORE seq007_endSequence so
+			-- processEvent033 plays on a live screen and its EventUpdate
+			-- resumes this coroutine — with the veil up, the chain died
+			-- here and the EndEvent/NewNpcLsMsg/exit-warp tail never ran.
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
 			data:IncCounter(CNTR_SEQ7_MSK);
 			if (data:GetCounter(CNTR_SEQ7_CUL) == 1) then
 				seq007_endSequence(player, quest);
 			end
+			-- Latch "exit warp issued" BEFORE quest:UpdateENPCs(): the
+			-- re-run onStateChange sees the fresh flag and keeps the
+			-- relog-rescue arm dormant on this (live) path.
+			data:SetFlag(FLAG_SEQ7_MSK_EXITED);
 			player:EndEvent();
 			quest:UpdateENPCs();
 			GetWorldManager():WarpToPublicArea(player);

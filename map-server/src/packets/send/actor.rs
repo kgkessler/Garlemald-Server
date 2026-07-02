@@ -1031,11 +1031,23 @@ pub fn build_hotbar_recast_update(
 /// property set: `charaWork.property[i]` for each non-zero bit of
 /// `propertyFlags`, baseline `potencial=1.0`, HP/MP/TP, two state_mainSkill
 /// entries that Meteor's Npc ctor hardcodes (`[0]=3`, `[2]=3`,
-/// `state_mainSkillLevel=1`), and `npcWork.hateType=0`. Without this
+/// `state_mainSkillLevel=1`), and `npcWork.hateType`. Without this
 /// dump the 1.x client keeps populace nameplates hidden and treats the
 /// actor as non-collidable — the spawn-bundle SetActorName carries the
 /// right displayNameId but the client only renders the nameplate when
 /// `charaWork.property[1] = 1` has arrived via 0x0137.
+///
+/// `hate_type` MUST be the actor's real combat hateType (3 for hostile
+/// BattleNpcs, 1 for populace/allies — see `build_npc_hate_type_packet`
+/// for the value table): the client's DepictionJudge latches
+/// `npcWork.hateType` when the nameplate is first built, non-
+/// retroactively, and it builds nameplates off this `/_init` dump.
+/// pmeteor only gets enemy HP gauges because `GetSpawnPackets` calls
+/// `GetHateTypePacket` — which MUTATES `npcWork.hateType = 3` server-
+/// side (BattleNpc.cs:130+145-163) — before `GetInitPackets` reads the
+/// struct back (ordering per Session.cs:159-160). Emitting a hardcoded
+/// 1 here and shipping the real value only in the later `npcWork/hate`
+/// subpacket arrives too late for the judge. (Garlemald-Server #46.)
 #[allow(clippy::too_many_arguments)]
 pub fn build_npc_property_init(
     actor_id: u32,
@@ -1045,6 +1057,7 @@ pub fn build_npc_property_init(
     mp: u16,
     mp_max: u16,
     tp: u16,
+    hate_type: u8,
 ) -> Vec<SubPacket> {
     let mut b = ActorPropertyPacketBuilder::new(actor_id, "/_init");
     // potencial=1.0 — Meteor stamps this in the Npc ctor (line 86).
@@ -1065,13 +1078,14 @@ pub fn build_npc_property_init(
     b.add_byte("charaWork.parameterSave.state_mainSkill[0]", 3);
     b.add_byte("charaWork.parameterSave.state_mainSkill[2]", 3);
     b.add_byte("charaWork.parameterSave.state_mainSkillLevel", 1);
-    // Meteor's `NpcWork.cs:33` defaults hateType to 1 for populace
-    // (HATE_TYPE_NONE=0 is only set by BattleNpc once it's added to
-    // the hate-table). Sending 0 here tells the 1.x client the actor
-    // is inert — no talk prompt, no capsule collider, player walks
-    // straight through. Non-battle NPCs want hateType=1 so the
-    // client allocates the collider and surfaces the "Talk" prompt.
-    b.add_byte("npcWork.hateType", 1);
+    // Meteor's `NpcWork.cs:33` defaults hateType to 1 for populace.
+    // Sending 0 for populace tells the 1.x client the actor is inert
+    // — no talk prompt, no capsule collider, player walks straight
+    // through — so plain NPCs pass 1 here. Hostile BattleNpcs pass 3:
+    // the DepictionJudge latches this value at nameplate build (see
+    // the fn doc above), so the enemy HP gauge only ever renders if
+    // the combat hateType is already in the `/_init` dump.
+    b.add_byte("npcWork.hateType", hate_type);
     b.done()
 }
 
@@ -1171,6 +1185,47 @@ pub fn build_battle_parameter(actor_id: u32, general_parameter: &[i16; 35]) -> V
 }
 
 use std::io::Write as _;
+
+#[cfg(test)]
+mod npc_property_init_tests {
+    use super::*;
+
+    /// Scan a property-packet series for the staged `add_byte` record of
+    /// `name` (`[type=1][murmur2(name) LE][value]`) and return its value.
+    fn find_byte_property(packets: &[SubPacket], name: &str) -> Option<u8> {
+        let id = common::utils::murmur_hash2(name, 0).to_le_bytes();
+        for p in packets {
+            let d = &p.data;
+            for i in 0..d.len().saturating_sub(5) {
+                if d[i] == 1 && d[i + 1..i + 5] == id {
+                    return Some(d[i + 5]);
+                }
+            }
+        }
+        None
+    }
+
+    /// The DepictionJudge latches `npcWork.hateType` from the `/_init`
+    /// dump at nameplate build (non-retroactive), so a hostile
+    /// BattleNpc's 3 must already be in this bundle — the later
+    /// `npcWork/hate` subpacket alone never lights the enemy HP gauge.
+    /// (Garlemald-Server #46.)
+    #[test]
+    fn init_dump_carries_the_passed_hate_type() {
+        let hostile = build_npc_property_init(0x4700_0001, 0x13, 100, 100, 50, 50, 0, 3);
+        assert_eq!(
+            find_byte_property(&hostile, "npcWork.hateType"),
+            Some(3),
+            "hostile BattleNpc /_init must carry hateType=3"
+        );
+        let populace = build_npc_property_init(0x4700_0002, 0x13, 100, 100, 50, 50, 0, 1);
+        assert_eq!(
+            find_byte_property(&populace, "npcWork.hateType"),
+            Some(1),
+            "populace /_init keeps the NpcWork.cs:33 default of 1"
+        );
+    }
+}
 
 #[cfg(test)]
 mod reset_head_tests {

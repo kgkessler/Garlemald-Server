@@ -419,11 +419,33 @@ async fn dispatch_npc_event_started(
     } else if base_path.exists() {
         base_path
     } else {
+        // A live owner with no script on disk still opened a modal event
+        // on the client (e.g. an object push trigger like the La Noscea→
+        // Limsa `seafld0_push_limsa_entrance`, classId 1090004, whose push
+        // fires whenever the player walks into it — only man0l1 SEQ_048
+        // actually claims it). Without an EndEvent the client stays modal
+        // and every further interaction is dropped → softlock. Release it
+        // — UNLESS a current quest claims the owner (the quest-ENPC guard
+        // below): the quest-hook fan-out in `handle_event_start` is about
+        // to park a cutscene the client MUST keep open. Ported from the
+        // removed `processor::dispatch_event_start_to_npc` (whose release
+        // was the only behavior this single-path dispatch lacked).
+        // (Garlemald-Server #46 — Limsa-entrance push softlock.)
         tracing::debug!(
             owner = owner_actor_id,
             class = %class_path,
-            "NPC onEventStarted skipped — no script on disk",
+            "NPC onEventStarted: no script on disk — releasing client with EndEvent (unless quest-claimed)",
         );
+        release_unclaimed_owner_with_end_event(
+            registry,
+            world,
+            player_actor_id,
+            owner_actor_id,
+            actor_class_id,
+            event_name,
+            event_type,
+        )
+        .await;
         return;
     };
 
@@ -656,39 +678,74 @@ async fn dispatch_npc_event_started(
         // the tutorial → controls re-lock → softlock (the regression the
         // entrance-push fix introduced). Only GENUINELY UNCLAIMED owners — the
         // La Noscea→Limsa entrance push `1090004`, claimed by no quest at
-        // SEQ_005 — get the inert release. Mirrors the `is_quest_enpc` guard in
-        // `processor::dispatch_event_start_to_npc`, so the dispatcher and
-        // processor NPC paths treat quest ENPCs identically. (Garlemald-Server
-        // #46 — the entrance-push fix must NOT comingle with quest pushes.)
-        let is_quest_enpc = if let (Some(owner_h), Some(player_h)) = (
-            registry.get(owner_actor_id).await,
-            registry.get(player_actor_id).await,
-        ) {
-            let owner_class_id = owner_h.character.read().await.chara.actor_class_id;
-            let c = player_h.character.read().await;
-            c.quest_journal.slots.iter().flatten().any(|q| {
-                q.state
-                    .current
-                    .values()
-                    .any(|e| e.actor_class_id == owner_class_id)
-            })
-        } else {
-            false
-        };
-        if !is_quest_enpc
-            && let Some(player_handle) = registry.get(player_actor_id).await
-            && player_handle.session_id != 0
-            && let Some(client) = world.client(player_handle.session_id).await
-        {
-            let mut sub = crate::packets::send::events::build_end_event(
-                player_actor_id,
-                owner_actor_id,
-                event_name,
-                event_type,
-            );
-            sub.set_target_id(player_handle.session_id);
-            client.send_bytes(sub.to_bytes()).await;
-        }
+        // SEQ_005 — get the inert release. (Garlemald-Server #46 — the
+        // entrance-push fix must NOT comingle with quest pushes.)
+        release_unclaimed_owner_with_end_event(
+            registry,
+            world,
+            player_actor_id,
+            owner_actor_id,
+            actor_class_id,
+            event_name,
+            event_type,
+        )
+        .await;
+    }
+}
+
+/// Release a client sitting modal on an event whose owner produced no
+/// handler output (no script on disk / script emitted nothing) with one
+/// 0x0131 EndEvent — UNLESS one of the player's current quests claims
+/// the owner's actor class. `start_event` ALWAYS emits an `EventStarted`
+/// that lands here and runs the owner's BASE populace script; for a
+/// quest-claimed ENPC that base script is inert while the quest hook
+/// (fired separately in `handle_event_start`) is about to park a
+/// cutscene the client MUST keep open — releasing would close the event
+/// out from under the tutorial → controls re-lock → softlock (the
+/// man0l0 Rostnsthal `pushDefault` regression). Shared by the inert and
+/// no-script arms of [`dispatch_npc_event_started`] so both releases
+/// keep identical quest-ENPC semantics. (Garlemald-Server #46.)
+async fn release_unclaimed_owner_with_end_event(
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    player_actor_id: u32,
+    owner_actor_id: u32,
+    owner_class_id: u32,
+    event_name: &str,
+    event_type: u8,
+) {
+    let Some(player_handle) = registry.get(player_actor_id).await else {
+        return;
+    };
+    let is_quest_enpc = {
+        let c = player_handle.character.read().await;
+        c.quest_journal.slots.iter().flatten().any(|q| {
+            q.state
+                .current
+                .values()
+                .any(|e| e.actor_class_id == owner_class_id)
+        })
+    };
+    if is_quest_enpc {
+        tracing::debug!(
+            owner = owner_actor_id,
+            class = owner_class_id,
+            event = event_name,
+            "NPC onEventStarted release skipped — owner claimed by a current quest",
+        );
+        return;
+    }
+    if player_handle.session_id != 0
+        && let Some(client) = world.client(player_handle.session_id).await
+    {
+        let mut sub = crate::packets::send::events::build_end_event(
+            player_actor_id,
+            owner_actor_id,
+            event_name,
+            event_type,
+        );
+        sub.set_target_id(player_handle.session_id);
+        client.send_bytes(sub.to_bytes()).await;
     }
 }
 
@@ -985,6 +1042,24 @@ async fn dispatch_event_updated_drain(
     // client's `callClientFunction` return values (e.g. a dialog
     // choice) — thread them through so the resumed coroutine sees
     // them, matching `handle_event_update`'s primary resume path.
+    //
+    // A continuation that re-parks must keep its event-owner stamp for
+    // `handle_event_start`'s resume gate — scope the resume with the
+    // still-open event's owner from the session, mirroring
+    // `handle_event_update`. (Garlemald-Server #46.)
+    let current_event_owner = if let Some(handle) = registry.get(player_actor_id).await {
+        let c = handle.character.read().await;
+        c.event_session.current_event_owner
+    } else {
+        0
+    };
+    let _owner_ctx = (current_event_owner != 0).then(|| {
+        crate::lua::scheduler::CoroutineScheduler::event_owner_scope(
+            lua.scheduler(),
+            player_actor_id,
+            current_event_owner,
+        )
+    });
     let after = lua.fire_player_event_and_drain(player_actor_id, lua_params);
     let Some(after) = after else {
         tracing::debug!(

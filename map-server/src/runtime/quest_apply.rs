@@ -915,6 +915,43 @@ async fn apply_actor_engage(
             &zone_arc,
         )
         .await;
+        // Mirror the rest of the `BattleEvent::Engage` arm's hostile-mob
+        // packet pair (runtime/dispatcher.rs) — dispatching a real
+        // BattleEvent::Engage here instead would double-fire the State
+        // trio + hate seed above, so the two families are emitted inline:
+        //   * 0x0195 SetEnmityIndicator — locks the red hate gem onto the
+        //     engaged target (decoded from ffxiv_traces/combat_skills.pcapng;
+        //     pmeteor never emits this opcode).
+        //   * npcWork.hateType = 3 (ENGAGED_PARTY) — turns on the overhead +
+        //     target-HUD HP gauge and the claimed nameplate colour (pmeteor
+        //     BattleNpc.cs:160 ships 3 unconditionally from spawn).
+        // Allies/players skip both, same gate as the dispatch arm —
+        // friendly nameplates stay passive. Without these the tutorial's
+        // script-engaged enemies fought with no hate gem / HP gauge.
+        if matches!(handle.kind, ActorKindTag::BattleNpc) {
+            let gem = crate::packets::send::actor_battle::build_set_enmity_indicator(
+                actor_id,
+                target_actor_id,
+                100,
+            );
+            crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                &zone_arc,
+                actor_id,
+                gem.to_bytes(),
+            )
+            .await;
+            let hate_type = crate::packets::send::actor::build_npc_hate_type_packet(actor_id, 3);
+            crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                &zone_arc,
+                actor_id,
+                hate_type.to_bytes(),
+            )
+            .await;
+        }
     }
 }
 
@@ -2234,6 +2271,91 @@ pub(crate) async fn apply_do_zone_change(
 /// parked on `waitForSignal(name)` (e.g. the combat tutorial director on
 /// "playerActive") and applies THEIR commands, recursively.
 /// (Garlemald-Server #28.)
+/// Player id of a warp-family command — one whose applier funnels into
+/// `apply_do_zone_change` / the content-warp machinery and therefore puts
+/// the `0x00E2` reload latch on the wire. `WarpToPosition` is deliberately
+/// absent (same-zone `SetActorPosition` snap, no reload latch), as is the
+/// consumer-less `LuaCommand::Warp` (no applier arm anywhere — it can't
+/// emit anything today).
+fn warp_family_player(cmd: &crate::lua::command::LuaCommand) -> Option<u32> {
+    use crate::lua::command::LuaCommand;
+    match cmd {
+        LuaCommand::DoZoneChange { player_id, .. }
+        | LuaCommand::DoZoneChangeContent { player_id, .. }
+        | LuaCommand::WarpToPublicArea { player_id, .. }
+        | LuaCommand::WarpToPrivateArea { player_id, .. } => Some(*player_id),
+        _ => None,
+    }
+}
+
+/// Stable-reorder a drained script batch so a player's `EndEvent` reaches
+/// the wire BEFORE that player's first warp-family command.
+///
+/// 0x0131 EndEvent ahead of the 0x00E2 reload latch is retail's invariant
+/// ordering on every captured transition (see the Hob → Musketeers'
+/// hand-off rationale in `scripts/lua/quests/man/man0l1.lua:149-153`) —
+/// with the event still open inside the Now-Loading window the client
+/// never completes zone-in. Scripts that order the two correctly are left
+/// byte-identical; only an `EndEvent` that appears AFTER the same player's
+/// first warp command is hoisted to just ahead of it (e.g.
+/// `TeleportCommand.lua`'s `DoZoneChange` → `player:EndEvent()` tail).
+/// Everything else keeps its relative order — per-command interleave is
+/// load-bearing on the wire (see `apply_event_script_commands`).
+pub(crate) fn hoist_end_events_before_warps(
+    batch: Vec<crate::lua::command::LuaCommand>,
+) -> Vec<crate::lua::command::LuaCommand> {
+    use std::collections::HashMap;
+
+    use crate::lua::command::LuaCommand;
+
+    // Index of each player's FIRST warp-family command.
+    let mut first_warp_idx: HashMap<u32, usize> = HashMap::new();
+    for (i, cmd) in batch.iter().enumerate() {
+        if let Some(player_id) = warp_family_player(cmd) {
+            first_warp_idx.entry(player_id).or_insert(i);
+        }
+    }
+    if first_warp_idx.is_empty() {
+        return batch;
+    }
+    // Misordered EndEvents: those that appear AFTER the same player's
+    // first warp. Keyed by the warp index they must be hoisted ahead of,
+    // in original relative order.
+    let mut hoisted_before: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut any_misordered = false;
+    for (i, cmd) in batch.iter().enumerate() {
+        if let LuaCommand::EndEvent { player_id, .. } = cmd
+            && let Some(&warp_idx) = first_warp_idx.get(player_id)
+            && i > warp_idx
+        {
+            hoisted_before.entry(warp_idx).or_default().push(i);
+            any_misordered = true;
+        }
+    }
+    if !any_misordered {
+        // Already ordered — return the batch untouched so correct scripts
+        // stay byte-identical on the wire.
+        return batch;
+    }
+    let mut slots: Vec<Option<LuaCommand>> = batch.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len());
+    for i in 0..slots.len() {
+        if let Some(end_event_idxs) = hoisted_before.get(&i) {
+            for &j in end_event_idxs {
+                // `j > i` always holds, so the hoisted EndEvent is still
+                // in its slot; the later pass over `j` then no-ops.
+                if let Some(end_event) = slots[j].take() {
+                    out.push(end_event);
+                }
+            }
+        }
+        if let Some(cmd) = slots[i].take() {
+            out.push(cmd);
+        }
+    }
+    out
+}
+
 pub(crate) async fn apply_event_script_commands(
     handle: &ActorHandle,
     commands: Vec<crate::lua::command::LuaCommand>,
@@ -2256,6 +2378,11 @@ pub(crate) async fn apply_event_script_commands(
             other => rest.push(other),
         }
     }
+    // Enforce the EndEvent-before-warp wire invariant across the whole
+    // drained batch — scripts that warp first and close the event after
+    // (TeleportCommand.lua) would otherwise ship 0x00E2 → 0x0131 and
+    // softlock the client at Now Loading.
+    let rest = hoist_end_events_before_warps(rest);
     if !rest.is_empty() {
         let event_session_snapshot = {
             let c = handle.character.read().await;
@@ -2812,7 +2939,15 @@ pub async fn apply_add_exp(
     // Read-modify-write inside the write lock so a concurrent AddExp
     // doesn't lose a level-up crossing to a race. `new_exp` and
     // `new_level` are the post-rollover values.
-    let Some((effective_gain, new_exp, new_level, levels_gained, rested_before, rested_after)) = ({
+    let Some((
+        effective_gain,
+        new_exp,
+        new_level,
+        levels_gained,
+        rested_before,
+        rested_after,
+        is_active_class,
+    )) = ({
         let mut c = handle.character.write().await;
         if class_slot >= c.battle_save.skill_point.len() {
             tracing::warn!(class = class_id, "AddExp: class_id out of range");
@@ -2833,6 +2968,7 @@ pub async fn apply_add_exp(
             let (lvl, sp, gained) =
                 crate::battle::save::level_up_if_threshold_crossed(prior_level, combined);
             c.battle_save.skill_point[class_slot] = sp;
+            let is_active_class = c.chara.class as i32 == class_id as i32;
             if gained > 0 {
                 if let Some(slot) = c.battle_save.skill_level.get_mut(class_slot) {
                     *slot = lvl;
@@ -2841,13 +2977,22 @@ pub async fn apply_add_exp(
                 // top-level `chara.level` the stat pipeline reads. No
                 // other class gets reflected into `chara.level` — the
                 // player has one active class at a time.
-                if c.chara.class as i32 == class_id as i32 {
+                if is_active_class {
                     c.chara.level = lvl;
                 }
             }
-            Some((effective_gain, sp, lvl, gained, rested_before, rested_after))
+            Some((
+                effective_gain,
+                sp,
+                lvl,
+                gained,
+                rested_before,
+                rested_after,
+                is_active_class,
+            ))
         }
-    }) else {
+    })
+    else {
         return;
     };
 
@@ -2866,6 +3011,27 @@ pub async fn apply_add_exp(
                 class = class_id,
                 err = %e,
                 "AddExp: set_level DB persist failed",
+            );
+        }
+        // pmeteor Player.cs:2965 parity — the level-up branch persists BOTH
+        // characters_class_levels (Database.SetLevel) and the char-select
+        // surface characters_parametersave.mainSkill/mainSkillLevel
+        // (Database.SavePlayerCurrentClass, Map Server/Database.cs:374). The
+        // lobby reads mainSkillLevel for the char-select level, so skipping
+        // this write froze every character at its creation-time level there.
+        // Active class only: garlemald's port takes an explicit (class,
+        // level) instead of reading the player's current class the way C#
+        // does, so a gain on a parked class must not clobber mainSkill.
+        if is_active_class
+            && let Err(e) = db
+                .save_player_current_class(actor_id, class_id, new_level)
+                .await
+        {
+            tracing::warn!(
+                actor = actor_id,
+                class = class_id,
+                err = %e,
+                "AddExp: save_player_current_class DB persist failed",
             );
         }
         tracing::info!(
@@ -7242,5 +7408,137 @@ mod move_actor_grid_sync_tests {
             (500.0, 500.0),
             "authoritative position must match the grid",
         );
+    }
+}
+
+#[cfg(test)]
+mod end_event_before_warp_tests {
+    use super::hoist_end_events_before_warps;
+    use crate::lua::command::LuaCommand;
+
+    fn end_event(player_id: u32) -> LuaCommand {
+        LuaCommand::EndEvent {
+            player_id,
+            event_owner: 0x2200_0001,
+            event_name: "commandContent".to_string(),
+        }
+    }
+
+    fn do_zone_change(player_id: u32) -> LuaCommand {
+        LuaCommand::DoZoneChange {
+            player_id,
+            zone_id: 244,
+            private_area: None,
+            private_area_type: 0,
+            spawn_type: 15,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            rotation: 0.0,
+        }
+    }
+
+    fn warp_to_private_area(player_id: u32) -> LuaCommand {
+        LuaCommand::WarpToPrivateArea {
+            player_id,
+            area_class: "PrivateAreaMasterPast".to_string(),
+            area_index: 3,
+            target: None,
+        }
+    }
+
+    fn change_music(player_id: u32) -> LuaCommand {
+        LuaCommand::ChangeMusic {
+            player_id,
+            music_id: 7,
+        }
+    }
+
+    fn send_message(actor_id: u32) -> LuaCommand {
+        LuaCommand::SendMessage {
+            actor_id,
+            message_type: 0x20,
+            sender: "test".to_string(),
+            text: "hello".to_string(),
+        }
+    }
+
+    /// `LuaCommand` doesn't derive `PartialEq`; order assertions go
+    /// through variant tags instead.
+    fn tags(batch: &[LuaCommand]) -> Vec<&'static str> {
+        batch
+            .iter()
+            .map(|cmd| match cmd {
+                LuaCommand::EndEvent { .. } => "end_event",
+                LuaCommand::DoZoneChange { .. } => "do_zone_change",
+                LuaCommand::WarpToPrivateArea { .. } => "warp_to_private_area",
+                LuaCommand::ChangeMusic { .. } => "change_music",
+                LuaCommand::SendMessage { .. } => "send_message",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn already_ordered_batch_stays_identical() {
+        // man0l1 Hob hand-off shape: EndEvent already precedes the warp.
+        let batch = vec![end_event(13), do_zone_change(13), change_music(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "do_zone_change", "change_music"]);
+    }
+
+    #[test]
+    fn warp_then_end_event_becomes_end_event_then_warp() {
+        // TeleportCommand.lua shape: DoZoneChange fires before
+        // player:EndEvent() — the hoist must flip them.
+        let batch = vec![do_zone_change(13), end_event(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "do_zone_change"]);
+        // The hoisted command keeps its payload.
+        assert!(
+            matches!(&out[0], LuaCommand::EndEvent { player_id: 13, .. }),
+            "hoisted EndEvent must keep its player id",
+        );
+    }
+
+    #[test]
+    fn non_warp_commands_keep_relative_order() {
+        let batch = vec![
+            send_message(13),
+            do_zone_change(13),
+            change_music(13),
+            end_event(13),
+            send_message(13),
+        ];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(
+            tags(&out),
+            [
+                "send_message",
+                "end_event",
+                "do_zone_change",
+                "change_music",
+                "send_message",
+            ],
+        );
+    }
+
+    #[test]
+    fn warp_to_private_area_counts_as_warp_family() {
+        // man0l1 SEQ_007 Isandorel shape, but with the closes inverted.
+        let batch = vec![warp_to_private_area(13), end_event(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "warp_to_private_area"]);
+    }
+
+    #[test]
+    fn end_event_for_a_different_player_is_not_moved() {
+        let batch = vec![do_zone_change(13), end_event(14)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["do_zone_change", "end_event"]);
+        assert!(matches!(
+            &out[1],
+            LuaCommand::EndEvent { player_id: 14, .. }
+        ));
     }
 }

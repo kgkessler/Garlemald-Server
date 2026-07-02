@@ -15848,6 +15848,181 @@ async fn send_instance_update_streams_walked_in_npc() {
     );
 }
 
+/// Garlemald-Server #46 / Drowning Wench late load-in —
+/// `send_instance_update` must also stream actors seeded in a seamless
+/// PARTNER zone, without a primary-zone flip. Limsa is two
+/// seamlessly-joined zones sharing one coordinate space: the player
+/// roams 230 (sea0Town01a) while the Drowning Wench population
+/// (Baderon et al.) is seeded in 133 (sea0Town01), and the boundary's
+/// flip/merge boxes sit at the west bridge/stairs and south stairs —
+/// never at the tavern's plaza entrance. pmeteor scans BOTH `zone` and
+/// `zone2` in `Player.SendInstanceUpdate` (Player.cs:2285-2288); this
+/// asserts the partner-derived scan does the same off the boundary
+/// table alone.
+#[tokio::test]
+async fn send_instance_update_streams_seamless_partner_zone_npc() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, SeamlessBoundary, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const PLAYER_ID: u32 = 1;
+    const PARTNER_NPC_ID: u32 = 0x4000_0020;
+    const PRIMARY_ZONE: u32 = 230;
+    const PARTNER_ZONE: u32 = 133;
+    const LIMSA_REGION: u16 = 101;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    for (zone_id, name) in [(PRIMARY_ZONE, "sea0Town01a"), (PARTNER_ZONE, "sea0Town01")] {
+        let zone = Zone::new(
+            zone_id,
+            name.to_string(),
+            LIMSA_REGION,
+            String::new(),
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        world.register_zone(zone).await;
+    }
+    // Boundary row pairing the two zones. All three boxes sit far from
+    // the player's position so no primary-zone flip / merge could fire —
+    // the stream must come from the boundary-derived partner scan alone.
+    world
+        .register_seamless_boundary(SeamlessBoundary {
+            id: 1,
+            region_id: LIMSA_REGION as u32,
+            zone_id_1: PARTNER_ZONE,
+            zone_id_2: PRIMARY_ZONE,
+            zone1_x1: -1000.0,
+            zone1_y1: -1000.0,
+            zone1_x2: -900.0,
+            zone1_y2: -900.0,
+            zone2_x1: 900.0,
+            zone2_y1: 900.0,
+            zone2_x2: 1000.0,
+            zone2_y2: 1000.0,
+            merge_x1: -500.0,
+            merge_y1: -500.0,
+            merge_x2: -400.0,
+            merge_y2: -400.0,
+        })
+        .await;
+
+    // Player in primary zone 230 at the origin.
+    let mut player = Character::new(PLAYER_ID);
+    player.base.zone_id = PRIMARY_ZONE;
+    registry
+        .insert(ActorHandle::new(
+            PLAYER_ID,
+            ActorKindTag::Player,
+            PRIMARY_ZONE,
+            1,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(PLAYER_ID, ClientHandle::new(PLAYER_ID, tx))
+        .await;
+    let mut session = MapSession::new(PLAYER_ID);
+    session.current_zone_id = PRIMARY_ZONE;
+    world.upsert_session(session).await;
+    {
+        let zone_arc = world.zone(PRIMARY_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: PLAYER_ID,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    // Tavern NPC seeded in PARTNER zone 133, within streaming range of
+    // the player's position (the pair shares one coordinate space).
+    let mut npc = Character::new(PARTNER_NPC_ID);
+    npc.base.zone_id = PARTNER_ZONE;
+    npc.chara.actor_class_id = 1_000_057;
+    npc.base.actor_name = "tavern_populace".to_string();
+    registry
+        .insert(ActorHandle::new(
+            PARTNER_NPC_ID,
+            ActorKindTag::Npc,
+            PARTNER_ZONE,
+            0,
+            npc,
+        ))
+        .await;
+    {
+        let zone_arc = world.zone(PARTNER_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: PARTNER_NPC_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(5.0, 0.0, 5.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world
+        .send_instance_update(&registry, None, PLAYER_ID, PLAYER_ID)
+        .await;
+
+    // The partner-zone NPC's AddActor reached the client.
+    let mut saw_partner_add_actor = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR
+                && sub.header.source_id == PARTNER_NPC_ID
+            {
+                saw_partner_add_actor = true;
+            }
+        }
+    }
+    assert!(
+        saw_partner_add_actor,
+        "send_instance_update must AddActor the partner-zone NPC without a zone flip",
+    );
+
+    let session = world.session(PLAYER_ID).await.unwrap();
+    assert_eq!(
+        session.current_zone_id, PRIMARY_ZONE,
+        "streaming the partner zone must NOT flip the primary zone",
+    );
+    assert!(
+        session.actor_instance_list.contains(&PARTNER_NPC_ID),
+        "the streamed partner-zone NPC must be recorded in actor_instance_list",
+    );
+}
+
 /// Garlemald-Server #46 live test round 2 — `send_instance_update` must
 /// also ENABLE the streamed actor's event conditions (SetEventStatus
 /// 0x0136), not just register them, or the 1.x client treats the NPC as

@@ -189,6 +189,17 @@ pub struct CharaState {
     pub birthday_month: u8,
     pub initial_town: u8,
     pub rest_bonus_exp_rate: i32,
+    /// Accumulated play time in seconds (`characters.playTime`),
+    /// hydrated at session-begin — same CharaState-vs-PlayerState split
+    /// as the GC / homepoint fields (see `gc_current`): the registry
+    /// only carries `Character`, and `build_player_snapshot_for_login`
+    /// reads from here. Without the mirror the login snapshot hardcoded
+    /// `play_time: 0`, so `player.lua::onLogin`'s
+    /// `GetPlayTime(false) == 0` first-login branch re-ran EVERY login
+    /// — repeating "PlayTime == 0, new player!" and re-granting the
+    /// initClassItems/initRaceItems starter kit each time.
+    /// (Garlemald-Server #46.)
+    pub play_time: u32,
     /// UNIX timestamp (seconds) of the last `rest_bonus_exp_rate`
     /// increment from the inn auto-accrual tick. `0` means "no
     /// accrual window open" — the next inn-zone tick will set this
@@ -353,6 +364,7 @@ impl Default for CharaState {
             birthday_month: 0,
             initial_town: 0,
             rest_bonus_exp_rate: 0,
+            play_time: 0,
             last_rest_accrual_utc: 0,
             time_of_death_utc: 0,
             respawn_disabled: false,

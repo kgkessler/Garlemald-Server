@@ -345,6 +345,13 @@ impl PacketProcessor {
         character.chara.birthday_month = loaded.birth_month;
         character.chara.initial_town = loaded.initial_town;
         character.chara.rest_bonus_exp_rate = loaded.rest_bonus_exp_rate;
+        // Play-time hydration — the DB round-trip already worked
+        // (`SavePlayTime` persists, `load_player_character` reads
+        // `playTime`), but the value was dropped here, so the login
+        // snapshot's `GetPlayTime(false)` stayed 0 and `player.lua::
+        // onLogin` re-ran its first-login branch (message + duplicate
+        // starter kit) every login. (Garlemald-Server #46.)
+        character.chara.play_time = loaded.play_time;
         // Mount/chocobo hydration. The DB load lands them on the
         // LoadedPlayer's `ChocoboData`; mirror into CharaState so
         // the runtime chocobo helpers (`apply_issue_chocobo`,
@@ -562,6 +569,33 @@ impl PacketProcessor {
     async fn handle_session_end(&self, client: &ClientHandle, sub: &SubPacket) -> Result<()> {
         let session_id = sub.header.source_id;
         tracing::info!(session = session_id, "session end");
+        // Purge the leaving player's parked coroutines BEFORE the
+        // registry forgets the session → actor mapping. The scheduler's
+        // park map is keyed by player actor id and was previously only
+        // purged via ContentFinished, so a `_WAIT_EVENT` park (an NPC
+        // talk mid-`callClientFunction`) survived teardown and fired
+        // against post-relog state — the live Charlys→Hobriaut hijack
+        // (a stale Charlys continuation resumed by a Hobriaut talk,
+        // silently draining QuestIncCounter + AddGil(2000) + EndEvent).
+        // Same `purge_owner` sweep the ContentFinished teardown uses
+        // (runtime/quest_apply.rs). (Garlemald-Server #46.)
+        if let Some(handle) = self.registry.by_session(session_id).await
+            && let Some(lua) = self.lua.as_ref()
+        {
+            let purged = lua
+                .scheduler()
+                .lock()
+                .map(|mut s| s.purge_owner(handle.actor_id))
+                .unwrap_or(0);
+            if purged > 0 {
+                tracing::warn!(
+                    session = session_id,
+                    player = handle.actor_id,
+                    purged_coroutines = purged,
+                    "session end purged parked coroutines — a talk/cutscene was mid-flight at disconnect",
+                );
+            }
+        }
         self.registry.remove_session(session_id).await;
         self.world.remove_session(session_id).await;
         let reply = tx::build_session_end(session_id, 1, 0);
@@ -861,8 +895,10 @@ impl PacketProcessor {
         // onStateChange never re-runs: the ENPC flags (e.g. man0l1 SEQ_007's
         // MSK_TRIGGER `pushDefault` + Isandorel-off at subseqMSK==1) are never
         // armed, AND `state.current` stays empty — so the is_quest_enpc guard
-        // in dispatch_event_start_to_npc misfires and prematurely resumes the
-        // first talk's parked cutscene ("first talk did nothing"). Re-run
+        // in the dispatcher's NPC release paths (`event/dispatcher.rs::
+        // dispatch_npc_event_started`, inert + no-script releases) misfires
+        // and sends a premature EndEvent out from under the first talk's
+        // just-parked cutscene ("first talk did nothing"). Re-run
         // onStateChange for every active quest now that the zone-in NPCs are
         // spawned (find_npc_by_class_id can resolve them). apply_quest_update
         // _enpcs is idempotent — begin_sequence_swap + onStateChange + diff
@@ -7537,6 +7573,109 @@ impl PacketProcessor {
         let actor_id = handle.actor_id;
 
         let owner_actor_id = pkt.owner_actor_id;
+
+        // pmeteor `LuaEngine.cs::EventStarted` parity — a STRICT resume-or-
+        // fresh split: if the player has a `_WAIT_EVENT`-parked coroutine,
+        // this EventStart resumes it (zero args, matching pmeteor's bare
+        // `coroutine.Resume()`); otherwise fall through to the fresh
+        // `onEventStarted` dispatch below. Never both — the old shape ran
+        // the fresh dispatch AND a trailing parked-resume arm
+        // (`dispatch_event_start_to_npc`), which resumed the just-parked
+        // menu coroutine with zero args so the camp Aetheryte menu opened
+        // and instantly closed (0x0130 + 0x0131 in one flush).
+        //
+        // Unlike pmeteor, the resume is gated on the park's stamped event
+        // owner: pmeteor resumes ANY parked coroutine for the player, which
+        // is how a stale Charlys talk surviving a relog got resumed by a
+        // Hobriaut talk — silently draining QuestIncCounter + AddGil(2000)
+        // + EndEvent. Owner mismatch ⇒ discard the stale park and dispatch
+        // fresh; owner UNKNOWN (parked outside the stamping scopes, e.g. a
+        // pre-warp director park from the DoZoneChangeContent drain) ⇒
+        // leave it alone and let `dispatch_event_start_to_content_director`'s
+        // own resume arm decide. (Garlemald-Server #46.)
+        //
+        // Command static actors + journal/NpcLs (0xA0F0xxxx) are exempt
+        // from the gate entirely: their menu round-trips resume via
+        // EventUpdate, and the pre-#46 dispatch skipped them with this
+        // same mask. Running them through the gate would let a hotbar /
+        // emote press DISCARD a stamped director park mid-flight (e.g.
+        // SEQ_005's processTtrBtl001 while the ACTIVEMODE popup is up —
+        // the game is NOT client-modal there), softlocking the tutorial
+        // until relog.
+        let is_command_static_actor = (owner_actor_id & 0xFFF0_0000) == 0xA0F0_0000;
+        if let Some(lua) = self.lua.as_ref().filter(|_| !is_command_static_actor) {
+            let parked_owner = lua
+                .scheduler()
+                .lock()
+                .ok()
+                .and_then(|s| s.parked_event_owner(actor_id));
+            match parked_owner {
+                Some(parked) if parked == owner_actor_id => {
+                    // pmeteor `Player.StartEvent` (Player.cs:2174) stamps
+                    // currentEventOwner/Name/Type BEFORE the resume-or-
+                    // dispatch split — mirror the field writes WITHOUT
+                    // `start_event`'s outbox row (the row is what triggers
+                    // the fresh dispatch).
+                    {
+                        let mut chara = handle.character.write().await;
+                        chara.event_session.current_event_owner = owner_actor_id;
+                        chara.event_session.current_event_name = pkt.event_name.clone();
+                        chara.event_session.current_event_type = pkt.event_type;
+                    }
+                    // Keep any re-park from the continuation stamped with
+                    // the same owner.
+                    let _owner_ctx = crate::lua::scheduler::CoroutineScheduler::event_owner_scope(
+                        lua.scheduler(),
+                        actor_id,
+                        owner_actor_id,
+                    );
+                    let resumed = lua
+                        .fire_player_event_and_drain(actor_id, &[])
+                        .filter(|c| !c.is_empty());
+                    tracing::debug!(
+                        player = actor_id,
+                        owner = format!("0x{owner_actor_id:08X}"),
+                        event_name = %pkt.event_name,
+                        commands = resumed.as_ref().map(|c| c.len()).unwrap_or(0),
+                        "EventStart resumed the owner's parked coroutine (pmeteor resume arm)",
+                    );
+                    if let Some(cmds) = resumed {
+                        self.apply_resumed_event_commands(&handle, cmds).await;
+                    }
+                    return Ok(());
+                }
+                Some(parked) if parked != crate::lua::scheduler::EVENT_OWNER_UNKNOWN => {
+                    tracing::warn!(
+                        player = actor_id,
+                        parked_owner = format!("0x{parked:08X}"),
+                        new_owner = format!("0x{owner_actor_id:08X}"),
+                        event_name = %pkt.event_name,
+                        "stale parked coroutine displaced by new event — discarded before fresh dispatch",
+                    );
+                    if let Ok(mut s) = lua.scheduler().lock() {
+                        s.discard_parked_event(actor_id);
+                    }
+                }
+                // Nothing parked, or parked-but-unattributable: fresh
+                // dispatch as before.
+                _ => {}
+            }
+        }
+
+        // Any `_WAIT_EVENT` park produced by the dispatch fan-out below
+        // (the EventStarted outbox → NPC/director dispatch, the quest-hook
+        // fan-out, command scripts) belongs to THIS event — stamp it with
+        // the owner so the resume gate above can match (or displace) it on
+        // the next EventStart. RAII: the early returns below (hotbar,
+        // NpcLs) clear the stamp on drop.
+        let _event_owner_ctx = self.lua.as_ref().map(|lua| {
+            crate::lua::scheduler::CoroutineScheduler::event_owner_scope(
+                lua.scheduler(),
+                actor_id,
+                owner_actor_id,
+            )
+        });
+
         let event_name_for_match = pkt.event_name.clone();
         // Snapshot the EventStart payload before the fields are moved into
         // `start_event`. The director-onEventStarted branch below replays
@@ -7611,9 +7750,13 @@ impl PacketProcessor {
         // Mirrors pmeteor `LuaEngine.cs::EventStarted` (lines 651-682):
         // `if (mSleepingOnPlayerEvent.ContainsKey(player.Id)) resume the
         // parked coroutine; else if (target is Director) Director.OnEventStart;
-        // else CallLuaFunction(player, target, "onEventStarted", …)`. We
-        // implement the parked-resume + fresh-dispatch arms here; the NPC
-        // fallback is the existing quest-hook fan-out further down.
+        // else CallLuaFunction(player, target, "onEventStarted", …)`. The
+        // owner-stamped resume arm at the top of this handler covers
+        // attributed parks; this path keeps its OWN resume arm for
+        // UNSTAMPED director parks (pre-warp parks from the
+        // DoZoneChangeContent drain land outside the stamping scopes) plus
+        // the fresh dispatch; the NPC fallback is the quest-hook fan-out
+        // further down.
         self.dispatch_event_start_to_content_director(
             &handle,
             session_id,
@@ -7657,20 +7800,20 @@ impl PacketProcessor {
             .await;
         }
 
-        // Non-quest NPC / object interaction — run the TARGET actor's OWN
+        // Non-quest NPC / object interaction — the TARGET actor's OWN
         // `onEventStarted` script (the aetheryte's teleport/homepoint/leve
-        // menu in AetheryteParent.lua, base populace dialogue, etc.).
-        // pmeteor runs this for EVERY EventStart target via
-        // LuaEngine.EventStarted -> CallLuaFunction(player, target,
-        // "onEventStarted"); garlemald only had quest-hook / command /
-        // journal / NpcLs / director routes, so clicking a plain NPC or
-        // the aetheryte did nothing (live-test round 2). Gated to a live
-        // Npc/object owner that ISN'T a command static actor, the journal
-        // / NpcLs commands, the active content director, or a current
-        // quest ENPC (those are handled by the quest-hook fan-out above —
-        // running their base script too would double-dispatch).
-        self.dispatch_event_start_to_npc(&handle, owner_actor_id, &event_name_for_cmd)
-            .await;
+        // menu in AetheryteParent.lua, base populace dialogue, etc.) rides
+        // the `start_event` → `EventStarted` outbox row above, dispatched by
+        // `event/dispatcher.rs::dispatch_npc_event_started`. There used to
+        // be a SECOND dispatch here (`dispatch_event_start_to_npc`) whose
+        // parked-resume arm resumed the coroutine the outbox dispatch had
+        // JUST parked — zero args, so menu scripts saw a nil choice and fell
+        // through to `player:EndEvent()`: the client got the menu-open
+        // 0x0130 and the 0x0131 EndEvent in the same flush and the camp
+        // Aetheryte menu instantly closed. pmeteor `LuaEngine.cs::
+        // EventStarted` is a strict resume-OR-fresh if/else — the resume
+        // arm lives at the top of this handler now, and the fresh dispatch
+        // is single-path through the outbox. (Garlemald-Server #46.)
 
         // SEQ-005 content-tutorial handshake (UNRESOLVED — breadcrumb for
         // the next attempt). Packet-diff against the working pmeteor capture
@@ -7944,6 +8087,27 @@ impl PacketProcessor {
             self.lua.as_ref(),
         )
         .await;
+    }
+
+    /// Apply the burst drained from a resumed `_WAIT_EVENT` coroutine.
+    /// Login-scoped bursts (content warps / quest handoffs / director
+    /// staging / logout — see [`Self::is_login_scoped_burst`] for the
+    /// per-variant rationale) MUST route through the login applier;
+    /// everything else takes the shared event-script drain. Shared by
+    /// the EventStart resume gate and the EventUpdate resume path so
+    /// both client wake-ups route a continuation identically.
+    async fn apply_resumed_event_commands(
+        &self,
+        handle: &ActorHandle,
+        cmds: Vec<crate::lua::command::LuaCommand>,
+    ) {
+        if Self::is_login_scoped_burst(&cmds) {
+            for cmd in cmds {
+                Box::pin(self.apply_login_lua_command(handle, cmd)).await;
+            }
+        } else {
+            Box::pin(self.apply_event_script_commands(handle, cmds)).await;
+        }
     }
 
     /// Command static-actor ids that dispatch to a `commands/<Name>.lua`
@@ -8772,199 +8936,6 @@ impl PacketProcessor {
     /// `callClientFunction(...)` lines would queue their commands but
     /// they'd be silently dropped at `apply_login_lua_command`.
     ///
-    /// Run a non-quest NPC/object's OWN `onEventStarted` script (port of
-    /// pmeteor's per-target `LuaEngine.EventStarted` dispatch). This is
-    /// what opens the aetheryte's menu (`AetheryteParent.lua`) and any
-    /// base populace dialogue — garlemald previously only routed quest
-    /// hooks / commands / journal / NpcLs / directors, so plain
-    /// NPC/object clicks did nothing. (Garlemald-Server #46 live test
-    /// round 2.)
-    ///
-    /// Guards (skip → leave to the existing routes):
-    ///  * command static actors (`0xA0F0xxxx`) — handled by
-    ///    `command_script_name` / journal / NpcLs above;
-    ///  * the active content director — `dispatch_event_start_to_content_director`;
-    ///  * a current quest ENPC — the quest-hook fan-out already ran its
-    ///    `onTalk`/`onPush`/etc.; running its base script too would
-    ///    double-open the event;
-    ///  * any owner not a live `Npc` in the registry.
-    ///
-    /// Mirrors the content-director resume pattern: try resuming a parked
-    /// coroutine first (the menu's `delegateCommand`/`callClientFunction`
-    /// round-trip parked on `_WAIT_EVENT`), only starting a fresh
-    /// `onEventStarted` when nothing was parked.
-    async fn dispatch_event_start_to_npc(
-        &self,
-        handle: &ActorHandle,
-        owner_actor_id: u32,
-        event_name: &str,
-    ) {
-        // Command static actors + journal/NpcLs are 0xA0F0xxxx; skip.
-        if (owner_actor_id & 0xFFF0_0000) == 0xA0F0_0000 {
-            return;
-        }
-        let Some(lua) = self.lua.as_ref() else {
-            return;
-        };
-        let actor_id = handle.actor_id;
-
-        // Skip the active content director (handled elsewhere).
-        if let Some(active) = self
-            .world
-            .session(handle.session_id)
-            .await
-            .and_then(|s| s.active_content_script)
-            && owner_actor_id == active.director_actor_id
-        {
-            return;
-        }
-
-        // Must be a live NPC actor in the registry.
-        let Some(owner_handle) = self.registry.get(owner_actor_id).await else {
-            return;
-        };
-        if !matches!(
-            owner_handle.kind,
-            crate::runtime::actor_registry::ActorKindTag::Npc
-        ) {
-            return;
-        }
-
-        // Skip current quest ENPCs — the quest-hook fan-out owns them.
-        let owner_class_id = {
-            let c = owner_handle.character.read().await;
-            c.chara.actor_class_id
-        };
-        let is_quest_enpc = {
-            let c = handle.character.read().await;
-            c.quest_journal.slots.iter().flatten().any(|q| {
-                q.state
-                    .current
-                    .values()
-                    .any(|e| e.actor_class_id == owner_class_id)
-            })
-        };
-        // DIAGNOSTIC (Garlemald-Server #46 walk-up): this non-quest NPC
-        // dispatch is the ONLY new server code in the push path this session
-        // (chained after the quest-hook fan-out in 9ff8a5c). For a quest ENPC
-        // like Rostnsthal the guard MUST skip here — otherwise the
-        // `fire_player_event_and_drain` below would prematurely resume the
-        // just-parked `onPush` coroutine (~1s EndEvent, tooltip torn down).
-        // Log the decision so a live test can prove the guard holds.
-        tracing::debug!(
-            owner = format!("0x{owner_actor_id:08X}"),
-            class = owner_class_id,
-            is_quest_enpc,
-            event = %event_name,
-            "dispatch_event_start_to_npc: quest-ENPC guard decision",
-        );
-        if is_quest_enpc {
-            return;
-        }
-
-        // First, try to resume a parked coroutine (the menu round-trip).
-        if let Some(cmds) = lua
-            .fire_player_event_and_drain(actor_id, &[])
-            .filter(|c| !c.is_empty())
-        {
-            self.apply_event_script_commands(handle, cmds).await;
-            return;
-        }
-
-        // Resolve the actor's script: unique override first, then the
-        // base class path (lowercased parents, leading '/' stripped —
-        // `resolver.base_class` joins `base/{path}.lua`).
-        let npc_spec = match self.build_npc_spec(owner_actor_id).await {
-            Some(s) => s,
-            None => return,
-        };
-        let zone_name = self
-            .world
-            .zone(npc_spec.zone_id)
-            .await
-            .map(|z| {
-                let zone = z.try_read();
-                zone.map(|z| z.core.zone_name.clone()).unwrap_or_default()
-            })
-            .unwrap_or_default();
-        let unique_path = lua
-            .resolver()
-            .npc(&zone_name, &npc_spec.class_name, &npc_spec.unique_id);
-        let script_path = if !npc_spec.unique_id.is_empty() && unique_path.exists() {
-            unique_path
-        } else {
-            let base_rel = crate::world_manager::lowercase_class_path(&npc_spec.class_path);
-            let base_rel = base_rel.strip_prefix('/').unwrap_or(&base_rel);
-            lua.resolver().base_class(base_rel)
-        };
-        if !script_path.exists() {
-            tracing::debug!(
-                owner = format!("0x{owner_actor_id:08X}"),
-                class = owner_class_id,
-                script = %script_path.display(),
-                "NPC onEventStarted: no script on disk — releasing client with EndEvent",
-            );
-            // A live owner with no script still opened a modal event on the
-            // client (e.g. an object push trigger like the La Noscea→Limsa
-            // `seafld0_push_limsa_entrance`, classId 1090004, whose push
-            // fires whenever the player walks into it — only man0l1 SEQ_048
-            // actually claims it). Without an EndEvent the client stays modal
-            // and every further interaction is dropped → softlock. Release
-            // it. (Garlemald-Server #46 — Limsa-entrance push softlock.)
-            self.end_command_event(handle).await;
-            return;
-        }
-
-        let snapshot = {
-            let c = handle.character.read().await;
-            build_player_snapshot_from_character(&c)
-        };
-        let lua_clone = lua.clone();
-        let script_path_clone = script_path.clone();
-        let event_name_owned = event_name.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            lua_clone.call_npc_on_event_started(
-                &script_path_clone,
-                snapshot,
-                npc_spec,
-                event_name_owned,
-                0,
-                Vec::new(),
-            )
-        })
-        .await;
-        let partial = match result {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "NPC onEventStarted dispatch panicked");
-                return;
-            }
-        };
-        if let Some(e) = partial.error {
-            tracing::debug!(
-                owner = format!("0x{owner_actor_id:08X}"),
-                error = %e,
-                "NPC onEventStarted errored; applying partial commands",
-            );
-        }
-        // If the script defined no handler for this eventName it emits NO
-        // commands (and parks nothing — a parked callClientFunction would
-        // have queued a RunEventFunction). That's an inert trigger — e.g. an
-        // object push trigger whose `pushDefault` no quest claims at the
-        // current sequence. The client is sitting modal on the event; release
-        // it with EndEvent or it softlocks. (Garlemald-Server #46.)
-        if partial.commands.is_empty() {
-            tracing::debug!(
-                owner = format!("0x{owner_actor_id:08X}"),
-                event = %event_name,
-                "NPC onEventStarted: script emitted nothing — releasing client with EndEvent",
-            );
-            self.end_command_event(handle).await;
-            return;
-        }
-        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
-    }
-
     /// No-ops if the NPC isn't in the registry, or the player has no
     /// active quests.
     async fn fire_quest_hook_for_active_quests(
@@ -9069,6 +9040,26 @@ impl PacketProcessor {
         // inert). When a coroutine IS resumed it emits its own EndEvent, so we
         // skip the event-session echo to avoid a double EndEvent.
         // (Garlemald-Server #28.)
+        //
+        // A continuation that re-parks (multi-step `delegateEvent` chains)
+        // must keep its event-owner stamp for `handle_event_start`'s resume
+        // gate — the open event's owner is still on the EventSession (no
+        // EndEvent has cleared it yet), so scope the resume with it.
+        // (Garlemald-Server #46.)
+        let current_event_owner = {
+            let c = handle.character.read().await;
+            c.event_session.current_event_owner
+        };
+        let _owner_ctx = match (self.lua.as_ref(), current_event_owner) {
+            (Some(lua), owner) if owner != 0 => Some(
+                crate::lua::scheduler::CoroutineScheduler::event_owner_scope(
+                    lua.scheduler(),
+                    actor_id,
+                    owner,
+                ),
+            ),
+            _ => None,
+        };
         let resumed = self
             .lua
             .as_ref()
@@ -9154,14 +9145,7 @@ impl PacketProcessor {
             //    QuestStartSequence / QuestUpdateEnpcs / SendMessage) has an
             //    explicit login-applier arm, so nothing load-bearing falls into
             //    the login catch-all. (Round-3 live test — Baderon breaks menu.)
-            let is_login_scoped_burst = Self::is_login_scoped_burst(&cmds);
-            if is_login_scoped_burst {
-                for cmd in cmds {
-                    Box::pin(self.apply_login_lua_command(&handle, cmd)).await;
-                }
-            } else {
-                Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
-            }
+            self.apply_resumed_event_commands(&handle, cmds).await;
             return Ok(());
         }
 
@@ -9804,7 +9788,8 @@ fn hash_name_to_id(name: &str) -> u64 {
 /// `PlayerSnapshot::from(&Player)` path requires the richer `actor::Player`
 /// struct with helper state we don't have plumbed into `ActorRegistry`
 /// yet — this constructs the subset `player.lua:onBeginLogin` actually
-/// reads: `GetPlayTime` (returns 0 → "new player"), `GetInitialTown`,
+/// reads: `GetPlayTime` (0 → "new player", nonzero after the first
+/// `SavePlayTime` persists), `GetInitialTown`,
 /// `HasQuest`, `GetZoneID`, plus the `playerWork.tribe` field read in
 /// the tutorial branch.
 pub(crate) fn build_player_snapshot_for_login(
@@ -9822,7 +9807,11 @@ pub(crate) fn build_player_snapshot_for_login(
         mp: c.chara.mp,
         max_mp: c.chara.max_mp,
         tp: c.chara.tp,
-        play_time: 0,
+        // Hydrated from `characters.playTime` at session-begin (see the
+        // `character.chara.play_time = loaded.play_time` line in the
+        // LoadedPlayer hydration) — a hardcoded 0 here re-triggered
+        // `player.lua::onLogin`'s first-login branch every login.
+        play_time: c.chara.play_time,
         current_class: c.chara.class.max(0) as u8,
         current_level: c.chara.level,
         current_job: c.chara.current_job as u8,

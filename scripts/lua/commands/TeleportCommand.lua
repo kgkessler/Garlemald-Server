@@ -72,13 +72,21 @@ function onEventStarted(player, actor, triggerName, isTeleport)
 				confirmChoice = callClientFunction(player, "delegateCommand", actor, "eventConfirm", false, false, 1, 138824, false);				
 				if (confirmChoice == 1) then
 					player:PlayAnimation(0x4000FFB);
-					player:SendGameMessage(worldMaster, 34105, 0x20);			
-					--Do teleport		
-					destination = aetheryteTeleportPositions[teleportMenuToAetheryte[regionChoice][aetheryteChoice]];			
-					if (destination ~= nil) then						
+					player:SendGameMessage(worldMaster, 34105, 0x20);
+					--Do teleport
+					destination = aetheryteTeleportPositions[teleportMenuToAetheryte[regionChoice][aetheryteChoice]];
+					if (destination ~= nil) then
 						randoPos = getRandomPointInBand(destination[2], destination[4], 3, 5);
 						rotation = getAngleFacing(randoPos.x, randoPos.y, destination[2], destination[4]);
+						-- Close the teleport menu event, THEN warp — 0x0131 ahead
+						-- of the 0x00E2 reload latch is retail's invariant ordering
+						-- on every captured transition (see man0l1.lua onStart).
+						-- EndEvent after the warp shipped the event teardown into
+						-- the client's Now-Loading gap and left the veil stuck.
+						-- (Garlemald-Server #46.)
+						player:EndEvent();
 						GetWorldManager():DoZoneChange(player, destination[1], nil, 0, 2, randoPos.x, destination[3], randoPos.y, rotation);
+						return;
 					end
 				end
 				player:EndEvent();
@@ -100,23 +108,35 @@ function onEventStarted(player, actor, triggerName, isTeleport)
 				player:PlayAnimation(0x01000066);
 			end
 
+			-- Same 0x0131-before-0x00E2 ordering as the teleport branch
+			-- above: each warping path closes the event first and returns,
+			-- so the shared EndEvent at the bottom only serves the
+			-- non-warp exits (declined confirm, unset inn slot, unknown
+			-- homepoint). (Garlemald-Server #46.)
 			if (isInn) then
-				--Return to Inn		
+				--Return to Inn
 				if (player:GetHomePointInn() == 1) then
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, 244, nil, 0, 15, -160.048, 0, -165.737, 0);
+					return;
 				elseif (player:GetHomePointInn() == 2) then
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, 244, nil, 0, 15, 160.048, 0, 154.263, 0);
+					return;
 				elseif (player:GetHomePointInn() == 3) then
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, 244, nil, 0, 15, 0.048, 0, -5.737, 0);
-				end			
+					return;
+				end
 			elseif (choice == 1 and isInn == nil) then			
 				--Return to Homepoint
 				destination = aetheryteTeleportPositions[player:GetHomePoint()];
 				if (destination ~= nil) then
 					randoPos = getRandomPointInBand(destination[2], destination[4], 3, 5);
 					rotation = getAngleFacing(randoPos.x, randoPos.y, destination[2], destination[4]);
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, destination[1], nil, 0, 2, randoPos.x, destination[3], randoPos.y, rotation);
-
+					return;
 				end
 			end
 		end
