@@ -5011,45 +5011,19 @@ impl PacketProcessor {
     /// pmeteor `Player.UpdateHotbar(slots)` — push one slot's live
     /// command + recast state to the owning client after an
     /// Equip/Unequip/Swap applier, so hotbar edits render without
-    /// re-zoning. Reads the post-mutation `chara.hotbar` mirror; an
-    /// absent entry emits the disable shape (command 0, category /
-    /// compatibility 0). Self-only, every subpacket target-stamped
-    /// (proxy rule). (#28 S3.1.)
+    /// re-zoning. Thin delegate: the body moved to
+    /// `runtime::quest_apply::send_hotbar_slot_update` so the level-up
+    /// auto-equip path (`equip_abilities_at_level`) shares the exact
+    /// same wire shape. (#28 S3.1, hoisted for #46 round 2.)
     async fn send_hotbar_slot_update(&self, player_id: u32, slot0: u16) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            return;
-        };
-        let Some(client) = self.world.client(handle.session_id).await else {
-            return;
-        };
-        let (command_masked, recast_end) = {
-            let c = handle.character.read().await;
-            c.chara
-                .hotbar
-                .iter()
-                .find(|e| e.hotbar_slot == slot0)
-                .map(|e| (e.command_id | 0xA0F0_0000, e.recast_time))
-                .unwrap_or((0, 0))
-        };
-        let max_recast_s = self
-            .lua
-            .as_ref()
-            .and_then(|l| l.catalogs().battle_commands.read().ok())
-            .and_then(|m| {
-                m.get(&((command_masked & 0xFFFF) as u16))
-                    .map(|c| c.max_recast_time_seconds as u16)
-            })
-            .unwrap_or(0);
-        for mut sub in crate::packets::send::actor::build_hotbar_slot_update(
+        crate::runtime::quest_apply::send_hotbar_slot_update(
             player_id,
             slot0,
-            command_masked,
-            max_recast_s,
-            recast_end,
-        ) {
-            sub.set_target_id(handle.session_id);
-            client.send_bytes(sub.to_bytes()).await;
-        }
+            &self.registry,
+            &self.world,
+            self.lua.as_ref(),
+        )
+        .await;
     }
 
     async fn apply_equip_ability(
@@ -5836,7 +5810,7 @@ impl PacketProcessor {
         // Reload hotbar BEFORE updating chara.class so a partial
         // failure (DB load fails) leaves the player on their old
         // class with intact hotbar.
-        let new_hotbar = match self.db.load_hotbar(player_id, class_id).await {
+        let mut new_hotbar = match self.db.load_hotbar(player_id, class_id).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -5846,6 +5820,63 @@ impl PacketProcessor {
                 return;
             }
         };
+        // First-time-class init — pmeteor `DoClassChange`
+        // (Player.cs:1268-1272): `if (charaWork.battleSave.skillLevel
+        // [classId-1] <= 0) { UpdateClassLevel(classId, 1);
+        // EquipAbilitiesAtLevel(classId, 1); }` — a class that has never
+        // been played starts at level 1 with its level-1 kit
+        // auto-equipped. Gate on BOTH the empty hotbar AND a 0/absent
+        // characters_class_levels entry so a deliberately emptied bar on
+        // an already-played class doesn't re-deal the starter kit.
+        // (#46 round 2.)
+        if new_hotbar.is_empty() {
+            let db_level = self
+                .db
+                .load_class_levels_and_exp(player_id)
+                .await
+                .map(|s| s.skill_level.get(class_id as usize).copied().unwrap_or(0))
+                .unwrap_or(0);
+            if db_level <= 0 {
+                // pmeteor `UpdateClassLevel(classId, 1)` — persisting the
+                // level also closes this init gate for future changes.
+                if let Err(e) = self.db.set_level(player_id, class_id, 1).await {
+                    tracing::warn!(
+                        player = player_id, class_id, err = %e,
+                        "DoClassChange: first-time set_level failed",
+                    );
+                }
+                {
+                    let mut c = handle.character.write().await;
+                    if let Some(slot) = c.battle_save.skill_level.get_mut(class_id as usize) {
+                        *slot = 1;
+                    }
+                }
+                // Auto-equip the level-1 kit (class bar + job mirror).
+                // `chara.class` still holds the OLD class here, so the
+                // helper takes the DB-slot path (no live-mirror / wire
+                // writes) — the reload right below picks the rows up and
+                // the full-bar refresh at the tail ships them.
+                if let Some(lua) = self.lua.as_ref() {
+                    crate::runtime::quest_apply::equip_abilities_at_level(
+                        player_id,
+                        class_id,
+                        1,
+                        &self.registry,
+                        &self.db,
+                        Some(&*self.world),
+                        lua,
+                    )
+                    .await;
+                    match self.db.load_hotbar(player_id, class_id).await {
+                        Ok(v) => new_hotbar = v,
+                        Err(e) => tracing::warn!(
+                            player = player_id, class_id, err = %e,
+                            "DoClassChange: post-init hotbar reload failed",
+                        ),
+                    }
+                }
+            }
+        }
         {
             let mut c = handle.character.write().await;
             c.chara.class = class_id as i16;
@@ -5872,10 +5903,23 @@ impl PacketProcessor {
         )
         .await;
 
+        // Full-bar refresh — pmeteor `DoClassChange` tail
+        // (Player.cs:1276+ `Database.LoadHotbar(this)` + the Set Hotbar
+        // Commands property blocks / `UpdateHotbar`): push all 30 slots
+        // so the client swaps the visible bar to the new class —
+        // occupied slots render, stale old-class slots blank out
+        // (absent mirror entries emit the disable shape). Self-only,
+        // target stamped inside the helper. Before this the reload only
+        // touched the in-memory mirror and the client kept drawing the
+        // previous class's bar until re-zoning. (#46 round 2.)
+        for slot0 in 0..crate::runtime::quest_apply::HOTBAR_SLOTS {
+            self.send_hotbar_slot_update(player_id, slot0).await;
+        }
+
         tracing::info!(
             player = player_id,
             class_id,
-            "DoClassChange applied (chara.class + hotbar reload + 0x01A4 broadcast; status-effect removal + stat recalc deferred)",
+            "DoClassChange applied (chara.class + hotbar reload + first-time kit init + 0x01A4 broadcast + full-bar refresh; status-effect removal + stat recalc deferred)",
         );
     }
 

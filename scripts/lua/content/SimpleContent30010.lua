@@ -39,17 +39,16 @@ function onCreate(starterPlayer, contentArea, director)
     mob1:ChangeState(2);
     mob2:ChangeState(2);
     mob3:ChangeState(2);
-	-- Party-add the allies (MeteorReborn SimpleContent30010.lua:17-18)
-	-- so the HUD roster renders Yda/Papalymo HP bars — the 1.x party
-	-- list reads the real party group (10001), and the content-group
-	-- 30006 roster alone never lit the bars in any live run (#28 issue:
-	-- "Yda and Papalymo's health should show in my Roster"). The
-	-- quest_system_mac variant omits these lines, but its tutorial also
-	-- never shows ally bars; MeteorReborn (Decimus's rescript) is the
-	-- canonical reference. ContentFinished clears the transient party
-	-- roster at teardown, so the party is solo again entering Gridania.
-	starterPlayer.currentParty:AddMember(papalymo.actorId);
-	starterPlayer.currentParty:AddMember(yda.actorId);
+	-- Do NOT party-add the allies (Garlemald-Server #46, round 2):
+	-- pmeteor never party-adds tutorial allies — the HUD roster rides the
+	-- CONTENT group trio (group 0x3000000000000001, type 30006, 12-byte-
+	-- stride X08 rows [actorId, layoutId, flag]), which pmeteor/
+	-- MeteorReborn RE-SEND inside the content-warp zone-in bundle
+	-- (MeteorReborn Player.cs:625-629: currentContentGroup.SendGroupPackets
+	-- then currentParty.SendGroupPackets — mirrored by the Rust side).
+	-- The round-1 currentParty:AddMember(papalymo/yda) calls put
+	-- empty-named rows in the party X08 and displaced the content roster
+	-- (retest packet capture).
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);
 	-- Allies are unkillable for the tutorial too (Modifier::MinimumHpLock
 	-- floor-1 clamp, actor/chara.rs): a dead Yda/Papalymo would otherwise

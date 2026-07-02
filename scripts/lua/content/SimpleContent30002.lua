@@ -38,11 +38,16 @@ function onCreate(starterPlayer, contentArea, director)
 	mob1:ChangeState(2);
 	mob2:ChangeState(2);
 	mob3:ChangeState(2);
-	-- Party-add the allies so the HUD roster shows their HP bars (the
-	-- 1.x party list reads the real party group, not the content
-	-- group). ContentFinished clears the transient roster at teardown.
-	starterPlayer.currentParty:AddMember(yshtola.actorId);
-	starterPlayer.currentParty:AddMember(sthalmann.actorId);
+	-- Do NOT party-add the allies (Garlemald-Server #46, round 2):
+	-- pmeteor never party-adds tutorial allies — the HUD roster rides the
+	-- CONTENT group trio (group 0x3000000000000001, type 30006, 12-byte-
+	-- stride X08 rows [actorId, layoutId, flag]), which pmeteor/
+	-- MeteorReborn RE-SEND inside the content-warp zone-in bundle
+	-- (MeteorReborn Player.cs:625-629: currentContentGroup.SendGroupPackets
+	-- then currentParty.SendGroupPackets — mirrored by the Rust side).
+	-- The round-1 currentParty:AddMember(yshtola/sthalmann) calls put
+	-- empty-named rows in the party X08 and displaced the content roster
+	-- (retest packet capture).
 	-- No-die guarantees for the tutorial (MinimumHpLock floor-1 clamp);
 	-- the player's lock is cleared at ContentFinished.
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);

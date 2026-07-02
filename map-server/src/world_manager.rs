@@ -406,6 +406,88 @@ pub fn build_retainer_spawn_bundle(
 /// neighbour scan uses the same figure.
 pub(crate) const INSTANCE_STREAM_RADIUS: f32 = 50.0;
 
+/// `0x00CE SetActorPosition` spawn_type that makes the 1.23b client
+/// complete zone-in INSTANTLY: a 0x00CE carrying 0x16 (with
+/// `isZoningPlayer = 0`) makes the client treat the arrival as
+/// in-place — it emits RX 0x0007 zone-in-complete immediately instead
+/// of waiting on a scene reload that a same-resident-geometry warp can
+/// never finish (the 0x00E2-armed scheduled reload of
+/// captures/issue28-rca/03-decomp-reload.md; the escort recipe sends
+/// no 0x00E2 at all). Wire-proven precedent: the man0l1 same-map
+/// escort (commit bcfc0aa); now also the same-seamless-family public
+/// warp path in `apply_do_zone_change`. (Garlemald-Server #46.)
+pub(crate) const SPAWN_TYPE_INSTANT_ZONE_IN: u16 = 0x16;
+
+/// pmeteor's content-group index: `0x3000_0000_0000_0000 | counter`
+/// (WorldManager.cs:1077) — high nibble 0x3 is the content-group
+/// bitfield marker the client uses to pick the group index table;
+/// counter is a per-process sequence starting at 1. Garlemald only
+/// ever runs one content group per session (the tutorial flows), so
+/// counter is hard-coded to 1 — the same value the pre-warp trio in
+/// `PacketProcessor` emits, which matters: the zone-in re-send below
+/// must address the SAME group or the client registers a second one.
+pub(crate) const CONTENT_GROUP_INDEX: u64 = 0x3000_0000_0000_0001;
+
+/// C# Group.cs:49 — `ContentGroup_SimpleContentGroup24B = 30006`, the
+/// GroupHeader type_id pmeteor sends for a content director's group
+/// (byte-verified vs captures/pmeteor-quest/20260426-160210-gridania-
+/// manual3 line 31878).
+pub(crate) const GROUP_TYPE_CONTENT_GROUP: u32 = 30006;
+
+/// Build the CONTENT group trio — GroupHeader (0x017C) + Begin
+/// (0x017D) + the 12-byte-stride content-members X08 (0x0183) + End
+/// (0x017E) — for [`CONTENT_GROUP_INDEX`] / type
+/// [`GROUP_TYPE_CONTENT_GROUP`]. Shared shape between the pre-warp
+/// emission in `PacketProcessor::apply_do_zone_change_content` (which
+/// registers the group ahead of the director kick) and the zone-in
+/// bundle's post-warp RE-send (MeteorReborn Player.cs:625-629:
+/// `currentContentGroup.SendGroupPackets` then
+/// `currentParty.SendGroupPackets` inside SendZoneInPackets — the
+/// content trio rides EVERY content-warp zone-in bundle, not just the
+/// pre-warp burst). Subpackets are returned untargeted; callers stamp
+/// `target_id` before sending (world-server proxy drops untargeted
+/// subpackets). (Garlemald-Server #46.)
+pub(crate) fn build_content_group_trio(
+    player_actor_id: u32,
+    location_code: u64,
+    sequence_id: u64,
+    members: &[tx::groups::GroupMember],
+) -> Vec<common::subpacket::SubPacket> {
+    let mut offset = 0usize;
+    vec![
+        tx::groups::build_group_header(
+            player_actor_id,
+            location_code,
+            sequence_id,
+            CONTENT_GROUP_INDEX,
+            GROUP_TYPE_CONTENT_GROUP,
+            -1,
+            "",
+            members.len() as u32,
+        ),
+        tx::groups::build_group_members_begin(
+            player_actor_id,
+            location_code,
+            sequence_id,
+            CONTENT_GROUP_INDEX,
+            members.len() as u32,
+        ),
+        tx::groups::build_content_members_x08(
+            player_actor_id,
+            location_code,
+            sequence_id,
+            members,
+            &mut offset,
+        ),
+        tx::groups::build_group_members_end(
+            player_actor_id,
+            location_code,
+            sequence_id,
+            CONTENT_GROUP_INDEX,
+        ),
+    ]
+}
+
 /// Snapshot the receiving player's quest-driven ENPC overlay states:
 /// `actor_class_id → QuestEnpc` across every active quest's current
 /// ENPC set. A spawned/streamed actor whose class is in this map is a
@@ -476,10 +558,11 @@ pub(crate) fn push_npc_spawn(
     lua: Option<&std::sync::Arc<crate::lua::LuaEngine>>,
     // Registry kind of the actor, when known. `Some(BattleNpc)` /
     // `Some(Ally)` means the actor went through the REAL BattleNpc
-    // pipeline (stats, state_mainSkill, battleSave populated) and may
-    // keep `charaWork.property[2]` + a combat hateType; `None` keeps
-    // the legacy populace-pipeline behavior (bit-2 mask + hateType 0
-    // for `/Monster/` class paths).
+    // pipeline (stats, state_mainSkill, battleSave populated) and gets
+    // the forced 0x13 render bits + the `npcWork/hate` tail; `None`
+    // keeps the legacy populace-pipeline behavior (bit-2 mask for
+    // `/Monster/` class paths). hateType itself is 1 (passive white)
+    // for everyone at spawn — see the spawn_hate_type note below.
     battle_kind: Option<crate::runtime::actor_registry::ActorKindTag>,
     // Per-actor push-trigger enable override for the receiving player.
     // `Some(b)` when this actor is a current quest ENPC for the player
@@ -694,8 +777,11 @@ pub(crate) fn push_npc_spawn(
     // allocates the battle-branch fields bit 2 makes the client read,
     // regardless of what the /_init delivers. pmeteor hit the same
     // wall: `charaWork.property[2] = 1` is COMMENTED OUT in both its
-    // Npc.cs:174 and BattleNpc.cs:97, and its tutorial renders mob HP
-    // bars via npcWork.hateType alone. (Garlemald-Server #28.)
+    // Npc.cs:174 and BattleNpc.cs:97. (Round-2 decomp correction: no
+    // overhead mob HP gauge exists in 1.23b at all —
+    // `_setNameplateGauge` is a RET 0x8 stub; enemy HP renders in the
+    // target parameter widget. hateType only colors the nameplate.)
+    // (Garlemald-Server #28.)
     use crate::runtime::actor_registry::ActorKindTag;
     let is_real_battle_npc = matches!(
         battle_kind,
@@ -730,39 +816,32 @@ pub(crate) fn push_npc_spawn(
     let mp = character.chara.mp.max(0) as u16;
     let mp_max = character.chara.max_mp.max(0) as u16;
     let tp = character.chara.tp;
-    // hateType by archetype, pmeteor parity (see the tail-emission note
-    // below for the value table + the 2026-04-21 incident history). It
-    // must be resolved BEFORE the `/_init` dump: the client's
-    // DepictionJudge latches `npcWork.hateType` at nameplate build off
-    // the `/_init` bundle, non-retroactively (wiki note; live
-    // 2026-06-11 run), so a hostile's hateType=3 arriving only in the
-    // later `npcWork/hate` subpacket never lit the enemy HP gauge.
-    // pmeteor's `GetHateTypePacket` mutates `npcWork.hateType = 3`
-    // server-side inside `GetSpawnPackets` (BattleNpc.cs:130+145-163)
-    // before `GetInitPackets` reads it back (Session.cs:159-160).
+    // hateType at spawn is 1 — passive white — for EVERY actor,
+    // hostile BattleNpcs included. Round-2 decomp of the client's
+    // DepictionJudge corrected two earlier premises:
     //
-    // The `/_init` latch value and the `npcWork/hate` tail value are
-    // DELIBERATELY different tables: in pmeteor only a real BattleNpc
-    // mutates the field to 3 — every other actor's init reads back the
-    // NpcWork.cs:33 default 1, including populace-pipeline monsters
-    // (empty `battle_ids` at boot registers all seeded actors as plain
-    // Npc), while the tail keeps the legacy 0 for those. Feeding the
-    // tail's 0 into the init would latch them inert at nameplate build
-    // (no talk prompt / no collider — the 2026-04-21 incident class).
-    // (Garlemald-Server #46.)
-    let init_hate_type: u8 = match battle_kind {
-        Some(ActorKindTag::BattleNpc) => 3,
-        _ => 1,
-    };
-    let tail_hate_type: u8 = if is_monster || is_real_battle_npc {
-        match battle_kind {
-            Some(ActorKindTag::BattleNpc) => 3,
-            Some(ActorKindTag::Ally) => 1,
-            _ => 0,
-        }
-    } else {
-        1
-    };
+    //   * There is NO latch: `judgeNameplate` RE-RUNS on every
+    //     WorkSync (`CharaBaseClass:_onUpdateWork`), so an engage-time
+    //     `npcWork/hate` flip re-colors the nameplate live. The
+    //     round-1 "non-retroactive latch" reading (which pushed 3 into
+    //     the `/_init` dump) was wrong.
+    //   * hateType drives nameplate COLOR only: 1 = white passive,
+    //     2 = engaged orange (no party deref), 3 = red ONLY when the
+    //     mob's party is the player party's occupancy group (0x0187
+    //     claim) — ELSE the purple "claimed by another party" tint,
+    //     which is exactly what the retest showed on unengaged
+    //     spawn-3 hostiles. Retail spawns unengaged hostiles WHITE;
+    //     the 2/3 transitions belong to the engage/claim path
+    //     (`dispatcher.rs` BattleEvent arms), not the spawn tables.
+    //   * No hateType value renders an overhead HP gauge — the
+    //     client's `_setNameplateGauge` is a RET 0x8 stub in 1.23b.
+    //     Enemy HP displays in the target parameter widget from
+    //     `charaWork.parameterSave.hp`, already on the wire.
+    //
+    // One value feeds both the `/_init` dump and the `npcWork/hate`
+    // tail below (the old two-table split existed only to serve the
+    // disproven latch model). (Garlemald-Server #46, round 2.)
+    let spawn_hate_type: u8 = 1;
     let npc_init = tx::actor::build_npc_property_init(
         actor_id,
         property_flags,
@@ -771,7 +850,7 @@ pub(crate) fn push_npc_spawn(
         mp,
         mp_max,
         tp,
-        init_hate_type,
+        spawn_hate_type,
     );
     subpackets.extend(npc_init);
 
@@ -805,24 +884,18 @@ pub(crate) fn push_npc_spawn(
 
     // BattleNpc `/npcWork/hate` tail is load-bearing — omitting it
     // for monster-path actors Wine-hard-crashes on zone-in (confirmed
-    // 2026-04-21). Hate type by archetype, pmeteor parity:
-    //   * hostile BattleNpc → 3 (ENGAGED_PARTY). pmeteor stomps 3
-    //     unconditionally at spawn (BattleNpc.cs:160) and its tutorial
-    //     renders mob HP gauges on this exact client. The wiki notes the
-    //     hateType evaluation is NOT retroactive — the judge reads it
-    //     when the nameplate is first built, so an engage-time flip
-    //     alone never lit the gauge (live 2026-06-11 run). The
-    //     2026-04-21 "hateType=3 crashes the judge" incident predated
-    //     the solo-party 0x017C group registration the judge's
-    //     `getPlayerParty():_getOccupancyGroup()` deref needs; that
-    //     trio ships in every zone-in bundle now.
-    //   * Ally → 1 (friendly passive).
-    //   * populace-pipeline monsters keep the legacy 0.
-    // See `build_npc_hate_type_packet` for the judge contract. (#28.)
+    // 2026-04-21) — so the EMISSION stays for every monster-path /
+    // real-BattleNpc actor. The VALUE is the same passive 1 as the
+    // `/_init` dump (see the spawn_hate_type note above): unengaged
+    // hostiles are white in retail, and the judge re-runs on every
+    // WorkSync, so the engage-time `npcWork/hate` flips
+    // (`dispatcher.rs` Engage → 2/3, Disengage → 1) re-color live.
+    // See `build_npc_hate_type_packet` for the corrected value table.
+    // (Garlemald-Server #46, round 2.)
     if is_monster || is_real_battle_npc {
         subpackets.push(tx::actor::build_npc_hate_type_packet(
             actor_id,
-            tail_hate_type,
+            spawn_hate_type,
         ));
     }
 }
@@ -2042,8 +2115,21 @@ impl WorldManager {
             tx::actor::build_0x132(actor_id, 0x100, "widgetCreate"),
             tx::actor::build_0x132(actor_id, 0x100, "macroRequest"),
             tx::actor::build_set_actor_speed_default(actor_id),
+            // spawn_type 0x16 is the instant zone-in-complete bypass
+            // (see `SPAWN_TYPE_INSTANT_ZONE_IN`): it must ship with
+            // `isZoningPlayer = 0` — the pair is what makes the client
+            // treat the arrival as in-place and echo RX 0x0007
+            // immediately. Every other spawn_type keeps the zoning
+            // flag set (the reload recipe's shape). (Garlemald #46.)
             tx::actor::build_set_actor_position(
-                actor_id, -1, position.x, position.y, position.z, rotation, spawn_type, true,
+                actor_id,
+                -1,
+                position.x,
+                position.y,
+                position.z,
+                rotation,
+                spawn_type,
+                /* is_zoning_player */ spawn_type != SPAWN_TYPE_INSTANT_ZONE_IN,
             ),
             tx::actor::build_set_actor_appearance(actor_id, model_id, &appearance_ids),
             tx::actor::build_set_actor_name(actor_id, display_name_id, &actor_name),
@@ -2737,6 +2823,134 @@ impl WorldManager {
             }
         }
 
+        // Director spawns (login + content) — emitted after the player
+        // / NPC spawn packets and BEFORE the group trios, mirroring
+        // pmeteor `Player.SendZoneInPackets` (MeteorReborn
+        // Player.cs:619-629): the `ownedDirectors` loop runs after the
+        // player's self-spawn + the nearby-NPC `UpdateInstance` pass,
+        // then `currentContentGroup.SendGroupPackets` and
+        // `currentParty.SendGroupPackets` close out the bundle's group
+        // section. The 1.x client tolerates the player's
+        // `ActorInstantiate` referencing the director's actor id by
+        // forward reference (just an integer; resolved on first use
+        // post-spawn).
+        //
+        // Directors still precede the trailing KickEvent at the very
+        // end of this bundle, so their `+0x5c` flag (the KickEvent
+        // gate per meteor-decomp `event_kick_receiver_decomp.md`) is
+        // set by the time the kick fires.
+        let mut director_subpackets: Vec<common::subpacket::SubPacket> = Vec::new();
+        if let Some(spec) = &login_director_spec {
+            director_subpackets.extend(build_director_spawn_subpackets(
+                spec.actor_id,
+                spec.zone_actor_id,
+                &spec.class_path,
+                &spec.class_name,
+                &zone_name,
+            ));
+            tracing::info!(
+                director = spec.actor_id,
+                class_path = %spec.class_path,
+                "login director spawn packets appended (after player + NPCs)"
+            );
+        }
+        if let Some(active) = session.active_content_script.as_ref()
+            && Some(active.director_actor_id) != login_director_spec.as_ref().map(|s| s.actor_id)
+        {
+            let content_director_class_path = format!("/Director/{}", active.director_name);
+            director_subpackets.extend(build_director_spawn_subpackets(
+                active.director_actor_id,
+                active.parent_zone_id,
+                &content_director_class_path,
+                &active.director_name,
+                &zone_name,
+            ));
+            tracing::info!(
+                director = active.director_actor_id,
+                director_name = %active.director_name,
+                "content director spawn packets appended (after player + NPCs)"
+            );
+        }
+        for mut sub in director_subpackets {
+            sub.set_target_id(session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
+
+        // CONTENT group trio RE-send — every content-warp zone-in
+        // bundle carries the content group again, positioned after the
+        // director spawns and before the party trio. pmeteor /
+        // MeteorReborn re-send BOTH group trios inside
+        // `Player.SendZoneInPackets` (MeteorReborn Player.cs:625-629:
+        // `currentContentGroup.SendGroupPackets(...)` then
+        // `currentParty.SendGroupPackets(...)`), and the reference
+        // capture shows the content trio in the post-warp bundle — the
+        // pre-warp trio alone (see
+        // `PacketProcessor::apply_do_zone_change_content`) is not what
+        // keeps the tutorial allies on the party HUD: the client
+        // rebuilds its HUD state from the zone-in bundle, so a bundle
+        // without the content trio reverts the ally list. The tutorial
+        // allies ride THIS group (type 30006, 12-byte-stride X08 rows)
+        // — pmeteor never party-adds them; the party trio below stays
+        // the player's real (solo) party. (Garlemald-Server #46.)
+        if let Some(active) = session.active_content_script.as_ref() {
+            let roster: Vec<u32> = session
+                .transient_director_members
+                .get(&active.director_actor_id)
+                .cloned()
+                .unwrap_or_default();
+            if roster.is_empty() {
+                // A content script whose director has no members yet
+                // (pre-AddMember). An empty X08 is the malformed shape
+                // the client hard-crashes on (see the party-trio note
+                // below) — skip rather than emit a zero-member group.
+                tracing::debug!(
+                    session = session_id,
+                    director = format!("0x{:08X}", active.director_actor_id),
+                    "content group trio skipped at zone-in: empty director roster",
+                );
+            } else {
+                let mut members: Vec<tx::groups::GroupMember> = Vec::with_capacity(roster.len());
+                for &mid in &roster {
+                    // Name resolution mirrors the pre-warp emission:
+                    // registry display name, synthetic `bnpc_<id>`
+                    // fallback for a not-yet-registered member.
+                    let name = if let Some(h) = registry.get(mid).await {
+                        let c = h.character.read().await;
+                        c.base.display_name().to_string()
+                    } else {
+                        format!("bnpc_{mid:08X}")
+                    };
+                    members.push(tx::groups::GroupMember {
+                        actor_id: mid,
+                        localized_name: -1,
+                        unknown2: 0,
+                        flag1: false,
+                        is_online: true,
+                        name,
+                    });
+                }
+                let sequence_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default();
+                for mut sub in build_content_group_trio(
+                    actor_id,
+                    active.parent_zone_id as u64,
+                    sequence_id,
+                    &members,
+                ) {
+                    sub.set_target_id(session_id);
+                    client.send_bytes(sub.to_bytes()).await;
+                }
+                tracing::info!(
+                    session = session_id,
+                    director = format!("0x{:08X}", active.director_actor_id),
+                    roster = members.len(),
+                    "content group trio re-sent in zone-in bundle (MeteorReborn Player.cs:625-629 parity)",
+                );
+            }
+        }
+
         // Solo-party group sync. Decompiled
         // `CharaBaseClass:getPlayerParty` (proto[2] of
         // `script/729s9/729s989r57y9rr.le.lpb`) is literally
@@ -2953,55 +3167,6 @@ impl WorldManager {
                 sub.set_target_id(session_id);
                 client.send_bytes(sub.to_bytes()).await;
             }
-        }
-
-        // Director spawns (login + content) emitted AFTER all player /
-        // NPC / group packets. Per pmeteor `Player.SendZoneInPackets`
-        // (`Map Server/Actors/Chara/Player/Player.cs:657-661`), the
-        // `ownedDirectors` loop runs AFTER the player's self-spawn
-        // and after the nearby-NPC `UpdateInstance` pass. The 1.x
-        // client tolerates the player's `ActorInstantiate` referencing
-        // the director's actor id by forward reference (just an
-        // integer; resolved on first use post-spawn).
-        //
-        // Sending directors LAST also ensures their `+0x5c` flag (the
-        // KickEvent gate per meteor-decomp `event_kick_receiver_decomp.md`)
-        // is still set when the trailing KickEvent fires below.
-        let mut director_subpackets: Vec<common::subpacket::SubPacket> = Vec::new();
-        if let Some(spec) = &login_director_spec {
-            director_subpackets.extend(build_director_spawn_subpackets(
-                spec.actor_id,
-                spec.zone_actor_id,
-                &spec.class_path,
-                &spec.class_name,
-                &zone_name,
-            ));
-            tracing::info!(
-                director = spec.actor_id,
-                class_path = %spec.class_path,
-                "login director spawn packets appended (after player + NPCs)"
-            );
-        }
-        if let Some(active) = session.active_content_script.as_ref()
-            && Some(active.director_actor_id) != login_director_spec.as_ref().map(|s| s.actor_id)
-        {
-            let content_director_class_path = format!("/Director/{}", active.director_name);
-            director_subpackets.extend(build_director_spawn_subpackets(
-                active.director_actor_id,
-                active.parent_zone_id,
-                &content_director_class_path,
-                &active.director_name,
-                &zone_name,
-            ));
-            tracing::info!(
-                director = active.director_actor_id,
-                director_name = %active.director_name,
-                "content director spawn packets appended (after player + NPCs)"
-            );
-        }
-        for mut sub in director_subpackets {
-            sub.set_target_id(session_id);
-            client.send_bytes(sub.to_bytes()).await;
         }
 
         // Retail actor-cleanup commit — the Mass Delete KEEP-LIST trio.

@@ -922,12 +922,21 @@ async fn apply_actor_engage(
         //   * 0x0195 SetEnmityIndicator — locks the red hate gem onto the
         //     engaged target (decoded from ffxiv_traces/combat_skills.pcapng;
         //     pmeteor never emits this opcode).
-        //   * npcWork.hateType = 3 (ENGAGED_PARTY) — turns on the overhead +
-        //     target-HUD HP gauge and the claimed nameplate colour (pmeteor
-        //     BattleNpc.cs:160 ships 3 unconditionally from spawn).
+        //   * npcWork.hateType = 2 (HATE_TYPE_ENGAGED) — flips the nameplate
+        //     to the engaged ORANGE tint. NEVER 3: per the round-2 decomp of
+        //     `DepictionJudge:judgeNameplate()`, 3 renders RED only when the
+        //     mob's party is the player party's occupancy group (0x0187 Set
+        //     Occupancy Group claim wiring, which garlemald doesn't emit) —
+        //     without the claim the client falls through to the PURPLE
+        //     "claimed by another party" tint. 2 is party-independent (no
+        //     party deref in the judge's colour table). hateType drives
+        //     nameplate COLOR only — no value renders an overhead HP gauge
+        //     (`_setNameplateGauge` is a RET 0x8 stub in 1.23b); enemy HP
+        //     shows in the target parameter widget. See
+        //     `build_npc_hate_type_packet` for the full corrected table.
         // Allies/players skip both, same gate as the dispatch arm —
         // friendly nameplates stay passive. Without these the tutorial's
-        // script-engaged enemies fought with no hate gem / HP gauge.
+        // script-engaged enemies fought with no hate gem / engaged tint.
         if matches!(handle.kind, ActorKindTag::BattleNpc) {
             let gem = crate::packets::send::actor_battle::build_set_enmity_indicator(
                 actor_id,
@@ -942,7 +951,10 @@ async fn apply_actor_engage(
                 gem.to_bytes(),
             )
             .await;
-            let hate_type = crate::packets::send::actor::build_npc_hate_type_packet(actor_id, 3);
+            let hate_type = crate::packets::send::actor::build_npc_hate_type_packet(
+                actor_id,
+                crate::npc::HATE_TYPE_ENGAGED,
+            );
             crate::runtime::broadcast::broadcast_around_actor(
                 world,
                 registry,
@@ -2023,12 +2035,15 @@ pub(crate) async fn apply_do_zone_change(
         return;
     }
 
-    // Pre-move zone — feeds the same-region detection in step 5.
-    let old_zone_id = world
+    // Pre-move zone + private-area routing — feeds the transition
+    // classification in step 4 (same-seamless-family detection needs to
+    // know the ORIGIN was public; `do_zone_change_with_private_area`
+    // overwrites both fields, so snapshot before the migration).
+    let (old_zone_id, old_private_area_name) = world
         .session(session_id)
         .await
-        .map(|s| s.current_zone_id)
-        .unwrap_or(0);
+        .map(|s| (s.current_zone_id, s.current_private_area_name.clone()))
+        .unwrap_or((0, None));
 
     // 1. Migrate the actor between zones (no-op if zone_id is the
     //    same as the current zone). `do_zone_change_with_private_area`
@@ -2124,19 +2139,115 @@ pub(crate) async fn apply_do_zone_change(
         }
     }
 
-    // 3. Carry the requested spawn_type through to the zone-in
-    //    bundle so the client plays the right "you arrived" anim.
+    // 3. Classify the transition BEFORE emitting a single packet.
+    //
+    // Round-2 wire investigation (captures/issue28-rca/): a warp whose
+    // destination shares the ORIGIN's resident scene geometry — same
+    // zone, or the seamless partner zone the client already has merged
+    // in (230 ⇄ 133 Limsa) — NEVER completes via the 0x00E2(0x02)
+    // reload recipe. The 0x00E2 subcode sets the MapLayoutElement
+    // scheduled-reload latch ([+0xb9] per
+    // captures/issue28-rca/03-decomp-reload.md) and NOTHING on the
+    // same-geometry path ever clears it: the client schedules a scene
+    // reload it can't finish, never emits RX 0x0007
+    // zone-in-complete, and sits on "Now Loading" forever. Retest wire
+    // evidence (2026-07-01): the 128 → 230 teleport AND the 230 → 230
+    // proximity push both hung on the reload recipe, while every RX
+    // 0x0007 in the same captures correlates with a director kick or a
+    // genuine off-disk reload — not with the latch.
+    //
+    // Two proven arrival mechanisms exist for this family:
+    //   (A) the escort recipe (commit bcfc0aa): NO 0x00E2 latch, no
+    //       deferral, immediate zone-in bundle whose player 0x00CE
+    //       carries spawn_type 0x16 / isZoning 0 — the instant
+    //       zone-in-complete bypass; the client emits RX 0x0007
+    //       immediately (see `SPAWN_TYPE_INSTANT_ZONE_IN`);
+    //   (B) the Baderon recipe: standard reload + an
+    //       AfterQuestWarpDirector noticeEvent kick that clears the
+    //       veil (scripts own that path — see man0l1.lua SEQ_000).
+    // This applier takes (A) for the same-family public case; (B)
+    // stays a script-side recipe.
+    //
+    // Scope: BOTH endpoints must be public (no private-area flip on
+    // either side — a 230 → 230 WarpToPrivate/PublicArea flip swaps
+    // layouts and keeps the retail-verified reload recipe) and the
+    // zones must be the same seamless-merge family (same region +
+    // paired in the seamless boundary table, or old == new).
+    // Everything else — private-area flips, cross-region,
+    // same-region-different-family — keeps the reload recipe
+    // unchanged; it is retail-verified there. (Garlemald-Server #46.)
+    let (old_region, new_region) = {
+        let old_region = match world.zone(old_zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => 0,
+        };
+        let new_region = match world.zone(zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => u16::MAX,
+        };
+        (old_region, new_region)
+    };
+    let same_region = old_region == new_region;
+    let same_seamless_family = same_region
+        && (old_zone_id == zone_id
+            || world
+                .seamless_partner_zones(new_region as u32, old_zone_id)
+                .await
+                .contains(&zone_id));
+    let use_instant_recipe =
+        same_seamless_family && old_private_area_name.is_none() && private_area.is_none();
+    let effective_spawn_type: u8 = if use_instant_recipe {
+        crate::world_manager::SPAWN_TYPE_INSTANT_ZONE_IN as u8
+    } else {
+        spawn_type
+    };
+
+    // Carry the effective spawn_type through to the zone-in bundle so
+    // the client plays the right "you arrived" anim (or, on the
+    // instant path, takes the 0x16 zone-in-complete bypass).
     if let Some(mut snap) = world.session(session_id).await {
-        snap.destination_spawn_type = spawn_type;
+        snap.destination_spawn_type = effective_spawn_type;
         world.upsert_session(snap).await;
     }
 
-    // 4. Emit the zone-change packet trio — same order as
-    //    `apply_do_zone_change_content`.
+    // 4. Emit the zone-change packets.
     let Some(client) = world.client(session_id).await else {
         tracing::warn!(player = player_id, "DoZoneChange: no client");
         return;
     };
+    if use_instant_recipe {
+        // Same-seamless-family public warp — the escort recipe:
+        // no 0x00E2 (leave the client's scheduled-reload latch
+        // unarmed), no deferral, immediate bundle. The bundle's
+        // 0x00CE ships spawn_type 0x16 / isZoning 0 (see
+        // `send_zone_in_bundle`), so the client completes zone-in
+        // instantly and echoes RX 0x0007. Old-actor cleanup still
+        // happens via the bundle's Mass Delete keep-list commit.
+        world
+            .send_zone_in_bundle(
+                registry,
+                db,
+                lua,
+                session_id,
+                crate::world_manager::SPAWN_TYPE_INSTANT_ZONE_IN,
+                /* commit_keep_list */ true,
+            )
+            .await;
+        // No 34108 PrivateArea notice on this path — `private_area`
+        // is structurally None here (public → public only).
+        tracing::info!(
+            player = player_id,
+            zone = zone_id,
+            old_zone = old_zone_id,
+            spawn_type = effective_spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+            "DoZoneChange applied (same-seamless-family instant recipe, spawnType 0x16, no reload latch)",
+        );
+        return;
+    }
     // Force-reload latch only. Retail warps NEVER wipe the old zone's
     // actors up front (`return_to_inn` / `teleport_to_gridania` /
     // `move_out_of_room` pcaps): the old-actor cleanup is the Mass
@@ -2178,28 +2289,20 @@ pub(crate) async fn apply_do_zone_change(
     //    34108 PrivateArea notice travels with whichever path
     //    dispatches the bundle (pmeteor: after it, WorldManager.cs:
     //    887-888).
-    let same_region = {
-        let old_region = match world.zone(old_zone_id).await {
-            Some(z) => z.read().await.core.region_id,
-            None => 0,
-        };
-        let new_region = match world.zone(zone_id).await {
-            Some(z) => z.read().await.core.region_id,
-            None => u16::MAX,
-        };
-        old_region == new_region
-    };
+    //
     // Defer ONLY for a genuine cross-zone change within the same region (the
-    // 230 → 133 Drowning Wench case the pacing was added for). A SAME-zone warp
-    // — entering/leaving a private-area instance (WarpToPrivate/PublicArea, both
-    // 230 → 230) or an in-zone reposition (the MSK "go downstairs") — must flush
-    // immediately, exactly like a cold login does. The 6 s deferral on a
-    // same-zone warp leaves the client interactive in a half-transitioned state
-    // for 6 s; any input during that window (man0l1 SEQ_040: the player talks to
-    // Sisipu again after the hand-signal cutscene) corrupts the instance-exit and
-    // the client hangs on "Now Loading" — it never sends the 0x0007 zone-in-
-    // complete. pmeteor never defers; the deferral is "retail parity, not a
-    // proven client requirement". (Garlemald-Server #46.)
+    // 230 → 133 Drowning Wench case the pacing was added for — note that
+    // seamless-family pairs like 230 → 133 now take the instant recipe above
+    // and never reach this arm). A SAME-zone warp — entering/leaving a
+    // private-area instance (WarpToPrivate/PublicArea, both 230 → 230) —
+    // must flush immediately, exactly like a cold login does. The 6 s
+    // deferral on a same-zone warp leaves the client interactive in a
+    // half-transitioned state for 6 s; any input during that window (man0l1
+    // SEQ_040: the player talks to Sisipu again after the hand-signal
+    // cutscene) corrupts the instance-exit and the client hangs on "Now
+    // Loading" — it never sends the 0x0007 zone-in-complete. pmeteor never
+    // defers; the deferral is "retail parity, not a proven client
+    // requirement". (Garlemald-Server #46.)
     let defer_same_region = same_region && old_zone_id != zone_id;
     if defer_same_region {
         const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
@@ -3041,6 +3144,19 @@ pub async fn apply_add_exp(
             levels_gained,
             "AddExp: level up",
         );
+        // pmeteor `Player.LevelUp` tail (Player.cs:3013) — every crossed
+        // level auto-equips the commands it unlocks (class bar + job
+        // mirror + live hotbar push) so new skills are usable without a
+        // manual /eaction. Once per crossed level, oldest first — the
+        // same order the 33909 rows take in `emit_exp_property_updates`,
+        // which keeps ownership of the 33926 "You learn" text line;
+        // this arm owns only the DB / mirror / wire equip.
+        if let Some(lua) = lua {
+            for at_level in (new_level - levels_gained + 1)..=new_level {
+                equip_abilities_at_level(actor_id, class_id, at_level, registry, db, world, lua)
+                    .await;
+            }
+        }
     }
     if rested_after != rested_before
         && let Err(e) = db.set_rest_bonus_exp_rate(actor_id, rested_after).await
@@ -3365,6 +3481,253 @@ async fn emit_exp_property_updates(
                 bytes,
             )
             .await;
+        }
+    }
+}
+
+/// The 1.x action bar holds 30 command slots (0-based; wire slot =
+/// `charaWork.commandBorder` (32) + slot0). Shared by the slot-search
+/// helpers here and the processor's full-bar refresh loop.
+pub const HOTBAR_SLOTS: u16 = 30;
+
+/// First open 0-based slot on the 30-slot in-memory hotbar mirror —
+/// pmeteor `Player.FindFirstCommandSlotById(0)` scanning
+/// `charaWork.command` (Player.cs, used by `EquipAbilityInFirstOpenSlot`
+/// for the ACTIVE class). A slot is free when no mirror entry carries a
+/// real command there — an entry whose low word is 0 counts as free,
+/// matching the C# `charaWork.command[i] == 0` test. Returns
+/// `HOTBAR_SLOTS` when the bar is full (same "one past the end"
+/// convention as `db.find_first_command_slot`).
+fn first_free_hotbar_slot(hotbar: &[crate::gamedata::HotbarEntry]) -> u16 {
+    (0..HOTBAR_SLOTS)
+        .find(|s| {
+            !hotbar
+                .iter()
+                .any(|e| e.hotbar_slot == *s && e.command_id & 0xFFFF != 0)
+        })
+        .unwrap_or(HOTBAR_SLOTS)
+}
+
+/// Per-slot live hotbar push — pmeteor `Player.UpdateHotbar(slots)`
+/// (`UpdateHotbarCommands` + `UpdateRecastTimers`, Player.cs:2502-2543).
+/// Free-function twin shared by the processor's Equip/Unequip/Swap
+/// appliers (`processor.rs::send_hotbar_slot_update` delegates here)
+/// and the level-up auto-equip below. Reads the post-mutation
+/// `chara.hotbar` mirror; an absent entry emits the disable shape
+/// (command 0, category / compatibility 0). Self-only, every subpacket
+/// target-stamped (proxy rule — the fan-out drops `target_id == 0`
+/// frames). (#28 S3.1, hoisted for #46 round 2.)
+pub async fn send_hotbar_slot_update(
+    player_id: u32,
+    slot0: u16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let Some(client) = world.client(handle.session_id).await else {
+        return;
+    };
+    let (command_masked, recast_end) = {
+        let c = handle.character.read().await;
+        c.chara
+            .hotbar
+            .iter()
+            .find(|e| e.hotbar_slot == slot0)
+            .map(|e| (e.command_id | 0xA0F0_0000, e.recast_time))
+            .unwrap_or((0, 0))
+    };
+    let max_recast_s = lua
+        .and_then(|l| l.catalogs().battle_commands.read().ok())
+        .and_then(|m| {
+            m.get(&((command_masked & 0xFFFF) as u16))
+                .map(|c| c.max_recast_time_seconds as u16)
+        })
+        .unwrap_or(0);
+    for mut sub in crate::packets::send::actor::build_hotbar_slot_update(
+        player_id,
+        slot0,
+        command_masked,
+        max_recast_s,
+        recast_end,
+    ) {
+        sub.set_target_id(handle.session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+}
+
+/// pmeteor `Player.EquipAbilitiesAtLevel` (Map Server/Actors/Chara/
+/// Player/Player.cs:2980-2998; EchoGate identical) — auto-equip every
+/// battle command `class_id` unlocks at exactly `at_level`:
+///
+///   * class bar: first open slot 0..30 — the ACTIVE class scans the
+///     live in-memory `chara.hotbar` mirror (pmeteor
+///     `FindFirstCommandSlotById(0)` on `charaWork.command`); a parked
+///     class asks the DB (`db.find_first_command_slot`, pmeteor
+///     `Database.FindFirstCommandSlot`).
+///   * job mirror: `convert_class_id_to_job_id` — when the job id
+///     differs, the same command also lands in the JOB's first open DB
+///     slot, DB-only (Player.cs:2987-2989; the job bar isn't the live
+///     one here, so no mirror / wire writes).
+///   * new skills start ON COOLDOWN: `recast_end = now + maxRecastTime`
+///     (pmeteor `EquipAbility`, Player.cs:2568 — `recastEnd =
+///     UnixTimeStampUTC() + maxRecastTime`, 5 s fallback when the
+///     catalog misses the id).
+///   * a full bar warn-logs and SKIPS the equip — the 33926 "You
+///     learn" line (owned by `emit_exp_property_updates`) still fires;
+///     the player slots the command by hand.
+///   * active class only: the in-memory `chara.hotbar` mirror is
+///     updated (same shape as `processor.rs::apply_equip_ability`) and
+///     the slot's `charaWork/command` + `commandDetailForSelf` pair
+///     goes out self-only via `send_hotbar_slot_update` when a
+///     WorldManager is wired (`None` in DB-only tests).
+///
+/// Quiet no-op when nothing unlocks at this level (most levels).
+/// No 30603 "equipped" toast — pmeteor passes `printMessage = false`
+/// from this path (Player.cs:2986).
+pub async fn equip_abilities_at_level(
+    actor_id: u32,
+    class_id: u8,
+    at_level: i16,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: Option<&WorldManager>,
+    lua: &Arc<LuaEngine>,
+) {
+    let unlocked = lua.catalogs().commands_unlocked_at(class_id, at_level);
+    if unlocked.is_empty() {
+        return;
+    }
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let is_active_class = {
+        let c = handle.character.read().await;
+        c.chara.class as i32 == class_id as i32
+    };
+    let now_unix = common::utils::unix_timestamp();
+    let job_id = crate::actor::Player::convert_class_id_to_job_id(class_id);
+    for command_id in unlocked {
+        // pmeteor `EquipAbility`: `maxRecastTime = ability != null ?
+        // ability.maxRecastTimeSeconds : 5` — the fresh skill starts
+        // its recast the moment it's learned.
+        let max_recast_s: u32 = lua
+            .catalogs()
+            .battle_commands
+            .read()
+            .ok()
+            .and_then(|m| m.get(&command_id).map(|c| c.max_recast_time_seconds))
+            .unwrap_or(5);
+        let recast_end = now_unix.saturating_add(max_recast_s);
+
+        // --- class bar -------------------------------------------------
+        let slot = if is_active_class {
+            let c = handle.character.read().await;
+            first_free_hotbar_slot(&c.chara.hotbar)
+        } else {
+            match db.find_first_command_slot(actor_id, class_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        actor = actor_id, class = class_id, command_id,
+                        err = %e,
+                        "EquipAbilitiesAtLevel: find_first_command_slot failed",
+                    );
+                    continue;
+                }
+            }
+        };
+        if slot >= HOTBAR_SLOTS {
+            // Keep the learn message (emit_exp_property_updates owns it) —
+            // only the auto-equip is skipped.
+            tracing::warn!(
+                actor = actor_id,
+                class = class_id,
+                command_id,
+                "EquipAbilitiesAtLevel: hotbar full — learn message only, no auto-equip",
+            );
+        } else if let Err(e) = db
+            .equip_ability(actor_id, class_id, slot, u32::from(command_id), recast_end)
+            .await
+        {
+            tracing::warn!(
+                actor = actor_id, class = class_id, command_id, slot,
+                err = %e,
+                "EquipAbilitiesAtLevel: DB persist failed",
+            );
+        } else {
+            if is_active_class {
+                // Mirror the in-memory CharaState hotbar (same shape as
+                // `apply_equip_ability`) so PlayerSnapshot builds and
+                // subsequent slot searches see the equip immediately.
+                // C# wire mask: `0xA0F00000 | command_id`.
+                {
+                    let mut c = handle.character.write().await;
+                    let masked = u32::from(command_id) | 0xA0F0_0000;
+                    if let Some(entry) = c.chara.hotbar.iter_mut().find(|e| e.hotbar_slot == slot) {
+                        entry.command_id = masked;
+                        entry.recast_time = recast_end;
+                    } else {
+                        c.chara.hotbar.push(crate::gamedata::HotbarEntry {
+                            hotbar_slot: slot,
+                            command_id: masked,
+                            recast_time: recast_end,
+                        });
+                    }
+                }
+                if let Some(world) = world {
+                    send_hotbar_slot_update(actor_id, slot, registry, world, Some(lua)).await;
+                }
+            }
+            tracing::info!(
+                actor = actor_id,
+                class = class_id,
+                level = at_level,
+                command_id,
+                slot,
+                "EquipAbilitiesAtLevel: auto-equipped",
+            );
+        }
+
+        // --- job-bar mirror (DB-only) -----------------------------------
+        if job_id != class_id {
+            match db.find_first_command_slot(actor_id, job_id).await {
+                Ok(job_slot) if job_slot < HOTBAR_SLOTS => {
+                    if let Err(e) = db
+                        .equip_ability(
+                            actor_id,
+                            job_id,
+                            job_slot,
+                            u32::from(command_id),
+                            recast_end,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            actor = actor_id, job = job_id, command_id, slot = job_slot,
+                            err = %e,
+                            "EquipAbilitiesAtLevel: job-mirror DB persist failed",
+                        );
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        actor = actor_id,
+                        job = job_id,
+                        command_id,
+                        "EquipAbilitiesAtLevel: job hotbar full — mirror skipped",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        actor = actor_id, job = job_id, command_id,
+                        err = %e,
+                        "EquipAbilitiesAtLevel: job-mirror find_first_command_slot failed",
+                    );
+                }
+            }
         }
     }
 }

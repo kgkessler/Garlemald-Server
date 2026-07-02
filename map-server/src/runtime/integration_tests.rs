@@ -8860,6 +8860,317 @@ async fn apply_add_exp_level_up_emits_extra_state_for_all_bundle() {
 }
 
 // ---------------------------------------------------------------------------
+// Level-up auto-equip — #46 round 2 (pmeteor Player.LevelUp →
+// EquipAbilitiesAtLevel → EquipAbilityInFirstOpenSlot)
+// ---------------------------------------------------------------------------
+
+/// Shared scaffolding for the level-up auto-equip tests: tempdb with the
+/// character rows, the REAL seed battle-command catalog
+/// (`013_server_battle_commands.sql` — GLA (class 3) unlocks rampart
+/// 27142 at level 2 (recast 120 s) and phalanx 27158 at level 4), a
+/// registered ClientHandle, and a level-1 GLA character in the registry.
+async fn setup_level_up_equip_scene(
+    chara_id: u32,
+) -> (
+    Arc<WorldManager>,
+    Arc<ActorRegistry>,
+    Arc<crate::database::Database>,
+    Arc<crate::lua::LuaEngine>,
+    mpsc::Receiver<Vec<u8>>,
+) {
+    use common::db::ConnCallExt;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+    let (catalog, by_level) = db
+        .load_global_battle_command_list()
+        .await
+        .expect("battle command catalog");
+    assert!(catalog.contains_key(&27142), "rampart seeded (GLA lvl 2)");
+    assert!(catalog.contains_key(&27158), "phalanx seeded (GLA lvl 4)");
+    lua.catalogs()
+        .install_battle_commands_with_level_index(catalog, by_level);
+
+    db.conn_for_test()
+        .call_db(move |c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name, restBonus)
+                  VALUES (:cid, 0, 0, 0, 'SkillLearner', 0)",
+                rusqlite::named_params! { ":cid": chara_id },
+            )?;
+            c.execute(
+                r"INSERT INTO characters_class_levels (characterId) VALUES (:cid)",
+                rusqlite::named_params! { ":cid": chara_id },
+            )?;
+            c.execute(
+                r"INSERT INTO characters_class_exp (characterId) VALUES (:cid)",
+                rusqlite::named_params! { ":cid": chara_id },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(chara_id, ClientHandle::new(chara_id, tx))
+        .await;
+    let mut chara = Character::new(chara_id);
+    chara.chara.class = crate::gamedata::CLASSID_GLA as i16;
+    chara.chara.level = 1;
+    chara.battle_save.skill_level[crate::gamedata::CLASSID_GLA as usize] = 1;
+    registry
+        .insert(ActorHandle::new(
+            chara_id,
+            ActorKindTag::Player,
+            200,
+            chara_id,
+            chara,
+        ))
+        .await;
+
+    (world, registry, db, lua, rx)
+}
+
+/// Read one hotbar row `(commandId, recastTime)` straight from
+/// `characters_hotbar`, or `None` when the slot is empty.
+async fn hotbar_row(
+    db: &crate::database::Database,
+    chara_id: u32,
+    class_id: u8,
+    slot0: u16,
+) -> Option<(u32, u32)> {
+    use common::db::ConnCallExt;
+    db.conn_for_test()
+        .call_db(move |c| {
+            use rusqlite::OptionalExtension;
+            c.query_row(
+                r"SELECT commandId, recastTime FROM characters_hotbar
+                  WHERE characterId = :cid AND classId = :class AND hotbarSlot = :slot",
+                rusqlite::named_params! { ":cid": chara_id, ":class": class_id, ":slot": slot0 },
+                |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?)),
+            )
+            .optional()
+        })
+        .await
+        .unwrap()
+}
+
+/// A 1→2 crossing auto-equips the newly unlocked command (rampart
+/// 27142) into the NEXT FREE slot — slot 0 is pre-occupied by
+/// fast_blade so the equip must land in slot 1 — persists the
+/// job-mirror row (PLD = GLA + 13 = class 16, first free DB slot),
+/// starts the recast (pmeteor: new skills begin on cooldown), updates
+/// the in-memory mirror, and ships the `charaWork.command[33]` hotbar
+/// subpacket to the owning client (wire slot = 32 + slot0).
+#[tokio::test]
+async fn apply_add_exp_level_up_auto_equips_unlocked_command_into_hotbar() {
+    use common::db::ConnCallExt;
+
+    let (world, registry, db, lua, mut rx) = setup_level_up_equip_scene(1101).await;
+
+    // Occupy slot 0 (DB + in-memory mirror) so "next free" is slot 1.
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters_hotbar (characterId, classId, hotbarSlot, commandId, recastTime)
+                  VALUES (1101, 3, 0, 27150, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    {
+        let handle = registry.get(1101).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.chara.hotbar.push(crate::gamedata::HotbarEntry {
+            hotbar_slot: 0,
+            command_id: 27150 | 0xA0F0_0000,
+            recast_time: 0,
+        });
+    }
+
+    let before_unix = common::utils::unix_timestamp();
+    // LEVEL_THRESHOLDS[0] = 570 — 600 crosses 1 → 2.
+    crate::runtime::quest_apply::apply_add_exp(
+        1101,
+        crate::gamedata::CLASSID_GLA,
+        600,
+        &registry,
+        &db,
+        Some(&world),
+        Some(&lua),
+    )
+    .await;
+
+    // (1) Class-bar row in the next free slot, recast started.
+    let (cmd, recast) = hotbar_row(&db, 1101, 3, 1)
+        .await
+        .expect("rampart should be equipped in class slot 1");
+    assert_eq!(cmd, 27142, "level-2 unlock is rampart");
+    assert!(
+        recast >= before_unix + 100,
+        "new skill starts on cooldown (rampart recast 120 s); got {recast} vs now {before_unix}",
+    );
+
+    // (1b) Job-mirror row — PLD (16), first free DB slot = 0.
+    let (job_cmd, _) = hotbar_row(&db, 1101, 16, 0)
+        .await
+        .expect("job mirror row should exist for PLD");
+    assert_eq!(job_cmd, 27142);
+
+    // In-memory mirror updated for the active class (masked shape).
+    {
+        let handle = registry.get(1101).await.unwrap();
+        let c = handle.character.read().await;
+        let entry = c
+            .chara
+            .hotbar
+            .iter()
+            .find(|e| e.hotbar_slot == 1)
+            .expect("mirror entry for slot 1");
+        assert_eq!(entry.command_id, 27142 | 0xA0F0_0000);
+    }
+
+    // (2) The client received the charaWork/command subpacket for the
+    // slot — wire slot 32 + 1 = 33. Property NAMES ride the wire as
+    // murmur2 ids (ActorPropertyPacketBuilder::add_int), so match the
+    // staged entry bytes: type 4 + id LE + masked command LE. The
+    // target path is the only raw string in the payload.
+    let subs = parse_all_subpackets(&mut rx);
+    assert!(
+        contains_target_path(&subs, b"charaWork/command"),
+        "client should receive a charaWork/command-targeted 0x0137",
+    );
+    let prop_id = common::utils::murmur_hash2("charaWork.command[33]", 0);
+    let mut entry = vec![4u8];
+    entry.extend_from_slice(&prop_id.to_le_bytes());
+    entry.extend_from_slice(&(27142u32 | 0xA0F0_0000).to_le_bytes());
+    assert!(
+        subs.iter()
+            .any(|s| s.data.windows(entry.len()).any(|w| w == entry)),
+        "client should receive charaWork.command[33] = masked rampart",
+    );
+}
+
+/// A full 30-slot bar skips the auto-equip (no class-bar DB row, no
+/// panic) but the 33926 "You learn" battle-log line still reaches the
+/// client — the player just slots the command by hand.
+#[tokio::test]
+async fn apply_add_exp_level_up_full_hotbar_skips_equip_keeps_learn_message() {
+    let (world, registry, db, lua, mut rx) = setup_level_up_equip_scene(1102).await;
+
+    // Fill every in-memory slot (the active-class search scans the
+    // mirror, matching pmeteor FindFirstCommandSlotById on
+    // charaWork.command).
+    {
+        let handle = registry.get(1102).await.unwrap();
+        let mut c = handle.character.write().await;
+        for slot0 in 0..crate::runtime::quest_apply::HOTBAR_SLOTS {
+            c.chara.hotbar.push(crate::gamedata::HotbarEntry {
+                hotbar_slot: slot0,
+                command_id: 27150 | 0xA0F0_0000,
+                recast_time: 0,
+            });
+        }
+    }
+
+    crate::runtime::quest_apply::apply_add_exp(
+        1102,
+        crate::gamedata::CLASSID_GLA,
+        600,
+        &registry,
+        &db,
+        Some(&world),
+        Some(&lua),
+    )
+    .await;
+
+    // No class-bar row landed anywhere for rampart.
+    use common::db::ConnCallExt;
+    let class_rows: i64 = db
+        .conn_for_test()
+        .call_db(|c| {
+            c.query_row(
+                r"SELECT COUNT(*) FROM characters_hotbar
+                  WHERE characterId = 1102 AND classId = 3 AND commandId = 27142",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(class_rows, 0, "full bar must skip the class-bar equip");
+
+    // Learn message still fires (emit_exp_property_updates owns it).
+    let learn_marker = 33926u16.to_le_bytes();
+    let mut saw_learn = false;
+    while let Ok(frame) = rx.try_recv() {
+        if frame.windows(2).any(|w| w == learn_marker) {
+            saw_learn = true;
+        }
+    }
+    assert!(
+        saw_learn,
+        "33926 'You learn X' should still be emitted when the bar is full",
+    );
+}
+
+/// A multi-level gain (1 → 4: rampart at 2, phalanx at 4) equips each
+/// level's commands into DISTINCT slots, oldest level first.
+#[tokio::test]
+async fn apply_add_exp_multi_level_gain_equips_each_level_into_distinct_slots() {
+    let (world, registry, db, lua, _rx) = setup_level_up_equip_scene(1103).await;
+
+    // 570 (1→2) + 700 (2→3) + 880 (3→4) = 2150; 2200 crosses to 4.
+    crate::runtime::quest_apply::apply_add_exp(
+        1103,
+        crate::gamedata::CLASSID_GLA,
+        2200,
+        &registry,
+        &db,
+        Some(&world),
+        Some(&lua),
+    )
+    .await;
+
+    let (slot0_cmd, _) = hotbar_row(&db, 1103, 3, 0)
+        .await
+        .expect("slot 0 should hold the level-2 unlock");
+    let (slot1_cmd, _) = hotbar_row(&db, 1103, 3, 1)
+        .await
+        .expect("slot 1 should hold the level-4 unlock");
+    assert_eq!(slot0_cmd, 27142, "rampart (lvl 2) equips first — slot 0");
+    assert_eq!(slot1_cmd, 27158, "phalanx (lvl 4) equips second — slot 1");
+
+    // Job mirror got both, also in distinct slots.
+    let (job0, _) = hotbar_row(&db, 1103, 16, 0).await.expect("PLD slot 0");
+    let (job1, _) = hotbar_row(&db, 1103, 16, 1).await.expect("PLD slot 1");
+    assert_eq!(job0, 27142);
+    assert_eq!(job1, 27158);
+
+    // In-memory mirror tracks both distinct slots for the active class.
+    let handle = registry.get(1103).await.unwrap();
+    let c = handle.character.read().await;
+    assert_eq!(
+        c.chara
+            .hotbar
+            .iter()
+            .filter(|e| matches!(e.command_id & 0xFFFF, 27142 | 27158))
+            .count(),
+        2,
+        "both unlocks mirrored in memory",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Event warp triggers — Tier 4 #18 (AfterQuestWarpDirector)
 // ---------------------------------------------------------------------------
 

@@ -1037,17 +1037,20 @@ pub fn build_hotbar_recast_update(
 /// right displayNameId but the client only renders the nameplate when
 /// `charaWork.property[1] = 1` has arrived via 0x0137.
 ///
-/// `hate_type` MUST be the actor's real combat hateType (3 for hostile
-/// BattleNpcs, 1 for populace/allies — see `build_npc_hate_type_packet`
-/// for the value table): the client's DepictionJudge latches
-/// `npcWork.hateType` when the nameplate is first built, non-
-/// retroactively, and it builds nameplates off this `/_init` dump.
-/// pmeteor only gets enemy HP gauges because `GetSpawnPackets` calls
-/// `GetHateTypePacket` — which MUTATES `npcWork.hateType = 3` server-
-/// side (BattleNpc.cs:130+145-163) — before `GetInitPackets` reads the
-/// struct back (ordering per Session.cs:159-160). Emitting a hardcoded
-/// 1 here and shipping the real value only in the later `npcWork/hate`
-/// subpacket arrives too late for the judge. (Garlemald-Server #46.)
+/// `hate_type` is the actor's CURRENT hateType — 1 (passive white) for
+/// everything at spawn, hostiles included. Round-2 decomp of the
+/// client corrected the earlier model: `judgeNameplate` RE-RUNS on
+/// every WorkSync (`CharaBaseClass:_onUpdateWork`) — there is NO
+/// latch, so a later `npcWork/hate` flip re-colors the nameplate live.
+/// hateType drives nameplate COLOR only (see
+/// `build_npc_hate_type_packet` for the corrected value table); no
+/// value renders an overhead HP gauge — the client's
+/// `_setNameplateGauge` is a RET 0x8 stub in 1.23b, and enemy HP
+/// displays in the target parameter widget from
+/// `charaWork.parameterSave.hp`. The builder itself is value-agnostic;
+/// callers pick the value (spawn tables pass 1, engage-time updates go
+/// through `build_npc_hate_type_packet`). (Garlemald-Server #46,
+/// round 2.)
 #[allow(clippy::too_many_arguments)]
 pub fn build_npc_property_init(
     actor_id: u32,
@@ -1078,13 +1081,13 @@ pub fn build_npc_property_init(
     b.add_byte("charaWork.parameterSave.state_mainSkill[0]", 3);
     b.add_byte("charaWork.parameterSave.state_mainSkill[2]", 3);
     b.add_byte("charaWork.parameterSave.state_mainSkillLevel", 1);
-    // Meteor's `NpcWork.cs:33` defaults hateType to 1 for populace.
-    // Sending 0 for populace tells the 1.x client the actor is inert
-    // — no talk prompt, no capsule collider, player walks straight
-    // through — so plain NPCs pass 1 here. Hostile BattleNpcs pass 3:
-    // the DepictionJudge latches this value at nameplate build (see
-    // the fn doc above), so the enemy HP gauge only ever renders if
-    // the combat hateType is already in the `/_init` dump.
+    // Meteor's `NpcWork.cs:33` defaults hateType to 1. Sending 0 here
+    // tells the 1.x client the actor is inert — no talk prompt, no
+    // capsule collider, player walks straight through — so every
+    // spawn passes 1 (passive white nameplate; hostiles too — see the
+    // fn doc above). Engage-time 2/3 flips arrive via the later
+    // `npcWork/hate` subpacket and re-color live (judge re-runs per
+    // WorkSync, no latch).
     b.add_byte("npcWork.hateType", hate_type);
     b.done()
 }
@@ -1096,24 +1099,29 @@ pub fn build_npc_property_init(
 /// client routes it through its hate-state update path instead of the
 /// boot-property path.
 ///
-/// `hate_type` values (Meteor `NpcWork.cs` + the client's
-/// `DepictionJudge:judgeNameplate()` branches):
-///   0 = HATE_TYPE_NONE — passive nameplate, NO HP gauge.
-///   1 = passive default (populace) — friendly nameplate, no gauge.
-///   2 = HATE_TYPE_ENGAGED — aggro nameplate WITH the HP gauge; does
-///       not dereference party state.
-///   3 = HATE_TYPE_ENGAGED_PARTY — claimed-by-party colour, but the
-///       judge then resolves `getPlayerParty():_getOccupancyGroup()`,
-///       which is only populated by a 0x0187 Set Occupancy Group claim.
-///       Meteor hardcodes 3 unconditionally (`BattleNpc.cs:160`);
-///       honouring that without the 0x0187 made the judge hit "attempt
-///       to compare number with nil" → three "An error has occurred"
-///       popups on zone-in (observed 2026-04-21). Do not send 3 until
-///       the occupancy claim is wired.
+/// `hate_type` values — corrected per the round-2 decomp of
+/// `DepictionJudge:judgeNameplate()` (which RE-RUNS on every WorkSync
+/// via `CharaBaseClass:_onUpdateWork` — no latch; hateType drives
+/// nameplate COLOR only, never an HP gauge):
+///   0 = inert — treated as no-interaction (no talk prompt / no
+///       collider when it lands in the `/_init` dump); avoid.
+///   1 = passive WHITE — populace AND unengaged hostiles (retail
+///       spawns every mob white; this is the spawn-table value).
+///   2 = engaged ORANGE — in-combat tint; does NOT dereference party
+///       state.
+///   3 = claimed — RED only if the mob's party is the player party's
+///       occupancy group (0x0187 Set Occupancy Group claim), ELSE the
+///       PURPLE "claimed by another party" tint. Meteor hardcodes 3
+///       unconditionally at spawn (`BattleNpc.cs:160`); doing that
+///       without the 0x0187 claim renders every idle hostile purple
+///       (2026-07-01 retest) — and before the solo-party 0x017C
+///       registration existed it crashed the judge outright
+///       ("attempt to compare number with nil", 2026-04-21).
 ///
-/// The SEQ_005 live runs proved 0 also suppresses the enemy HP gauge
-/// entirely (wolves un-damageable-looking) — combat-capable hostiles
-/// want 2. (Garlemald-Server #28.)
+/// No hateType value renders an overhead HP gauge: the client's
+/// `_setNameplateGauge` is a RET 0x8 stub in 1.23b. Enemy HP renders
+/// in the target parameter widget from `charaWork.parameterSave.hp`
+/// (already correct on the wire). (Garlemald-Server #46, round 2.)
 pub fn build_npc_hate_type_packet(actor_id: u32, hate_type: u8) -> SubPacket {
     let mut b = ActorPropertyPacketBuilder::new(actor_id, "npcWork/hate");
     b.add_byte("npcWork.hateType", hate_type);
@@ -1205,24 +1213,26 @@ mod npc_property_init_tests {
         None
     }
 
-    /// The DepictionJudge latches `npcWork.hateType` from the `/_init`
-    /// dump at nameplate build (non-retroactive), so a hostile
-    /// BattleNpc's 3 must already be in this bundle — the later
-    /// `npcWork/hate` subpacket alone never lights the enemy HP gauge.
-    /// (Garlemald-Server #46.)
+    /// The builder is value-agnostic — it stamps whatever hateType the
+    /// caller resolved into the `/_init` dump. Spawn tables pass 1
+    /// (passive white — retail spawns every actor white, hostiles
+    /// included); 2 is the engaged-orange tint an engage-time caller
+    /// would carry. The judge re-runs per WorkSync (no latch), so this
+    /// only needs to be the CURRENT value, not a pre-latched combat
+    /// one. (Garlemald-Server #46, round 2.)
     #[test]
     fn init_dump_carries_the_passed_hate_type() {
-        let hostile = build_npc_property_init(0x4700_0001, 0x13, 100, 100, 50, 50, 0, 3);
+        let spawn = build_npc_property_init(0x4700_0001, 0x13, 100, 100, 50, 50, 0, 1);
         assert_eq!(
-            find_byte_property(&hostile, "npcWork.hateType"),
-            Some(3),
-            "hostile BattleNpc /_init must carry hateType=3"
-        );
-        let populace = build_npc_property_init(0x4700_0002, 0x13, 100, 100, 50, 50, 0, 1);
-        assert_eq!(
-            find_byte_property(&populace, "npcWork.hateType"),
+            find_byte_property(&spawn, "npcWork.hateType"),
             Some(1),
-            "populace /_init keeps the NpcWork.cs:33 default of 1"
+            "spawn-table /_init carries the passive-white 1 (all actors, hostiles too)"
+        );
+        let engaged = build_npc_property_init(0x4700_0002, 0x13, 100, 100, 50, 50, 0, 2);
+        assert_eq!(
+            find_byte_property(&engaged, "npcWork.hateType"),
+            Some(2),
+            "builder passes an engaged-orange 2 through unchanged (value-agnostic)"
         );
     }
 }
