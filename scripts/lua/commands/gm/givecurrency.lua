@@ -119,7 +119,7 @@ function onTrigger(player, argc, item, qty, name, lastName)
         qty = tonumber(qty) or 1;
         location = INVENTORY_CURRENCY;
 
-        local invCheck = player:getInventory(location):AddItem(item, qty, 1);
+        local invCheck = player:GetItemPackage(location):AddItem(item, qty, 1);
         
         if (invCheck == INV_ERROR_FULL) then
             -- Your inventory is full.

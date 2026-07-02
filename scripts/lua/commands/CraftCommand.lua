@@ -222,26 +222,20 @@ function onEventStarted(player, commandactor, triggerName, arg1, arg2, arg3, arg
         elseif (operationMode == MENU_MAINHAND or operationMode == MENU_OFFHAND) then 
             -- Recipe choosing loop
 			while (true) do			
-				-- Figure out the number of preloaded mats
-				local numArgs = #operationResult;
-				local numMatArgs = numArgs - 2;
-				local materials;
-				player:SendMessage(0x20, "", "[DEBUG] " .. tostring(numArgs));				
-				player:SendMessage(0x20, "", "[DEBUG] " .. tostring(numMatArgs));
-				
-				-- Handle the possible args returned: Either 0 player items, 1 player item, 2+ palyer items. The rest is always the remaining prepped items.
-				if (numMatArgs == 8 and type(operationResult[3]) == "number") then
-					materials = {unpack(operationResult, 3)};
-				elseif (numMatArgs == 8 and type(operationResult[3]) ~= "number") then
-					player:SendMessage(0x20, "", "[DEBUG] " .. tostring(player:GetItemPackage(operationResult[3].itemPackage):GetItemAtSlot(operationResult[3].slot).itemId));
-					materials = {player:GetItemPackage(operationResult[3].itemPackage):GetItemAtSlot(operationResult[3].slot).itemId, unpack(operationResult, 3)};
-				else
-					local itemIds = {};
-					for i=0,operationResult[3].itemSlots.length do
-						converted = player:GetItemPackage(operationResult[3].itemPackages[i]):GetItemAtSlot(operationResult[3].slots[i]).itemId
+				-- operationResult[3..10] holds the 8 material slots. A placed item
+				-- arrives as an item-reference table (itemPackage+slot); an empty
+				-- slot is already a number. PR73's three hard-coded arms mishandled
+				-- both cases (wrong unpack offset, nonexistent .itemSlots.length).
+				local materials = {};
+				for i = 3, #operationResult do
+					local slot = operationResult[i];
+					if type(slot) == "number" then
+						materials[#materials + 1] = slot;
+					else
+						local item = player:GetItemPackage(slot.itemPackage):GetItemAtSlot(slot.slot);
+						materials[#materials + 1] = (item ~= nil) and item.itemId or 0;
 					end
-					materials = {unpack(itemIds), unpack(operationResult, 4)};
-				end				
+				end
 				
 				-- Choosing a recipe from the given materials
 				local recipes = recipeResolver.GetRecipeFromMats(unpack(materials));				
@@ -313,20 +307,28 @@ function onEventStarted(player, commandactor, triggerName, arg1, arg2, arg3, arg
             end        
         elseif operationMode == MENU_RECENT then -- "Recipes" button hit
             if isRecipeRecentSent == false then
-				recentRecipes = player.GetRecentRecipes();
-				local itemIds = recipeResolver.RecipesToItemIdTable(recentRecipes);
-                callClientFunction(player, "delegateCommand", craftJudge, "selectRcp", commandactor, unpack(itemIds)); -- Load up recipe list
+				local okRecent; okRecent, recentRecipes = pcall(function() return player.GetRecentRecipes(); end);
+				if not okRecent or recentRecipes == nil then
+					player:SendMessage(0x20, "", "Recipe history is not wired on this server yet - use Mainhand/Offhand synthesis.");
+				else
+					local itemIds = recipeResolver.RecipesToItemIdTable(recentRecipes);
+					callClientFunction(player, "delegateCommand", craftJudge, "selectRcp", commandactor, unpack(itemIds)); -- Load up recipe list
+				end
                 isRecipeRecentSent = true;
             end
         elseif operationMode == MENU_AWARDED then -- "Awarded Recipes" tab hit  
             if isRecipeAwardSent == false then
-				awardedRecipes = player.GetAwardedRecipes();
-				local itemIds = recipeResolver.RecipesToItemIdTable(awardedRecipes);
-                callClientFunction(player, "delegateCommand", craftJudge, "selectRcp", commandactor, unpack(itemIds)); -- Load up Award list
+				local okAwarded; okAwarded, awardedRecipes = pcall(function() return player.GetAwardedRecipes(); end);
+				if not okAwarded or awardedRecipes == nil then
+					player:SendMessage(0x20, "", "Awarded recipes are not wired on this server yet - use Mainhand/Offhand synthesis.");
+				else
+					local itemIds = recipeResolver.RecipesToItemIdTable(awardedRecipes);
+					callClientFunction(player, "delegateCommand", craftJudge, "selectRcp", commandactor, unpack(itemIds)); -- Load up Award list
+				end
                 isRecipeAwardSent = true;
             end
         elseif ((operationMode == MENU_RECENT_DETAILED or operationMode == MENU_AWARDED_DETAILED) and recipeMode > 0) then -- Pop-up for an item's stats/craft mats on a recent recipe			
-			local chosenRecipe = operationMode == MENU_RECENT_DETAILED and recentRecipes[recipeMode-1] or recentRecipes[awardedMode-1];
+			local chosenRecipe = operationMode == MENU_RECENT_DETAILED and recentRecipes[recipeMode-1] or awardedRecipes[recipeMode-1];
 			local recipeConfirmed = callClientFunction(player, "delegateCommand", craftJudge, "confirmRcp", commandactor, 
 				chosenRecipe.resultItemID, 
 				chosenRecipe.resultQuantity, 
@@ -501,6 +503,19 @@ function startCrafting(player, commandactor, craftJudge, hand, recipe, quest, st
 				end				
 			-- Normal synth craft success
             else                
+				-- Consume the recipe's materials + crystals before granting the result; the minigame previously granted output for free.
+				local materials = recipe:GetMaterials();
+				for i = 1, #materials do
+					if materials[i] ~= 0 then
+						player:getItemPackage(INVENTORY_NORMAL):RemoveItem(materials[i], 1);
+					end
+				end
+				if recipe.crystalId1 ~= 0 and recipe.crystalQuantity1 > 0 then
+					player:getItemPackage(INVENTORY_CURRENCY):RemoveItem(recipe.crystalId1, recipe.crystalQuantity1);
+				end
+				if recipe.crystalId2 ~= 0 and recipe.crystalQuantity2 > 0 then
+					player:getItemPackage(INVENTORY_CURRENCY):RemoveItem(recipe.crystalId2, recipe.crystalQuantity2);
+				end
 				player:SendGameMessage(GetWorldMaster(), 40111, 0x20, player, recipe.resultItemID, 1, recipe.resultQuantity);  -- "You create <#3 quantity> <#1 item> <#2 quality>."				
 				player:getItemPackage(INVENTORY_NORMAL):addItem(recipe.resultItemID, recipe.resultQuantity, 1);
 				break;
