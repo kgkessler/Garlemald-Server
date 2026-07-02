@@ -767,21 +767,22 @@ pub(crate) fn push_npc_spawn(
     //   attempt to compare number with nil
     //   01>DepictionJudge:judgeNameplate() [?:900]
     //     program => CharaBaseClass:_onUpdateWork() [?:5685]
-    // Masking bit 2 off for `/monster/` actors routes the client
-    // through the populace nameplate path and suppresses the
-    // "An error has occurred" popups. This mask is UNCONDITIONAL and
-    // must stay that way: a 2026-06-11 live A/B with bit 2 restored for
-    // real-pipeline BattleNpcs crashed the client's
-    // `NpcBaseClass:_onUpdateWork()` ("attempt to index field
-    // 'parameterTemp' (a nil value)") — the NpcBase work struct never
-    // allocates the battle-branch fields bit 2 makes the client read,
-    // regardless of what the /_init delivers. pmeteor hit the same
-    // wall: `charaWork.property[2] = 1` is COMMENTED OUT in both its
-    // Npc.cs:174 and BattleNpc.cs:97. (Round-2 decomp correction: no
-    // overhead mob HP gauge exists in 1.23b at all —
-    // `_setNameplateGauge` is a RET 0x8 stub; enemy HP renders in the
-    // target parameter widget. hateType only colors the nameplate.)
-    // (Garlemald-Server #28.)
+    // Masking bit 2 off for populace-pipeline `/monster/` actors routes
+    // the client through the populace nameplate path and suppresses the
+    // "An error has occurred" popups. For REAL-pipeline BattleNpc/Ally
+    // spawns the mask is now LIFTED (round 3, 2026-07-02): retail
+    // shutdown-day screenshots + tutorial videos prove the overhead HP
+    // gauge exists and rides the bit-2 battle nameplate branch. The
+    // 2026-06-11 A/B crash ("attempt to index field 'parameterTemp'
+    // (a nil value)" in NpcBaseClass:_onUpdateWork) that justified the
+    // unconditional mask was mis-attributed to bit 2 itself — the init
+    // tail of that era typed state_mainSkillLevel as a BYTE where the
+    // wire type is SHORT, corrupting the work-struct parse (fixed
+    // together with this change in `build_npc_property_init`). If a
+    // live retest still crashes, the next retail-shape delta to try is
+    // dropping `charaWork.parameterTemp.tp` from the mob init (retail
+    // omits it for mobs; garlemald and pmeteor send it).
+    // (Garlemald-Server #28/#46, round 3.)
     use crate::runtime::actor_registry::ActorKindTag;
     let is_real_battle_npc = matches!(
         battle_kind,
@@ -789,25 +790,28 @@ pub(crate) fn push_npc_spawn(
     );
     let property_flags = if is_monster {
         // A real-pipeline BattleNpc/Ally (spawned via SpawnBattleNpcById) MUST
-        // carry the populace nameplate/render bits 0x13 (charaWork.property[0]/
-        // [1]/[4]) the client's `DepictionJudge:judgeNameplate` reads — bit 1
-        // is the targetable-nameplate flag. The gamedata_actor_class table has
-        // DUPLICATE classPath rows at propertyFlags 0 and 0x17, and content
-        // pools sometimes point at the pf=0 variant (man0l1's escort: Chigoe
-        // 2205603 + FighterAlly 2290007 are pf=0), which shipped these actors
-        // with NO property bits → un-targetable (target fell back to self),
-        // while man0g0's pf=0x17 wolves were fine. Forcing 0x13 here makes
-        // every script-spawned BattleNpc/Ally targetable regardless of which
-        // seed variant it resolved to. Bit 2 (PROPERTY_TARGETABLE/solid) STAYS
-        // masked — restoring it crashes the client's NpcBase work struct (see
-        // the note above). Ground-truthed via escort-vs-man0g0 packet diff
-        // 2026-06-17. (Garlemald-Server #46.)
-        let pf = if is_real_battle_npc {
-            character.chara.property_flags | 0x13
+        // carry the FULL battle nameplate/render bits 0x17 (charaWork.
+        // property[0]/[1]/[2]/[4]): bit 1 is the targetable-nameplate flag and
+        // bit 2 gates the client's BATTLE nameplate branch — without it the
+        // 1.x client keeps the actor on the populace nameplate path and the
+        // overhead HP gauge never initializes (only a degenerate sliver of the
+        // gauge element renders when hateType flips restyle the plate).
+        // Retail 1.23b screenshots + pcaps show the gauge on engaged mobs, so
+        // bit 2 must ship (round-3 nameplate RCA, 2026-07-02). The earlier
+        // "bit 2 crashes NpcBase:_onUpdateWork" A/B (2026-06-11) was
+        // mis-attributed: the crash rode the then-malformed init tail
+        // (state_mainSkillLevel typed byte instead of short — fixed together
+        // with this change in `build_npc_property_init`). The gamedata table
+        // has DUPLICATE classPath rows at propertyFlags 0 and 0x17 and content
+        // pools sometimes resolve the pf=0 variant (man0l1's escort: Chigoe
+        // 2205603 + FighterAlly 2290007), so the bits are forced here.
+        // Populace-pipeline `/monster/` actors (no battle-stat backing) keep
+        // bit 2 masked as before. (Garlemald-Server #46, round 3.)
+        if is_real_battle_npc {
+            character.chara.property_flags | 0x17
         } else {
-            character.chara.property_flags
-        };
-        pf & !(1u32 << 2)
+            character.chara.property_flags & !(1u32 << 2)
+        }
     } else {
         character.chara.property_flags
     };
@@ -833,14 +837,14 @@ pub(crate) fn push_npc_spawn(
     //     spawn-3 hostiles. Retail spawns unengaged hostiles WHITE;
     //     the 2/3 transitions belong to the engage/claim path
     //     (`dispatcher.rs` BattleEvent arms), not the spawn tables.
-    //   * No hateType value renders an overhead HP gauge — the
-    //     client's `_setNameplateGauge` is a RET 0x8 stub in 1.23b.
-    //     Enemy HP displays in the target parameter widget from
-    //     `charaWork.parameterSave.hp`, already on the wire.
+    //   * The overhead HP gauge exists in 1.23b (retail screenshots;
+    //     the round-2 "RET 0x8 stub" claim was disproven) and belongs
+    //     to the bit-2 battle nameplate branch (see the property_flags
+    //     note above) — hateType still only styles the plate; fill
+    //     comes from charaWork battle state client-side.
     //
     // One value feeds both the `/_init` dump and the `npcWork/hate`
-    // tail below (the old two-table split existed only to serve the
-    // disproven latch model). (Garlemald-Server #46, round 2.)
+    // tail below. (Garlemald-Server #46, round 3.)
     let spawn_hate_type: u8 = 1;
     let npc_init = tx::actor::build_npc_property_init(
         actor_id,
@@ -851,6 +855,7 @@ pub(crate) fn push_npc_spawn(
         mp_max,
         tp,
         spawn_hate_type,
+        character.chara.level.max(1) as u16,
     );
     subpackets.extend(npc_init);
 

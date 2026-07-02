@@ -24,6 +24,10 @@
 pub const HATE_TYPE_NONE: u8 = 0;
 pub const HATE_TYPE_ENGAGED: u8 = 2;
 pub const HATE_TYPE_ENGAGED_PARTY: u8 = 3;
+/// Corpse plate — retail flips `npcWork.hateType` to 4 alongside the
+/// hp=0 state at death (retail pcap kill sequences; round-3 nameplate
+/// RCA 2026-07-02).
+pub const HATE_TYPE_DEAD: u8 = 4;
 
 #[derive(Debug, Clone)]
 pub struct NpcWork {

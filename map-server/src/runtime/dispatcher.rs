@@ -2354,6 +2354,20 @@ pub(crate) async fn apply_die(
         zone,
     )
     .await;
+    // Retail rides npcWork.hateType=4 with the death state (pcap kill
+    // sequences pack it with the hp=0 stateAtQuicklyForAll) — the
+    // corpse plate style. BattleNpcs only; players carry no npcWork.
+    // (Round-3 nameplate RCA, 2026-07-02.)
+    if matches!(
+        handle.kind,
+        crate::runtime::actor_registry::ActorKindTag::BattleNpc
+    ) {
+        let sub = crate::packets::send::actor::build_npc_hate_type_packet(
+            owner_actor_id,
+            crate::npc::HATE_TYPE_DEAD,
+        );
+        broadcast_around_actor(world, registry, zone, owner_actor_id, sub.to_bytes()).await;
+    }
     if let (Some(lua_ref), Some(db_ref)) = (lua, db) {
         for evt in status_outbox.drain() {
             dispatch_status_event(&evt, registry, world, db_ref, lua_ref.catalogs()).await;

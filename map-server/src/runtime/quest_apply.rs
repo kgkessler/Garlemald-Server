@@ -2141,41 +2141,38 @@ pub(crate) async fn apply_do_zone_change(
 
     // 3. Classify the transition BEFORE emitting a single packet.
     //
-    // Round-2 wire investigation (captures/issue28-rca/): a warp whose
-    // destination shares the ORIGIN's resident scene geometry — same
-    // zone, or the seamless partner zone the client already has merged
-    // in (230 ⇄ 133 Limsa) — NEVER completes via the 0x00E2(0x02)
-    // reload recipe. The 0x00E2 subcode sets the MapLayoutElement
-    // scheduled-reload latch ([+0xb9] per
-    // captures/issue28-rca/03-decomp-reload.md) and NOTHING on the
-    // same-geometry path ever clears it: the client schedules a scene
-    // reload it can't finish, never emits RX 0x0007
-    // zone-in-complete, and sits on "Now Loading" forever. Retest wire
-    // evidence (2026-07-01): the 128 → 230 teleport AND the 230 → 230
-    // proximity push both hung on the reload recipe, while every RX
-    // 0x0007 in the same captures correlates with a director kick or a
-    // genuine off-disk reload — not with the latch.
+    // Round-3 archaeology (2026-07-02, full packet-log sweep of every
+    // captured session): the 0x00E2(0x02) reload recipe is
+    // STATE-dependent. It completes whenever the destination forces a
+    // genuine map-resource load (cross-region 193→230; same-region
+    // different layout 230→133, 128→230 — all capture-proven), but a
+    // warp whose destination geometry is ALREADY resident — the same
+    // zone (public⇄private flips included: sea0Town01a on both sides),
+    // or the seamless partner the client has merged in (133⇄230 town
+    // pair) — schedules a reload the level streamer can never finish:
+    // no RX 0x0007, "Now Loading" forever. The round-2 spawnType-0x16
+    // "instant bypass" branch that used to live here never produced a
+    // single captured completion (its escort precedent bcfc0aa was
+    // itself abandoned for the cross-map 0x10 path in ebe7ecf).
     //
-    // Two proven arrival mechanisms exist for this family:
-    //   (A) the escort recipe (commit bcfc0aa): NO 0x00E2 latch, no
-    //       deferral, immediate zone-in bundle whose player 0x00CE
-    //       carries spawn_type 0x16 / isZoning 0 — the instant
-    //       zone-in-complete bypass; the client emits RX 0x0007
-    //       immediately (see `SPAWN_TYPE_INSTANT_ZONE_IN`);
-    //   (B) the Baderon recipe: standard reload + an
-    //       AfterQuestWarpDirector noticeEvent kick that clears the
-    //       veil (scripts own that path — see man0l1.lua SEQ_000).
-    // This applier takes (A) for the same-family public case; (B)
-    // stays a script-side recipe.
+    // The capture-proven recipe for the resident-geometry family is
+    // the CONTENT-warp shape (processor.rs
+    // apply_do_zone_change_content — the man0l0/man0g0 tutorial
+    // reload): targeted DeleteAllActors wipe + 0x00E2 subcode 0x10
+    // (the in-place/content reload latch) + an IMMEDIATE full zone-in
+    // bundle with commit_keep_list = false. That shape completes a
+    // same-zone reload even with a cutscene's
+    // startFadeInCutSceneAfterWarp veil armed — RX 0x0007 in ≤3 s on
+    // four separate captured runs, including 2026-07-02T07:17:15 on
+    // this exact build: the forced teardown/re-commit fires a real
+    // warp-END that clears both the order machine and the veil.
     //
-    // Scope: BOTH endpoints must be public (no private-area flip on
-    // either side — a 230 → 230 WarpToPrivate/PublicArea flip swaps
-    // layouts and keeps the retail-verified reload recipe) and the
-    // zones must be the same seamless-merge family (same region +
-    // paired in the seamless boundary table, or old == new).
-    // Everything else — private-area flips, cross-region,
-    // same-region-different-family — keeps the reload recipe
-    // unchanged; it is retail-verified there. (Garlemald-Server #46.)
+    // Scope: same zone (any private-area combination — the man0l1
+    // musketeer WarpToPrivateArea/WarpToPublicArea flips need this) or
+    // a directly-paired seamless partner with both endpoints public
+    // (the 133→230 aetheryte teleport). Cross-zone private flips like
+    // 230→133/PrivateAreaMasterPast keep the 0x02 reload recipe —
+    // capture-proven working there. (Garlemald-Server #46, round 3.)
     let (old_region, new_region) = {
         let old_region = match world.zone(old_zone_id).await {
             Some(z) => z.read().await.core.region_id,
@@ -2188,25 +2185,19 @@ pub(crate) async fn apply_do_zone_change(
         (old_region, new_region)
     };
     let same_region = old_region == new_region;
-    let same_seamless_family = same_region
-        && (old_zone_id == zone_id
-            || world
-                .seamless_partner_zones(new_region as u32, old_zone_id)
-                .await
-                .contains(&zone_id));
-    let use_instant_recipe =
-        same_seamless_family && old_private_area_name.is_none() && private_area.is_none();
-    let effective_spawn_type: u8 = if use_instant_recipe {
-        crate::world_manager::SPAWN_TYPE_INSTANT_ZONE_IN as u8
-    } else {
-        spawn_type
-    };
+    let same_zone = old_zone_id == zone_id;
+    let merged_pair_public = same_region
+        && !same_zone
+        && old_private_area_name.is_none()
+        && private_area.is_none()
+        && world
+            .seamless_partner_zones(new_region as u32, old_zone_id)
+            .await
+            .contains(&zone_id);
+    let use_wipe_reload_recipe = same_zone || merged_pair_public;
 
-    // Carry the effective spawn_type through to the zone-in bundle so
-    // the client plays the right "you arrived" anim (or, on the
-    // instant path, takes the 0x16 zone-in-complete bypass).
     if let Some(mut snap) = world.session(session_id).await {
-        snap.destination_spawn_type = effective_spawn_type;
+        snap.destination_spawn_type = spawn_type;
         world.upsert_session(snap).await;
     }
 
@@ -2215,36 +2206,55 @@ pub(crate) async fn apply_do_zone_change(
         tracing::warn!(player = player_id, "DoZoneChange: no client");
         return;
     };
-    if use_instant_recipe {
-        // Same-seamless-family public warp — the escort recipe:
-        // no 0x00E2 (leave the client's scheduled-reload latch
-        // unarmed), no deferral, immediate bundle. The bundle's
-        // 0x00CE ships spawn_type 0x16 / isZoning 0 (see
-        // `send_zone_in_bundle`), so the client completes zone-in
-        // instantly and echoes RX 0x0007. Old-actor cleanup still
-        // happens via the bundle's Mass Delete keep-list commit.
+    if use_wipe_reload_recipe {
+        // Resident-geometry warp — the content-reload shape (see the
+        // classification note above; mirrors processor.rs
+        // apply_do_zone_change_content, the capture-proven emitter).
+        // Both subpackets MUST be target_id-tagged or the world-server
+        // proxy drops them.
+        {
+            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            wipe.set_target_id(session_id);
+            client.send_bytes(wipe.to_bytes()).await;
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+            e2.set_target_id(session_id);
+            client.send_bytes(e2.to_bytes()).await;
+        }
+        // Immediate bundle, commit_keep_list = false: the bare wipe
+        // above is load-bearing for the in-place transition, so no
+        // trailing keep-list commit is added on top (the shape the
+        // tutorial content warp ships).
         world
             .send_zone_in_bundle(
                 registry,
                 db,
                 lua,
                 session_id,
-                crate::world_manager::SPAWN_TYPE_INSTANT_ZONE_IN,
-                /* commit_keep_list */ true,
+                spawn_type as u16,
+                /* commit_keep_list */ false,
             )
             .await;
-        // No 34108 PrivateArea notice on this path — `private_area`
-        // is structurally None here (public → public only).
+        if private_area.is_some() {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
         tracing::info!(
             player = player_id,
             zone = zone_id,
             old_zone = old_zone_id,
-            spawn_type = effective_spawn_type,
+            ?private_area,
+            spawn_type,
             x,
             y,
             z,
             rotation,
-            "DoZoneChange applied (same-seamless-family instant recipe, spawnType 0x16, no reload latch)",
+            "DoZoneChange applied (resident-geometry wipe+0x10 reload recipe)",
         );
         return;
     }
