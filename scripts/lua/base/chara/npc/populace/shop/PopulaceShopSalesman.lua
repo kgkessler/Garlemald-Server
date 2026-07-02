@@ -33,6 +33,7 @@ finishTalkTurn() - Done at the end.
 
 require ("global")
 require ("shop")
+require ("shopgoods")
 
 shopInfo = { 
 --[[ 
@@ -601,14 +602,14 @@ function openShopMenu(player, menuId, shopPack, itemRangeStart, itemRangeEnd, sh
                         player:EndEvent();
                         return;
                 else
-                    player:SendMessage(0x20, "", "Item chosen: " .. itemChosen .. "  Quantity: ".. quantity);
+                    local goods = shopGoods[itemChosen];
+                    quantity = quantity or 1;
 
-                    --[[
-                        TO-DO:  Request item information from server table and throw result to purchaseItem()
-
-                        requestItem = GetItemShopInfoThing(itemChosen);
-                        purchaseItem(player, INVENTORY_NORMAL, requestItem.id, quantity, requestItem.quality, requestItem.price, shopCurrency);
-                    --]]
+                    if goods == nil or goods.item == 0 then
+                        player:SendMessage(0x20, "", "[ERROR] No shop data for slot " .. itemChosen);
+                    else
+                        purchaseItem(player, INVENTORY_NORMAL, goods.item, quantity, 1, goods.price * quantity, shopCurrency);
+                    end
                 end
             end
             
