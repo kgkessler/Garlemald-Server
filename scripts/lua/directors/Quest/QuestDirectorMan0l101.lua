@@ -51,11 +51,23 @@ function onEventStarted(player, actor, triggerName)
 	-- bare EndEvent instead (the previous shape) leaves the client
 	-- veiled forever — the 14:24 hang. (Garlemald-Server #46, round 7.)
 	--
-	-- (a) Post-warp fade-in: processEvent604_3 = startFadeInCutSceneDefault
-	--     (_waitForMapLoaded → _fadeIn(1) → _waitForFading) — the reload
-	--     has finished by the time the client executes it, so this is the
-	--     veil-dropper, in exactly the slot the tutorials use.
-	callClientFunction(player, "delegateEvent", player, man0l1Quest, "processEvent604_3");
+	-- (a) Post-warp Now-Loading DISMISSAL (round 7c, decomp-final). The
+	--     overlay after a kick-at-entry is a DESIGNED staging veil: the
+	--     kicked noticeEvent arms MyPlayer+0x128/+0x12c and the ONLY
+	--     dismissal is a client Lua script calling MyPlayer slot 66
+	--     _fadeInNowLoadingForNoticeEventJustInArea (zero C++ callers —
+	--     the server's EndEvent does NOT clear it; wire-proven 20:08:
+	--     604_3 answered, EndEvent delivered, overlay stayed forever).
+	--     processEvent604_3 was fade-LAYER-only (the client faded in
+	--     BEHIND the overlay). questBaseRewardSeting is the QuestBase-
+	--     class delegate whose client body is exactly the dismissal:
+	--     _fadeInNowLoadingForNoticeEventJustInArea() +
+	--     startFadeInCutSceneDefault + _wait(0.5)
+	--     (QuestBaseClass_common.lua:1018-1033). The tutorials dismiss
+	--     via the SAME slot-66 call inside startCutScene's prologue
+	--     (their post-kick delegate starts an HQ cutscene) — not via the
+	--     fade, as the round-7 comment wrongly claimed.
+	callClientFunction(player, "delegateEvent", player, man0l1Quest, "questBaseRewardSeting");
 
 	-- (b) NO processTtrBlkNml001 (round 7b). Wire-proven 2026-07-03
 	--     19:58: the client ANSWERED the 604_3 fade above, then received

@@ -999,14 +999,14 @@ function startMan0l1Content(player, quest)
 	--    the veil in place" step was only ever validated in the zone-129
 	--    cross-map era; on the same-map wipe+0x10 warp it just flashes the
 	--    gate and the warp re-veils, and NOTHING then fades the client back
-	--    in — a same-map 0x10 reload fires no warp-END auto-fade. Both
-	--    working tutorials (man0g0/man0l0, 193→193 / 184→184) drop the veil
-	--    from the DIRECTOR's first post-kick delegate (processTtrBtl001 ends
-	--    in startFadeInCutSceneDefault) — QuestDirectorMan0l101 now does the
-	--    same (604_3 + processTtrBlkNml001 post-warp). Wire-proven
-	--    2026-07-03 14:24: byte-identical bundle to the tutorial, hung only
-	--    because the director answered the kick with a bare EndEvent and no
-	--    fade delegate. (Garlemald-Server #46, round 7.)
+	--    in — a same-map 0x10 reload fires no warp-END auto-fade. The
+	--    kicked noticeEvent arms a Now-Loading HOLD that only a client
+	--    Lua call to MyPlayer slot 66 (_fadeInNowLoadingForNoticeEvent-
+	--    JustInArea) dismisses; both working tutorials dismiss it via
+	--    startCutScene's slot-66 prologue (their post-kick delegate
+	--    starts an HQ cutscene). QuestDirectorMan0l101 dismisses it with
+	--    the questBaseRewardSeting delegate (slot-66 + fade + wait) as
+	--    its first post-kick beat. (Garlemald-Server #46, rounds 7-7c.)
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
 
 	-- 2. Close the push event BEFORE the warp. An EndEvent (0x0131)
