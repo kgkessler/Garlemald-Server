@@ -4942,6 +4942,24 @@ impl UserData for LuaItemPackage {
     }
 }
 
+/// `GetStaticActor(name)` return value — an opaque reference to a static
+/// actor (Command/Quest/Judge, 0xA0F0-band ids from `gamedata_static_actors`).
+/// It MUST be a userdata, not a bare integer: scripts pass it straight into
+/// `callClientFunction(player, "delegateEvent", player, staticActor, …)`,
+/// and `value_to_command_arg` only coerces USERDATA to `ActorId` (wire type
+/// 0x06). A bare number marshals as Integer (0x00), and the client's
+/// delegateEvent then calls a method on a number → client Lua error →
+/// crash-to-character-select (the Baderon DftSea incident, 2026-07-03).
+pub struct LuaStaticActor {
+    pub actor_id: u32,
+}
+
+impl mlua::UserData for LuaStaticActor {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("GetActorId", |_, this, _: ()| Ok(this.actor_id));
+    }
+}
+
 /// `player:GetQuest(id)` return value. Carries a snapshot of the live
 /// quest's flags/counters/sequence taken when the userdata was created,
 /// so getters like `GetQuestFlag(bit)` return a useful value without

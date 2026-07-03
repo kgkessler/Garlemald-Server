@@ -137,6 +137,17 @@ impl Catalogs {
         }
     }
 
+    /// Bulk install for the boot-time `gamedata_static_actors` load.
+    /// First-wins on duplicate names (a handful of bin entries share a
+    /// short name across class paths; scripts address the unique ones).
+    pub fn install_static_actors(&self, actors: Vec<(String, u32)>) {
+        if let Ok(mut w) = self.static_actors.write() {
+            for (name, actor_id) in actors {
+                w.entry(name).or_insert(actor_id);
+            }
+        }
+    }
+
     pub fn install_quests(&self, quests: HashMap<u32, QuestMeta>) {
         if let Ok(mut w) = self.quests.write() {
             *w = quests;

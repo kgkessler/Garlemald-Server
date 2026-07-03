@@ -445,7 +445,9 @@ pub fn value_to_command_arg(value: &Value) -> LuaCommandArg {
             LuaCommandArg::String(s.to_str().map(|c| c.to_string()).unwrap_or_default())
         }
         Value::UserData(ud) => {
-            use super::userdata::{LuaActor, LuaDirectorHandle, LuaNpc, LuaPlayer, LuaQuestHandle};
+            use super::userdata::{
+                LuaActor, LuaDirectorHandle, LuaNpc, LuaPlayer, LuaQuestHandle, LuaStaticActor,
+            };
             // Use `borrow_scoped` rather than `borrow`: the latter conflicts
             // with the mlua method binding's outer borrow when a script
             // passes `self` back into the call as a vararg
@@ -461,6 +463,11 @@ pub fn value_to_command_arg(value: &Value) -> LuaCommandArg {
             } else if let Ok(id) = ud.borrow_scoped::<LuaNpc, _>(|n| n.base.actor_id) {
                 LuaCommandArg::ActorId(id)
             } else if let Ok(id) = ud.borrow_scoped::<LuaDirectorHandle, _>(|d| d.actor_id) {
+                LuaCommandArg::ActorId(id)
+            } else if let Ok(id) = ud.borrow_scoped::<LuaStaticActor, _>(|s| s.actor_id) {
+                // GetStaticActor(name) reference (e.g. DftSea) — must ride
+                // the wire as ActorId 0x06; an Integer 0x00 here crashes
+                // the client's delegateEvent (2026-07-03 Baderon capture).
                 LuaCommandArg::ActorId(id)
             } else if let Ok(id) =
                 ud.borrow_scoped::<LuaQuestHandle, _>(|q| 0xA0F0_0000 | q.quest_id)

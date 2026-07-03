@@ -204,6 +204,26 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Populate the static-actor registry (gamedata_static_actors, seed
+    // 069 — decoded from pmeteor's staticactors.bin). Every script
+    // `GetStaticActor(name)` resolves against it; before this load
+    // existed the map was EMPTY, so e.g. baderon.lua's DftSea
+    // default-talk delegate marshalled a NIL quest actor and crashed
+    // the client to character select (2026-07-03 capture, round 6).
+    match db.load_static_actors().await {
+        Ok(actors) => {
+            let count = actors.len();
+            lua.catalogs().install_static_actors(actors);
+            tracing::info!(count, "static-actor registry loaded");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "gamedata_static_actors load failed: GetStaticActor() will return nil",
+            );
+        }
+    }
+
     // Populate the battle-command catalog + the `(class, level)` side
     // index. The level-up pass in `runtime::quest_apply::apply_add_exp`
     // reads the side index via `Catalogs::commands_unlocked_at` to

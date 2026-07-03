@@ -71,15 +71,26 @@ pub fn install_globals(
     }
 
     // GetStaticActor(name) / GetStaticActorById(id) — return the actor id
-    // registered under that name, or nil if unknown.
+    // registered under that name, or nil if unknown. A miss is warn-logged:
+    // scripts pass the result straight into client delegates, and a nil
+    // actor argument on the wire crashes the client to character select
+    // (the baderon.lua DftSea incident, 2026-07-03).
     {
         let cats = catalogs.clone();
         let f = lua.create_function(move |_, name: String| {
-            Ok(cats
+            let id = cats
                 .static_actors
                 .read()
                 .ok()
-                .and_then(|s| s.get(&name).copied()))
+                .and_then(|s| s.get(&name).copied());
+            if id.is_none() {
+                tracing::warn!(name, "GetStaticActor: unknown static actor (returning nil)");
+            }
+            // Userdata, NOT a bare integer: scripts feed the result into
+            // client delegates, and only userdata coerces to the ActorId
+            // wire type (0x06) in `value_to_command_arg` — an integer
+            // marshals as 0x00 and crashes the client (see LuaStaticActor).
+            Ok(id.map(|actor_id| crate::lua::userdata::LuaStaticActor { actor_id }))
         })?;
         globals.set("GetStaticActor", f)?;
     }
