@@ -10,8 +10,9 @@ require ("quests/man/man0l1")
 --
 --   client noticeEvent kick (startMan0l1Content's KickEvent) →
 --   onEventStarted runs the post-warp chain (fade-in 604_3 →
---   processTtrBlkNml001 tutorial block → entry text → EndEvent →
---   escort go-latch) and parks on "escortComplete" →
+--   entry text → EndEvent → escort go-latch; the retail
+--   TtrBlkNml001 tutorial block is a follow-up, see round 7b note) →
+--   parks on "escortComplete" →
 --   the content script's onUpdate fires the signal once Sisipu has led
 --   the player down the zone-128 road to the lighthouse approach
 --   (waypoint arrival — NOT a kill count; the ambush waves are
@@ -56,16 +57,21 @@ function onEventStarted(player, actor, triggerName)
 	--     veil-dropper, in exactly the slot the tutorials use.
 	callClientFunction(player, "delegateEvent", player, man0l1Quest, "processEvent604_3");
 
-	-- (b) The retail escort-start tutorial block (decoded client
-	--     Man0l1.lua:2431-2497): orderTutorialMode-if-needed, camera
-	--     aim/lookAt + gesture schedules on the 4000604 Sisipu anchor,
-	--     sayFreeDisplayName(4000604, quest, 337) ("Oschon's Torch is due
-	--     south..."), setTutorialMask(false x5, 3), cancels. Unresolvable
-	--     client refs inside the block degrade gracefully (the man0l0
-	--     tutorial runs processTtrBtl001 past its own 1900006 anchor with
-	--     no server-side mapping) — worst case the camera pan/named say
-	--     don't render; the content script's bark loop re-delivers 337.
-	callClientFunction(player, "delegateEvent", player, man0l1Quest, "processTtrBlkNml001");
+	-- (b) NO processTtrBlkNml001 (round 7b). Wire-proven 2026-07-03
+	--     19:58: the client ANSWERED the 604_3 fade above, then received
+	--     the TtrBlkNml001 delegate and Wine hard-died without answering
+	--     (22s silence → disconnect). The "unresolvable refs degrade
+	--     gracefully" assumption was wrong: the working man0l0 tutorial
+	--     precedes its Ttr block with a startTutorialMode 0x0133 data
+	--     packet (QuestDirectorMan0l001 three-part chain) — without
+	--     tutorial mode armed, the block's engine calls on the hardcoded
+	--     4000604 Sisipu anchor (aim camera / lookAt / chara scheduler /
+	--     sayFreeDisplayName) crash the client process. The block is
+	--     cosmetic (camera pan + named say + mask; the content script's
+	--     bark loop delivers say 337 regardless) — retail-parity
+	--     follow-up: port the FULL Man0l001 chain (startTutorialMode →
+	--     TtrBlkNml001 → the endTutorialMode exit) once the leg is
+	--     playable end-to-end. (Garlemald-Server #46, round 7b.)
 
 	-- (c) Retail entry text, now that the client is faded in and can see
 	--     the log (retail order after the journal update + 34108, which
