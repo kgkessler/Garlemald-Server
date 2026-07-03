@@ -304,12 +304,25 @@ function onUpdate(tick, area)
 	-- party has reached: any live ankle biter inside ENGAGE_RADIUS of
 	-- the escort or the player joins the fight (2-3 at once — cluster
 	-- size); Sisipu fights back like the tutorial allies do.
+	-- Round 7h: skip actors whose roster position is still unsynced
+	-- (0,0,0) — on the spawn tick every distance reads ~0, so the whole
+	-- wave-1 cluster engaged the player AND Sisipu instantly from ~225
+	-- units away (log 23:05:49: ActorEngage rows at content-spawn time =
+	-- the "invisible enemies" report). A real position never sits exactly
+	-- at origin in zone 128.
+	local function positionLive(a)
+		return a and not (a.positionX == 0 and a.positionY == 0 and a.positionZ == 0);
+	end
+	if not positionLive(escort) or not positionLive(owner) then
+		return;
+	end
+
 	local nearLive = 0
 	local anyEngaged = false
 	local nearestMob, nearestD = nil, math.huge
 	for i = 1, #mobs do
 		local mob = mobs[i]
-		if mob then
+		if mob and positionLive(mob) then
 			local dMob = math.min(
 				dist2d(mob.positionX, mob.positionZ, escort.positionX, escort.positionZ),
 				dist2d(mob.positionX, mob.positionZ, owner.positionX, owner.positionZ))
