@@ -82,11 +82,6 @@ BARKS = {
 escortState = {};
 
 function onCreate(starterPlayer, contentArea, director)
-	-- Fresh run: hold the duty until the director's post-warp chain has
-	-- the client faded in and interactive (retry-safe reset — the
-	-- director sets it TRUE at the end of its noticeEvent chain).
-	man0l1EscortGo = false;
-
 	escortState[starterPlayer.actorId] = {
 		done = false,        -- terminal latch (arrival signalled OR failed)
 		wpIndex = 1,         -- next ROUTE waypoint Sisipu walks toward
@@ -211,25 +206,27 @@ function onUpdate(tick, area)
 	local state = escortState[owner.actorId]
 	if not state or state.done then return end
 
-	-- Hold EVERYTHING (clock, waypoints, barks, wave beats) until the
-	-- director's post-warp chain reports the client faded-in and
-	-- interactive — otherwise the duty runs under the Now-Loading veil
-	-- and the 30-minute clock cheats the player (round 7).
-	if not man0l1EscortGo then return end
+	-- NO cross-VM go-latch (round 7d). The director and this content
+	-- script load into SEPARATE Lua VMs (the vm_cache is keyed by script
+	-- path), so a `man0l1EscortGo` global the director set in ITS VM is
+	-- invisible here — the previous gate read this VM's copy (always
+	-- false) and Sisipu never moved (wire-proven 20:50: zero
+	-- MoveActorToPosition). The ticker already parks the content driver
+	-- on `content_warp_acked` (the client's post-warp zone-in echo), and
+	-- the veil is cleared by the director's questBaseRewardSeting ~1s in,
+	-- so the escort simply runs from the first post-ack tick — a couple
+	-- of Sisipu's steps during the fade are invisible. (Garlemald-Server
+	-- #46, round 7d.)
 
-	-- ---- Timer (retail: 30-minute limit, reminder lines) ----
+	-- ---- Timer (retail: 30-minute limit) ----
 	-- `tick` is the ticker's monotonic 500 ms frame counter; latch the
-	-- first faded-in frame and measure elapsed from there.
+	-- first faded-in frame and measure elapsed from there. The 10/5-min
+	-- reminder LINES are omitted for now (round 7d): their text id was
+	-- the boundary-family 34112 "Enter this instance?" — wrong. The
+	-- expiry FAIL is real and kept; the reminder sends return once the
+	-- correct "There are N minutes remaining." id is probed.
 	state.startTick = state.startTick or tick;
 	local elapsed = tick - state.startTick;
-	if (not state.reminded10) and elapsed >= REMIND_10MIN_TICKS then
-		state.reminded10 = true;
-		owner:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 10);
-	end
-	if (not state.reminded5) and elapsed >= REMIND_5MIN_TICKS then
-		state.reminded5 = true;
-		owner:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 5);
-	end
 	if elapsed >= ESCORT_LIMIT_TICKS then
 		escortFail(owner, area, state);
 		return;

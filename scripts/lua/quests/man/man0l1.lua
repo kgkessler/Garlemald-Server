@@ -165,17 +165,6 @@ TEXT_BOUND_BY_DUTY		= 34110;	-- UNVERIFIED candidate: "You are now bound by duty
 TEXT_UNBOUND_FROM_DUTY	= 34111;	-- UNVERIFIED candidate: "You are no longer bound by duty."
 TEXT_TIME_REMAINING		= 34112;	-- UNVERIFIED candidate: "There are <param> minutes remaining."
 
--- Escort go-latch (round 7): set TRUE by QuestDirectorMan0l101 once its
--- post-warp fade-in + tutorial-block delegate chain has the client
--- interactive; SimpleContentMan0l101.onUpdate holds the 30-minute clock,
--- Sisipu's waypoint walk and the bark loop until then, so the duty
--- doesn't run under the Now-Loading veil. Reset FALSE by the content
--- script's onCreate on every fresh run (retry-safe). Shared via this
--- module because both the director and the content script require/see
--- man0l1's globals (single-runner assumption — same documented limit as
--- the sendSignal names). (Garlemald-Server #46, round 7.)
-man0l1EscortGo = false;
-
 -- Sisipu's on-the-road guidance bark ("Oschon's Torch is due south...")
 -- — man0l1 QUEST-sheet say id 337, CONFIRMED in the decoded client
 -- processTtrBlkNml001. (Her SEQ_055 camp talk is say 119 — that one

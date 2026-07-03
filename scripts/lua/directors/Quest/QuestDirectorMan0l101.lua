@@ -85,22 +85,30 @@ function onEventStarted(player, actor, triggerName)
 	--     TtrBlkNml001 → the endTutorialMode exit) once the leg is
 	--     playable end-to-end. (Garlemald-Server #46, round 7b.)
 
-	-- (c) Retail entry text, now that the client is faded in and can see
-	--     the log (retail order after the journal update + 34108, which
-	--     both already rode the warp). Ids are UNVERIFIED candidates
-	--     (man0l1.lua TEXT_*), pending an in-client probe.
-	player:SendGameMessage(GetWorldMaster(), TEXT_PROTECT_SISIPU, 0x20);
-	player:SendGameMessage(GetWorldMaster(), TEXT_BOUND_BY_DUTY, 0x20);
-	player:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 30);
+	-- (c) NO entry text here (round 7d). The round-7 candidate ids
+	--     34109/34110/34112 turned out to be the instance-BOUNDARY
+	--     message family, not the duty family — live 20:50 they rendered
+	--     "You are about to leave the instance." / "You have left the
+	--     instance." / "Enter this instance?" (alarming and wrong). The
+	--     real ids for "Protect Sisipu from harm." (a quest OBJECTIVE,
+	--     likely on the man0l1 QUEST sheet 2700193202, not worldMaster) /
+	--     "You are now bound by duty." / "There are N minutes remaining."
+	--     are still unresolved — omitted until an in-client probe or a
+	--     retail-pcap grep pins them. 34108 "You have entered an
+	--     instance." (correct) still rides the Rust content-warp path.
+	--     Known boundary family: 34108 entered / 34109 about-to-leave /
+	--     34110 left / 34112 enter-this-instance? (Garlemald-Server #46,
+	--     round 7d.)
 
 	-- (d) Close the kick — post-load, like the tutorials (their
 	--     noticeEvent EndEvent goes out well after the reload).
 	player:EndEvent();
 
-	-- (e) Release the duty: the content script's onUpdate holds the
-	--     30-minute clock, Sisipu's waypoint walk and the bark loop on
-	--     this latch so the escort doesn't run under the veil.
-	man0l1EscortGo = true;
+	-- (e) The escort runs from the content script's own onUpdate ticks
+	--     (no cross-VM go-latch — round 7d; the director and the content
+	--     script are separate Lua VMs, so a global set here was invisible
+	--     to onUpdate and froze Sisipu). The content driver is already
+	--     ticker-gated on content_warp_acked.
 
 	waitForSignal("escortComplete");
 
