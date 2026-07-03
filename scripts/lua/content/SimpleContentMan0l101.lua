@@ -57,7 +57,6 @@ BARK_INTERVAL_TICKS = 40;                           -- guidance bark every ~20 s
 -- to player-relative follow (round 7e logic) for the final stretch. Re-record
 -- a fuller run to extend. ARRIVAL_GOAL is pmeteor's SEQ_055 camp point.
 TRAIL = {
-
 	{ x = -63.25, y = 33.16, z = 164.51 },
 	{ x = -43.93, y = 37.11, z = 156.42 },
 	{ x = -27.49, y = 41.10, z = 147.08 },
@@ -73,7 +72,6 @@ TRAIL = {
 	{ x = 141.81, y = 46.77, z = 161.73 },
 	{ x = 157.87, y = 48.45, z = 170.87 },
 	{ x = 162.43, y = 50.15, z = 190.54 },
-	{ x = 158.99, y = 50.06, z = 191.96 },
 	{ x = 161.41, y = 48.73, z = 209.05 },
 	{ x = 150.93, y = 46.43, z = 227.20 },
 	{ x = 141.69, y = 45.26, z = 246.37 },
@@ -112,8 +110,6 @@ TRAIL = {
 	{ x = 46.25, y = 59.88, z = 775.92 },
 	{ x = 53.72, y = 61.38, z = 793.35 },
 	{ x = 44.38, y = 63.70, z = 807.00 },
-	{ x = 24.91, y = 64.03, z = 805.97 },
-	{ x = 31.48, y = 64.34, z = 809.72 },
 };
 ARRIVAL_GOAL = { x = 137.44, y = 60.33, z = 1322.0 };
 
@@ -309,6 +305,8 @@ function onUpdate(tick, area)
 	-- the escort or the player joins the fight (2-3 at once — cluster
 	-- size); Sisipu fights back like the tutorial allies do.
 	local nearLive = 0
+	local anyEngaged = false
+	local nearestMob, nearestD = nil, math.huge
 	for i = 1, #mobs do
 		local mob = mobs[i]
 		if mob then
@@ -318,13 +316,23 @@ function onUpdate(tick, area)
 			if dMob <= HOLD_RADIUS then
 				nearLive = nearLive + 1
 			end
+			if mob:IsEngaged() then
+				anyEngaged = true
+			end
+			if dMob < nearestD then
+				nearestMob, nearestD = mob, dMob
+			end
 			if dMob <= ENGAGE_RADIUS and not mob:IsEngaged() then
 				allyGlobal.EngageTarget(mob, (i % 2 == 0) and escort or owner)
 			end
 		end
 	end
-	if not escort:IsEngaged() and nearLive > 0 and #mobs > 0 then
-		allyGlobal.EngageTarget(escort, mobs[1])
+	-- Sisipu joins the fight against the NEAREST in-range mob only.
+	-- (Round 7g: this used to target mobs[1] — the first ROSTER entry,
+	-- which could be a far unstreamed cluster hundreds of units away →
+	-- ranged combat against an INVISIBLE attacker, the 8/8 report.)
+	if not escort:IsEngaged() and nearestMob ~= nil and nearestD <= ENGAGE_RADIUS then
+		allyGlobal.EngageTarget(escort, nearestMob)
 	end
 
 	-- Wave-outcome beat: the contested count dropping back to zero =
@@ -336,8 +344,10 @@ function onUpdate(tick, area)
 	end
 	state.lastNear = nearLive;
 
-	-- ---- Hold while contested ----
-	if nearLive > 0 or escort:IsEngaged() then
+	-- ---- Hold while contested (round 7g: she stays PUT until every
+	-- enemy of the active gate is dead — any live mob engaged with the
+	-- party, or still lurking inside the hold radius, pins her) ----
+	if nearLive > 0 or anyEngaged or escort:IsEngaged() then
 		return
 	end
 
@@ -392,11 +402,19 @@ function onUpdate(tick, area)
 		-- ON-TRAIL: step toward the next recorded breadcrumb at ITS
 		-- recorded ground Y. RUN pace (moveState 2) — the 7e walk was
 		-- reported too slow to keep up with a running player.
-		local wp = TRAIL[state.wpIndex];
-		local d = dist2d(escort.positionX, escort.positionZ, wp.x, wp.z);
-		if d <= WAYPOINT_RADIUS then
-			state.wpIndex = state.wpIndex + 1;
-		else
+		-- Skip THROUGH every breadcrumb already within radius in one
+		-- tick (round 7g: overlapping recorded points used to cost one
+		-- idle tick each — she stood in place burning time), then move
+		-- toward the first genuinely-ahead one this same tick.
+		local wp, d;
+		repeat
+			wp = TRAIL[state.wpIndex];
+			d = wp and dist2d(escort.positionX, escort.positionZ, wp.x, wp.z) or nil;
+			if d ~= nil and d <= WAYPOINT_RADIUS then
+				state.wpIndex = state.wpIndex + 1;
+			end
+		until wp == nil or d == nil or d > WAYPOINT_RADIUS or state.wpIndex > #TRAIL;
+		if wp ~= nil and d ~= nil and d > WAYPOINT_RADIUS then
 			local dx = (wp.x - escort.positionX) / d;
 			local dz = (wp.z - escort.positionZ) / d;
 			local step = math.min(RUN_STEP, d);
