@@ -1321,20 +1321,46 @@ impl PacketProcessor {
                     })
                     .collect();
                 if let Some(mut snap) = self.world.session(handle.session_id).await {
-                    snap.pending_kick_event = Some(crate::data::PendingKickEvent {
+                    let kick = crate::data::PendingKickEvent {
                         trigger_actor_id: player_id,
                         owner_actor_id: actor_id,
                         event_name: trigger.clone(),
                         args: lua_params,
-                    });
-                    self.world.upsert_session(snap).await;
+                    };
+                    // #46 escort R1 — a kick captured AFTER the content
+                    // warp already emitted its wipe pair in the same
+                    // login-scoped burst (`reload_in_flight` set, client
+                    // ack outstanding) has NO safe emitter left this
+                    // drain: the zone-in bundle already flushed, and a
+                    // bundle-end emission would ride AFTER
+                    // DeleteAllActors — the wire-proven client-side drop
+                    // (session 53943). Park it on the content slot; the
+                    // client's RX 0x0007 content-warp ack releases it
+                    // (`handle_zone_in_complete`). Kicks captured BEFORE
+                    // any warp in the burst (the Baderon SEQ_003 staging,
+                    // the SEQ_005 doExitDoor burst) see
+                    // `reload_in_flight == false` and keep the proven
+                    // `pending_kick_event` route unchanged.
+                    if snap.reload_in_flight {
+                        snap.pending_content_kick_event = Some(kick);
+                        self.world.upsert_session(snap).await;
+                        tracing::info!(
+                            player = player_id,
+                            target = actor_id,
+                            %trigger,
+                            "KickEvent parked until content-warp zone-in ack (RX 0x0007 — reload in flight)"
+                        );
+                    } else {
+                        snap.pending_kick_event = Some(kick);
+                        self.world.upsert_session(snap).await;
+                        tracing::info!(
+                            player = player_id,
+                            target = actor_id,
+                            %trigger,
+                            "KickEvent captured (will emit at end of zone-in bundle, after all spawns)"
+                        );
+                    }
                 }
-                tracing::info!(
-                    player = player_id,
-                    target = actor_id,
-                    %trigger,
-                    "KickEvent captured (will emit at end of zone-in bundle, after all spawns)"
-                );
             }
             LC::AddQuest {
                 player_id,
@@ -2278,6 +2304,17 @@ impl PacketProcessor {
                 // land; consumed by the ContentFinished teardown.
                 spawned_actor_ids: Vec::new(),
             });
+            // Re-arm the content-warp ack gate for THIS instance. The
+            // field doc always promised "reset to false when a new
+            // content warp dispatches" but no code performed it, so a
+            // RETRY entry (escort duty failed → SEQ_048 rollback →
+            // Zephyr push again) inherited the previous instance's
+            // `true`: the ticker's onUpdate driver ran during the
+            // pre-warp window (driving escort NPCs at a client
+            // mid-transition) and the pre-ack KickEvent park window
+            // never opened. First-time flows are unchanged (the flag
+            // is already false). (#46 escort R1.)
+            snap.content_warp_acked = false;
             self.world.upsert_session(snap).await;
         }
 
@@ -3369,6 +3406,32 @@ impl PacketProcessor {
         // pre-emit.
         if emitted_pre_warp_kick && let Some(mut snap) = self.world.session(session_id).await {
             snap.pending_kick_event = None;
+            self.world.upsert_session(snap).await;
+        }
+
+        // #46 escort R1 — any pending kick the pre-warp branch did NOT
+        // consume (owner ≠ this content director, or no active content
+        // script) must not fall through to `send_zone_in_bundle`'s
+        // end-of-bundle emission: on the CONTENT warp path that emission
+        // lands AFTER DeleteAllActors in the same flush, and the client
+        // silently drops a 0x012F whose owner it just wiped (wire-proven,
+        // session 53943 — the director's onEventStarted never ran and the
+        // escort duty could never complete). Move it to the post-ack slot;
+        // the client's RX 0x0007 zone-in-complete releases it, by which
+        // point the director actor rode the zone-in bundle and is
+        // client-known. Login/normal-warp bundles are NOT affected — this
+        // move happens only on the content-warp emitter.
+        if !emitted_pre_warp_kick
+            && let Some(mut snap) = self.world.session(session_id).await
+            && let Some(kick) = snap.pending_kick_event.take()
+        {
+            tracing::info!(
+                player = player_id,
+                owner = format!("0x{:08X}", kick.owner_actor_id),
+                event = %kick.event_name,
+                "DoZoneChangeContent: pending kick re-parked for post-ack emission (RX 0x0007)"
+            );
+            snap.pending_content_kick_event = Some(kick);
             self.world.upsert_session(snap).await;
         }
 
@@ -8231,6 +8294,18 @@ impl PacketProcessor {
         cmds: Vec<crate::lua::command::LuaCommand>,
     ) {
         if Self::is_login_scoped_burst(&cmds) {
+            // #46 escort R2 — enforce the EndEvent-before-warp wire
+            // invariant on THIS path too. The shared event-script drain
+            // below already hoists via `hoist_end_events_before_warps`,
+            // but login-scoped bursts bypassed it — so a script tail of
+            // `DoZoneChangeContent(...)` → `player:EndEvent()` (the
+            // startMan0l1Content escort shape, session 53943) shipped
+            // 0x00E2 → 0x0131 and the EndEvent landed inside the
+            // client's Now-Loading window, losing the `_onPostEvent`
+            // teardown (desktopWidgetMode-16 menu mask). The hoister's
+            // `warp_family_player` matcher includes `DoZoneChangeContent`,
+            // so the same reorder covers the content warp.
+            let cmds = crate::runtime::quest_apply::hoist_end_events_before_warps(cmds);
             for cmd in cmds {
                 Box::pin(self.apply_login_lua_command(handle, cmd)).await;
             }
@@ -9332,20 +9407,63 @@ impl PacketProcessor {
     /// `pub(crate)` so integration tests can simulate the client's
     /// zone-in echo directly.
     pub(crate) async fn handle_zone_in_complete(&self, session_id: u32) {
-        let deferred_warp = if let Some(mut snap) = self.world.session(session_id).await {
-            snap.reload_in_flight = false;
-            snap.defer_warps_until_zone_in_ack = false;
-            let deferred = snap.deferred_login_warp.take();
-            self.world.upsert_session(snap).await;
-            deferred
-        } else {
-            None
-        };
+        let (deferred_warp, parked_kick) =
+            if let Some(mut snap) = self.world.session(session_id).await {
+                snap.reload_in_flight = false;
+                snap.defer_warps_until_zone_in_ack = false;
+                let deferred = snap.deferred_login_warp.take();
+                // #46 escort R1 — release the content-director kick parked by
+                // the KickEvent appliers (a 0x012F that would have ridden the
+                // content-warp flush AFTER DeleteAllActors is dropped
+                // client-side; wire-proven, session 53943). This ack means the
+                // client finished loading the instance and the director actor
+                // (which rode the zone-in bundle) is client-known, so the kick
+                // lands and the director's onEventStarted runs. If a deferred
+                // login warp is about to replay (another full reload), KEEP the
+                // kick parked — it would be wiped again; the replayed warp's
+                // own RX 0x0007 releases it.
+                let kick = if deferred.is_none() {
+                    snap.pending_content_kick_event.take()
+                } else {
+                    None
+                };
+                self.world.upsert_session(snap).await;
+                (deferred, kick)
+            } else {
+                (None, None)
+            };
         tracing::debug!(
             session = session_id,
             deferred_warp = deferred_warp.is_some(),
+            released_content_kick = parked_kick.is_some(),
             "RX 0x0007 zone-in-complete — reload/login latches cleared",
         );
+        if let Some(kick) = parked_kick {
+            if let Some(client) = self.world.client(session_id).await {
+                let mut sub = crate::packets::send::events::build_kick_event(
+                    kick.trigger_actor_id,
+                    kick.owner_actor_id,
+                    &kick.event_name,
+                    5,
+                    &kick.args,
+                );
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+                tracing::info!(
+                    session = session_id,
+                    trigger = format!("0x{:08X}", kick.trigger_actor_id),
+                    owner = format!("0x{:08X}", kick.owner_actor_id),
+                    event = %kick.event_name,
+                    "parked content KickEvent released on content-warp zone-in ack",
+                );
+            } else {
+                tracing::warn!(
+                    session = session_id,
+                    event = %kick.event_name,
+                    "parked content KickEvent dropped — no client handle at release",
+                );
+            }
+        }
         if let Some(w) = deferred_warp {
             tracing::info!(
                 session = session_id,

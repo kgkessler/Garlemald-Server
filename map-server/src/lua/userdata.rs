@@ -100,6 +100,15 @@ pub struct LuaActor {
     /// enough for `allyGlobal.EngageTarget`-style consumers to
     /// re-extract the id and forward it to combat commands.
     pub target_actor_id: u32,
+    /// #46 escort R4a — HP snapshot surfaced to content scripts via
+    /// `actor:GetHP()` / `actor:GetMaxHP()` (the man0l1 escort's
+    /// onUpdate monitors Sisipu's HP for the "Sisipu hurt" bark +
+    /// the fail-the-duty-on-death beat). Refreshed each 500 ms tick
+    /// by `build_content_rosters` from the live `Character`; 0 for
+    /// synthetic stub LuaActors with no backing live actor (same
+    /// convention as `is_engaged` / `speed`).
+    pub hp: i16,
+    pub max_hp: i16,
 }
 
 impl UserData for LuaActor {
@@ -117,6 +126,13 @@ impl UserData for LuaActor {
         methods.add_method("IsDead", |_, this, _: ()| {
             Ok(this.state == crate::actor::MAIN_STATE_DEAD)
         });
+        // `GetHP()` / `GetMaxHP()` — HP snapshot, refreshed each content
+        // tick by `build_content_rosters` (see the `hp` field doc). The
+        // escort content script reads Sisipu's HP in onUpdate to drive
+        // the hurt-bark / duty-failure beats. Mirrors the LuaPlayer
+        // bindings of the same names. (#46 escort R4a.)
+        methods.add_method("GetHP", |_, this, _: ()| Ok(this.hp));
+        methods.add_method("GetMaxHP", |_, this, _: ()| Ok(this.max_hp));
         methods.add_method("GetPos", |_, this, _: ()| {
             Ok((
                 this.pos.0,
@@ -365,6 +381,8 @@ impl UserData for LuaActor {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 return lua.create_userdata(target).map(Value::UserData);
             }
@@ -3235,6 +3253,8 @@ impl UserData for LuaPlayer {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 return lua.create_userdata(target).map(Value::UserData);
             }
@@ -3478,6 +3498,8 @@ impl UserData for LuaZone {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 lua.create_userdata(actor)
             },
@@ -3834,6 +3856,8 @@ impl UserData for LuaContentArea {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 lua.create_userdata(actor)
             },
@@ -4114,6 +4138,8 @@ impl UserData for LuaWorldManager {
                     is_engaged: false,
                     speed: 5.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 lua.create_userdata(actor)
             },

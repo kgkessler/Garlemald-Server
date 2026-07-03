@@ -4882,10 +4882,12 @@ mod battle_npc_spawn_tests {
         assert_eq!(sisipu.actor_class_id, 2_290_007);
         assert_eq!(sisipu.script_name, "sisipu");
         assert_eq!(sisipu.allegiance, 1, "sisipu escorts as an ally");
-        // Re-homed to zone 129 ('sea0Field02', Camp Skull Valley) by seed 066:
-        // the escort runs as a content instance in a genuinely-different map
-        // resource so the cutscene→Now-Loading veil drops. (Garlemald-Server #46.)
-        assert_eq!(sisipu.zone_id, 129);
+        // Re-homed BACK to zone 128 ('sea0Field01', the retail Zephyr Gate →
+        // Oschon's Torch route) by seed 070: the zone-129 Skull Valley pin
+        // (seed 066) was a workaround for the same-map after-warp veil hang,
+        // obsolete now that the wipe+0x10 reload recipe is capture-proven to
+        // complete same-map content warps. (Garlemald-Server #46, escort.)
+        assert_eq!(sisipu.zone_id, 128);
 
         let biter = db
             .load_battle_npc_spawn(17)
@@ -4894,7 +4896,7 @@ mod battle_npc_spawn_tests {
             .expect("ankle biter row");
         assert_eq!(biter.actor_class_id, 2_205_603);
         assert_eq!(biter.allegiance, 0);
-        assert_eq!(biter.zone_id, 129);
+        assert_eq!(biter.zone_id, 128);
 
         // The migration's UPDATEs filled the stripped class rows.
         let sisipu_class = db

@@ -132,6 +132,8 @@ impl QuestHookArg {
                         is_engaged: false,
                         speed: 5.0,
                         target_actor_id: 0,
+                        hp: 0,
+                        max_hp: 0,
                     },
                     actor_class_id: spec.actor_class_id,
                     quest_graphic: spec.quest_graphic,
@@ -811,6 +813,8 @@ impl LuaEngine {
                 is_engaged: false,
                 speed: 0.0,
                 target_actor_id: 0,
+                hp: 0,
+                max_hp: 0,
             };
             let player_ud = lua
                 .create_userdata(player)
@@ -893,6 +897,8 @@ impl LuaEngine {
                     is_engaged: false,
                     speed: 5.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 },
                 actor_class_id: npc_spec.actor_class_id,
                 quest_graphic: npc_spec.quest_graphic,
@@ -2583,6 +2589,8 @@ mod tests {
                 is_engaged: false,
                 speed: 5.0,
                 target_actor_id: 0,
+                hp: 0,
+                max_hp: 0,
             });
         }
         area.monsters.push(userdata::LuaActor {
@@ -2600,6 +2608,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
 
         let result = engine.call_content_on_update(&script_path, 1, area);
@@ -2636,11 +2646,13 @@ mod tests {
 
     /// Garlemald-Server #46 — drive the REAL
     /// `SimpleContentMan0l101.lua` escort through its lifecycle:
-    /// onCreate spawns Sisipu (bnpc 16) + the 8 ankle biters (17-24),
-    /// then onUpdate (1) walks the escort toward the first waypoint on
-    /// a clear road, (2) holds the walk + pulls mobs when an ankle
-    /// biter is close, and (3) fires `sendSignal("escortComplete")`
-    /// after the final waypoint is reached with the road cleared. Also
+    /// onCreate spawns Sisipu (bnpc 25) + the 8 ankle biters (26-33,
+    /// the zone-128 route rows from seed/070), then onUpdate (1) has
+    /// Sisipu LEAD toward the first ROUTE waypoint while the player is
+    /// close and the road is clear, (2) holds the walk + pulls mobs
+    /// when an ankle biter is close, and (3) fires
+    /// `sendSignal("escortComplete")` once BOTH Sisipu and the player
+    /// are inside the lighthouse-approach arrival radius. Also
     /// syntax-checks the script.
     #[test]
     fn real_man0l1_escort_content_walks_holds_and_signals() {
@@ -2675,8 +2687,8 @@ mod tests {
             .collect();
         assert_eq!(
             spawn_ids,
-            (16..=24).collect::<Vec<u32>>(),
-            "onCreate must spawn Sisipu (16) + 8 ankle biters (17-24)",
+            (25..=33).collect::<Vec<u32>>(),
+            "onCreate must spawn Sisipu (25) + 8 ankle biters (26-33, seed/070 zone-128 route)",
         );
 
         let escort_actor =
@@ -2695,6 +2707,8 @@ mod tests {
                 is_engaged: false,
                 speed: 5.0,
                 target_actor_id: 0,
+                hp: 0,
+                max_hp: 0,
             };
         let mob_actor =
             |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
@@ -2712,21 +2726,30 @@ mod tests {
                 is_engaged: false,
                 speed: 5.0,
                 target_actor_id: 0,
+                hp: 0,
+                max_hp: 0,
             };
 
+        // Player standing right next to Sisipu (inside PLAYER_LEASH) —
+        // she only advances while the player keeps up.
+        let near_player = |pos: (f32, f32, f32)| {
+            let mut snap = sample_snapshot();
+            snap.pos = pos;
+            snap
+        };
+
         // Tick 1 — road clear (the only live mob is the far third
-        // cluster): the escort FOLLOWS the player. The player snapshot sits
-        // at the origin (0,0,0); the escort starts at (-60, 33.15, 170), so a
-        // walking step must move it TOWARD the player (z decreasing below 170,
-        // x increasing above -60). (See SimpleContentMan0l101.lua onUpdate
-        // follow-the-player rewrite — the old +Z waypoint walk was removed.)
+        // cluster), player at her side: Sisipu LEADS toward ROUTE[1]
+        // (-34.9, 38.2, 250) from her seed/070 spawn (-49, 36.43, 162),
+        // so a walking step must move her along the route (z increasing
+        // above 162, x increasing above -49).
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
-        area.players.push(sample_snapshot());
+        area.players.push(near_player((-52.0, 36.0, 158.0)));
         area.allies
-            .push(escort_actor((-60.0, 33.15, 170.0), q.clone()));
+            .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
         area.monsters
-            .push(mob_actor((-17.0, 33.15, 308.0), q.clone()));
+            .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
         let result = engine.call_content_on_update(&script_path, 1, area);
         assert!(result.error.is_none(), "tick1: {:?}", result.error);
         let step = result.commands.iter().find_map(|c| match c {
@@ -2739,20 +2762,20 @@ mod tests {
             _ => None,
         });
         assert!(
-            step.is_some_and(|(x, z)| z < 170.0 && x > -60.0),
-            "clear road must step the escort toward the player; got {:?}",
+            step.is_some_and(|(x, z)| z > 162.0 && x > -49.0),
+            "clear road + close player must step the escort toward ROUTE[1]; got {:?}",
             result.commands,
         );
 
-        // Tick 2 — ambush: a live ankle biter inside the hold radius
-        // freezes the walk and pulls the mob onto the escort party.
+        // Tick 2 — ambush at the wave-1 cluster: a live ankle biter
+        // inside the engage radius freezes the walk and pulls the mob
+        // onto the escort party.
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
-        area.players.push(sample_snapshot());
+        area.players.push(near_player((-6.0, 42.0, 446.0)));
         area.allies
-            .push(escort_actor((-60.0, 33.15, 170.0), q.clone()));
-        area.monsters
-            .push(mob_actor((-58.0, 33.15, 180.0), q.clone()));
+            .push(escort_actor((-2.7, 42.4, 450.0), q.clone()));
+        area.monsters.push(mob_actor((0.0, 42.4, 455.0), q.clone()));
         let result = engine.call_content_on_update(&script_path, 2, area);
         assert!(result.error.is_none(), "tick2: {:?}", result.error);
         assert!(
@@ -2772,36 +2795,153 @@ mod tests {
             result.commands,
         );
 
-        // Ticks 3-6 — the road is now fully cleared (no monsters left in the
-        // roster), so completion is keyed on the kill count (#mobs == 0), not
-        // a waypoint arrival: escortComplete must fire. Escort positions are
-        // cosmetic here.
-        let waypoints = [
-            (-52.0f32, 210.0f32),
-            (-36.0, 255.0),
-            (-20.0, 300.0),
-            (-8.0, 340.0),
-        ];
-        let mut signaled = false;
-        for (i, (wx, wz)) in waypoints.iter().enumerate() {
-            let q = CommandQueue::new();
-            let mut area = sample_content_area(q.clone());
-            area.players.push(sample_snapshot());
-            area.allies.push(escort_actor((*wx, 33.15, *wz), q.clone()));
-            let result = engine.call_content_on_update(&script_path, 3 + i as u64, area);
-            assert!(
-                result.error.is_none(),
-                "arrival tick {i}: {:?}",
-                result.error
-            );
-            signaled |= result
+        // Tick 3 — ARRIVAL: Sisipu and the player both inside the
+        // lighthouse-approach radius of the final waypoint
+        // (130.7, 59.5, 1280), the last cluster far behind:
+        // escortComplete must fire (waypoint arrival, NOT kill count —
+        // the far mob is still alive).
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(near_player((128.0, 59.0, 1276.0)));
+        area.allies
+            .push(escort_actor((130.7, 59.5, 1280.0), q.clone()));
+        area.monsters
+            .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 3, area);
+        assert!(result.error.is_none(), "arrival tick: {:?}", result.error);
+        assert!(
+            result
                 .commands
                 .iter()
-                .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete"));
-        }
+                .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete")),
+            "party inside the arrival radius must fire escortComplete; got {:?}",
+            result.commands,
+        );
+    }
+
+    /// Garlemald-Server #46 — the escort FAIL flow: Sisipu takes real
+    /// damage now (no MinimumHpLock), and her death — she vanishes from
+    /// the live-only ally roster — must roll the quest back to SEQ_048
+    /// (re-arming the ZEPHYR_TRIGGER for a retry), tear the content
+    /// down, eject the player to the gate, and drain the parked
+    /// director coroutine.
+    #[test]
+    fn real_man0l1_escort_sisipu_death_fails_and_ejects() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("content/SimpleContentMan0l101.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        // onCreate arms the per-player escort state (and must NOT lock
+        // Sisipu's HP any more — only the player keeps the tutorial
+        // floor).
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_content_hook(
+            &script_path,
+            "onCreate",
+            sample_snapshot(),
+            sample_content_area(dummy_queue.clone()),
+            sample_director(dummy_queue.clone()),
+        );
         assert!(
-            signaled,
-            "a cleared road (no monsters left) must fire escortComplete",
+            result.error.is_none(),
+            "onCreate errored: {:?}",
+            result.error
+        );
+        let hp_locks = result
+            .commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    LuaCommand::SetActorMod {
+                        modifier_key: 114, // Modifier::MinimumHpLock (modifiers.lua)
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            hp_locks, 1,
+            "only the PLAYER keeps the MinimumHpLock floor — Sisipu takes real damage",
+        );
+
+        let escort_actor =
+            |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
+                actor_id: 0x4008_0001,
+                name: "sisipu".to_string(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 128,
+                zone_name: String::new(),
+                state: 2,
+                pos,
+                rotation: 0.0,
+                queue,
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
+                hp: 0,
+                max_hp: 0,
+            };
+        let near_player = |pos: (f32, f32, f32)| {
+            let mut snap = sample_snapshot();
+            snap.pos = pos;
+            snap
+        };
+
+        // Tick 10 — Sisipu alive: latches the "seen" flag.
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(near_player((-52.0, 36.0, 158.0)));
+        area.allies
+            .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 10, area);
+        assert!(result.error.is_none(), "tick10: {:?}", result.error);
+
+        // Tick 11 — Sisipu is gone from the live-only roster (dead):
+        // the FAIL flow must fire.
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(near_player((-52.0, 36.0, 158.0)));
+        let result = engine.call_content_on_update(&script_path, 11, area);
+        assert!(result.error.is_none(), "tick11: {:?}", result.error);
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::QuestStartSequence {
+                    quest_id: 110_002,
+                    sequence: 48,
+                    ..
+                }
+            )),
+            "fail must roll man0l1 back to SEQ_048; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::ContentFinished { .. })),
+            "fail must tear the content instance down; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::WarpToPublicArea { .. })),
+            "fail must eject the player to the public gate; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete")),
+            "fail must drain the parked director coroutine; got {:?}",
+            result.commands,
         );
     }
 
@@ -3091,6 +3231,8 @@ mod tests {
             is_engaged: true,
             speed: 8.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         area.allies.push(userdata::LuaActor {
             actor_id: 0x4000_0002,
@@ -3107,6 +3249,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
 
         let result = engine.call_content_hook(
@@ -3239,6 +3383,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         area.monsters.push(userdata::LuaActor {
             actor_id: 0x4000_0099,
@@ -3255,6 +3401,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
 
         let result = engine.call_content_hook(
@@ -3325,6 +3473,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         area.monsters.push(userdata::LuaActor {
             actor_id: 0x4000_0099,
@@ -3341,6 +3491,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
 
         let result = engine.call_content_hook(
@@ -3609,6 +3761,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         let result = engine.call_content_hook(
             &script_path,
@@ -3689,6 +3843,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         area.monsters.push(userdata::LuaActor {
             actor_id: 0x4000_2099,
@@ -3705,6 +3861,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         let result = engine.call_content_hook(
             &script_path,
@@ -3779,6 +3937,8 @@ mod tests {
             is_engaged: false,
             speed: 5.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         });
         let snap = sample_snapshot();
         let player_actor_id = snap.actor_id;
@@ -4222,6 +4382,8 @@ mod tests {
             is_engaged: false,
             speed: 0.0,
             target_actor_id: 0,
+            hp: 0,
+            max_hp: 0,
         };
         let grants_in = |cmds: &[LuaCommand]| {
             cmds.iter()

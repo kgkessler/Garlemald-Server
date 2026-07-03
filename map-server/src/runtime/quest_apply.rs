@@ -1755,6 +1755,57 @@ async fn apply_kick_event(
         .iter()
         .map(crate::event::lua_bridge::arg_to_lua_param)
         .collect();
+    // #46 escort R1 — a 0x012F TX'd into an unacked wipe+0x10 content-
+    // reload window is silently dropped by the client (the owner actor
+    // was just wiped by DeleteAllActors; wire-proven, session 53943).
+    // Two windows are guarded:
+    //  * `reload_in_flight` — the wipe pair is already on the wire and
+    //    the client hasn't echoed RX 0x0007 yet (kick drained AFTER the
+    //    content warp in the same burst, or cross-drain pre-ack);
+    //  * the pre-ack content window — `CreateContentArea` has installed
+    //    the content script but `apply_do_zone_change_content` hasn't
+    //    completed yet (`!content_warp_acked`), and the kick targets
+    //    THAT content director (the `startMan0l1Content` shape). Kicks
+    //    for other owners keep direct dispatch — e.g. the mid-flow
+    //    `kickEventContinue` resumes fire long after the ack and are
+    //    unaffected.
+    // Parked kicks are released by `handle_zone_in_complete` on the
+    // client's RX 0x0007 content-warp ack. (Garlemald-Server #46.)
+    if let Some(session) = world.session(session_id).await {
+        let in_reload_window = session.reload_in_flight;
+        let in_pre_ack_content_window = !session.content_warp_acked
+            && session
+                .active_content_script
+                .as_ref()
+                .is_some_and(|active| active.director_actor_id == actor_id);
+        if in_reload_window || in_pre_ack_content_window {
+            let mut snap = session;
+            if let Some(prev) = snap.pending_content_kick_event.as_ref() {
+                tracing::warn!(
+                    session = session_id,
+                    prev_event = %prev.event_name,
+                    new_event = %trigger,
+                    "pending_content_kick_event overwritten — only one content kick can park at a time",
+                );
+            }
+            snap.pending_content_kick_event = Some(crate::data::PendingKickEvent {
+                trigger_actor_id: player_id,
+                owner_actor_id: actor_id,
+                event_name: trigger.to_string(),
+                args: lua_params,
+            });
+            world.upsert_session(snap).await;
+            tracing::info!(
+                session = session_id,
+                trigger_actor = format!("0x{player_id:08X}"),
+                owner_actor = format!("0x{actor_id:08X}"),
+                event = %trigger,
+                reload_in_flight = in_reload_window,
+                "KickEvent parked until content-warp zone-in ack (RX 0x0007)",
+            );
+            return;
+        }
+    }
     let mut sub = crate::packets::send::events::build_kick_event(
         player_id,
         actor_id,
@@ -1881,6 +1932,10 @@ pub(crate) async fn apply_content_finished(
         snap.party_group_ordinal = snap.party_group_ordinal.wrapping_add(1);
     }
     snap.active_content_script = None;
+    // A kick parked for the (now torn-down) content director must not
+    // fire on a LATER RX 0x0007 (e.g. the SEQ_055 camp warp's ack) —
+    // the owner actor no longer exists. (#46 escort R1.)
+    snap.pending_content_kick_event = None;
     if snap
         .login_director
         .as_ref()
@@ -8028,6 +8083,20 @@ mod end_event_before_warp_tests {
         }
     }
 
+    fn do_zone_change_content(player_id: u32) -> LuaCommand {
+        LuaCommand::DoZoneChangeContent {
+            player_id,
+            parent_zone_id: 129,
+            area_name: "Man0l101".to_string(),
+            director_actor_id: 0x6530_0003,
+            spawn_type: 16,
+            x: -991.88,
+            y: 61.71,
+            z: -1120.79,
+            rotation: 0.0,
+        }
+    }
+
     fn change_music(player_id: u32) -> LuaCommand {
         LuaCommand::ChangeMusic {
             player_id,
@@ -8052,6 +8121,7 @@ mod end_event_before_warp_tests {
             .map(|cmd| match cmd {
                 LuaCommand::EndEvent { .. } => "end_event",
                 LuaCommand::DoZoneChange { .. } => "do_zone_change",
+                LuaCommand::DoZoneChangeContent { .. } => "do_zone_change_content",
                 LuaCommand::WarpToPrivateArea { .. } => "warp_to_private_area",
                 LuaCommand::ChangeMusic { .. } => "change_music",
                 LuaCommand::SendMessage { .. } => "send_message",
@@ -8110,6 +8180,18 @@ mod end_event_before_warp_tests {
         let batch = vec![warp_to_private_area(13), end_event(13)];
         let out = hoist_end_events_before_warps(batch);
         assert_eq!(tags(&out), ["end_event", "warp_to_private_area"]);
+    }
+
+    #[test]
+    fn content_warp_then_end_event_becomes_end_event_then_content_warp() {
+        // startMan0l1Content escort shape (session 53943):
+        // `GetWorldManager():DoZoneChangeContent(...)` followed by
+        // `player:EndEvent()` — the 0x0131 must reach the wire before
+        // the wipe pair or the client loses the `_onPostEvent`
+        // teardown inside the Now-Loading window. (#46 escort R2.)
+        let batch = vec![do_zone_change_content(13), end_event(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "do_zone_change_content"]);
     }
 
     #[test]

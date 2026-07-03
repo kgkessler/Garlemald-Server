@@ -783,6 +783,10 @@ pub(crate) async fn build_content_rosters(
                         .map(|s| s.target_actor_id)
                         .filter(|id| *id != 0)
                         .unwrap_or(0),
+                    // #46 escort R4a — live HP for `actor:GetHP()` /
+                    // `GetMaxHP()` (escort onUpdate monitors Sisipu).
+                    hp: c.chara.hp,
+                    max_hp: c.chara.max_hp,
                 };
                 // Ally if the registered kind says so OR the BattleNpc
                 // was spawned with allegiance==1 (we can't read that

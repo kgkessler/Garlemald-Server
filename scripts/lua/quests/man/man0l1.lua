@@ -135,6 +135,41 @@ CNTR_LS_MSG			= 4;
 -- flag is the "already exited the MSK Echo" signal instead.
 -- (Garlemald-Server #46.)
 FLAG_SEQ7_MSK_EXITED	= 0;
+-- One-shot handoff latch for the SEQ_050 escort start: set by
+-- startMan0l1Content IMMEDIATELY BEFORE StartSequence(SEQ_050), and
+-- CONSUMED (ClearFlag) by the very next onStateChange run — the one
+-- that StartSequence itself fires. Any LATER onStateChange run at
+-- SEQ_050 (the processor's relog re-arm, or a wedged pre-escort save
+-- like the one stranded at SEQ_050 today) therefore sees the flag
+-- CLEAR and takes the rescue arm: roll back to SEQ_048 so the
+-- ZEPHYR_TRIGGER re-arms for a retry. See onStateChange.
+-- (Garlemald-Server #46 — escort leg.)
+FLAG_ESCORT_HANDOFF		= 1;
+
+-- ===== Escort duty system messages (Garlemald-Server #46) =====
+-- 34108 "You have entered an instance." is CONFIRMED (worldMaster
+-- sheet; EchoGate sends it right before its DoZoneChangeContent wipe;
+-- garlemald emits it Rust-side in apply_do_zone_change_content /
+-- the deferred private-area bundle — scripts never send it).
+--
+-- The four ids below are UNVERIFIED CANDIDATES in the worldMaster
+-- "instance" family around 34108, pending an in-client probe: if a
+-- candidate renders wrong text, the user reports it and only the
+-- number changes here. Retail line order at escort entry (OCR'd
+-- playthroughs + Mirke transcripts): journal update → 34108 →
+-- "Protect Sisipu from harm." → "You are now bound by duty." →
+-- "There are 30 minutes remaining." (log + centre banner; the banner
+-- half is pending the same id probe).
+TEXT_PROTECT_SISIPU		= 34109;	-- UNVERIFIED candidate: "Protect Sisipu from harm."
+TEXT_BOUND_BY_DUTY		= 34110;	-- UNVERIFIED candidate: "You are now bound by duty."
+TEXT_UNBOUND_FROM_DUTY	= 34111;	-- UNVERIFIED candidate: "You are no longer bound by duty."
+TEXT_TIME_REMAINING		= 34112;	-- UNVERIFIED candidate: "There are <param> minutes remaining."
+
+-- Sisipu's on-the-road guidance bark ("Oschon's Torch is due south...")
+-- — man0l1 QUEST-sheet say id 337, CONFIRMED in the decoded client
+-- processTtrBlkNml001. (Her SEQ_055 camp talk is say 119 — that one
+-- belongs to the camp leg, not the escort.)
+SAY_ESCORT_GUIDANCE		= 337;
 
 -- Msg packs for the Npc LS
 NPCLS_MSGS = {
@@ -258,6 +293,32 @@ function onStateChange(player, quest, sequence)
 		quest:SetENpc(BADERON);
 		quest:SetENpc(ZEPHYR_TRIGGER, QFLAG_PUSH, false, true);
 		quest:SetENpc(NNMULIKA);
+	elseif (sequence == SEQ_050) then
+		-- Escort-duty rescue (Garlemald-Server #46). onStateChange runs
+		-- at SEQ_050 in exactly two situations:
+		--   1. The legit escort start: startMan0l1Content sets
+		--      FLAG_ESCORT_HANDOFF then calls StartSequence(SEQ_050) —
+		--      the commands apply in order, so THIS run sees the flag
+		--      SET, consumes it, and stays dormant.
+		--   2. Everything else — the processor's relog re-arm for a
+		--      player whose escort content died with the session
+		--      (content instances don't persist), or a save wedged at
+		--      SEQ_050 by an older build (the flag was never set —
+		--      one such save exists today). The flag is CLEAR → roll
+		--      back to SEQ_048 so the ZEPHYR_TRIGGER re-arms and the
+		--      duty can be retried from the gate.
+		-- One-shot-safe by construction: the rescue moves the sequence
+		-- to SEQ_048, so this arm no longer matches. No mid-run
+		-- onStateChange re-run is expected while the duty is live (no
+		-- ENPCs are registered at SEQ_050, so no talk/UpdateENPCs path
+		-- exists inside the content area); if a stray one ever fires,
+		-- the failure mode is a graceful eject-to-retry, not a wedge.
+		local data = quest:GetData();
+		if (data:GetFlag(FLAG_ESCORT_HANDOFF)) then
+			data:ClearFlag(FLAG_ESCORT_HANDOFF);
+		else
+			quest:StartSequence(SEQ_048);
+		end
 	elseif (sequence == SEQ_055) then
 		quest:SetENpc(WINDWORN_CORPSE, QFLAG_TALK);
 		quest:SetENpc(GLASSYEYED_CORPSE);
@@ -873,37 +934,46 @@ function onNpcLS(player, quest, from, msgStep)
 end
 
 function startMan0l1Content(player, quest)
+	-- One-shot rescue latch FIRST, journal update SECOND: the commands
+	-- apply in queue order, so the onStateChange(SEQ_050) run that
+	-- StartSequence fires sees the flag SET and stays dormant (it
+	-- consumes the flag — see the SEQ_050 rescue arm). This is also
+	-- retail's first entry beat (journal update precedes the instance
+	-- messages). (Garlemald-Server #46 — escort leg.)
+	quest:GetData():SetFlag(FLAG_ESCORT_HANDOFF);
 	quest:StartSequence(SEQ_050);
 
-	-- ===== CUTSCENE → CROSS-MAP DUTY WARP (Garlemald-Server #46) =====
-	-- The man0l604 cutscene (processEvent604) ends with startFadeInCutSceneAfterWarp
-	-- == engine `_fadeInAfterWarp()`, which raises the "Now Loading" overlay. The
-	-- client tears that overlay down ONLY when a real off-disk map load COMPLETES
-	-- (warp-END handler / LuaActorImpl slot 42). The veil therefore REQUIRES the
-	-- cutscene to be followed by a warp into a GENUINELY DIFFERENT map resource:
-	--   * same zone / in-place reveal (0x16) / teleport respawn (7) -> no load -> hang
-	--   * same-map force-reload (128->128, or 141 'sea0Field01a' which aliases
-	--     128's 'sea0Field01') -> no DIFFERENT resource loads -> hang
-	-- (all three proven on 2026-06-17/18/19; captures/issue28-rca/04-decomp-unlock.md).
+	-- ===== CUTSCENE → SAME-MAP DUTY WARP (Garlemald-Server #46) =====
+	-- The escort runs as a content instance on ZONE 128 — retail
+	-- geography, pmeteor's intended (dead-code) shape: CreateContentArea
+	-- on the same map at the gate, then DoZoneChangeContent to pmeteor's
+	-- (-63.25, 33.15, 164.51, 0.8) with spawnType 16.
 	--
-	-- Fix: run the escort as a content instance whose zone is 129 (Western La
-	-- Noscea, 'sea0Field02') — the only different-map zone in region 101. The 6th
-	-- CreateContentArea arg pins the instance to 129, so the content NPCs spawn
-	-- there, active_content_script/onUpdate drive there, and DoZoneChangeContent
-	-- migrates the player 128->129. SetMap then carries 129 ('sea0Field02', a
-	-- DIFFERENT resource than 128's 'sea0Field01') and the 0x00E2(0x10) force-reload
-	-- latch (same-region 128->129 needs it) schedules the load -> it completes ->
-	-- warp-END fires -> (a) the cutscene veil resolves AND (b) the command-inhibit
-	-- latch clears (mode 0x10 != 0x16) -> menu/map/weaponskills live. This is the
-	-- cutscene -> Now Loading -> game-world chain (NOT a same-region DoZoneChange,
-	-- which would hit the 6 s deferral; the content path flushes immediately).
-	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101", 129);
+	-- The same-map reload is SOLVED: apply_do_zone_change_content's wipe
+	-- + 0x00E2(0x10) recipe (DeleteAllActors + force-reload latch +
+	-- immediate bundle) completes same-map content warps — capture-proven
+	-- on the 193→193 / 184→184 tutorial transitions — because
+	-- processEvent604_3 below neutralises the cutscene's after-warp veil
+	-- IN PLACE before the warp (the veil, not the map resource, was the
+	-- original hang; see seed/066 for the superseded zone-129 workaround
+	-- rationale).
+	-- ROLLBACK: flip the 6th CreateContentArea arg back to 129 and the
+	-- warp destination back to (-991.88, 61.71, -1120.79, 0.0), and spawn
+	-- bnpc 16..24 in SimpleContentMan0l101.lua — the seed/066 Skull
+	-- Valley rows are kept intact for exactly that (seed/070).
+	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101", 128);
 	if (contentArea == nil) then
 		return;
 	end
 	local director = contentArea:GetContentDirector();
 	player:AddDirector(director);
 	director:StartDirector(false);
+	-- Script order keeps the kick BEFORE the warp (pmeteor parity); the
+	-- Rust side defers the actual 0x012F TX until the post-warp ack —
+	-- a kick riding the warp bundle AFTER DeleteAllActors is dropped by
+	-- the client (the director actor was wiped), the client never
+	-- answers, and the director coroutine never arms (wire-proven,
+	-- session 53943). (Garlemald-Server #46.)
 	player:KickEvent(director, "noticeEvent", true);
 	player:SetLoginDirector(director);
 
@@ -926,12 +996,25 @@ function startMan0l1Content(player, quest)
 	--    normally → no stuck "Now Loading". (Garlemald-Server #46.)
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
 
-	-- 3. Duty warp into the zone-129 Skull Valley camp (escort NPCs seeded there —
-	--    seed/066). spawnType 16 (0x10) → apply_do_zone_change_content force-reload
-	--    branch (DeleteAllActors + 0x00E2(0x10) + zone-in bundle), same as man0g0.
-	GetWorldManager():DoZoneChangeContent(player, contentArea, -991.88, 61.71, -1120.79, 0.0, 16);
-
+	-- 3. Close the push event BEFORE the warp. An EndEvent (0x0131)
+	--    landing mid-reload loses the client's _onPostEvent teardown →
+	--    the session-global desktopWidgetMode-16 mask ("tutorial mode"
+	--    menu lock) — wire-proven; 0x0131 ahead of the 0x00E2 reload
+	--    latch is retail's invariant ordering on every captured
+	--    transition (see onStart). (Garlemald-Server #46.)
 	player:EndEvent();
+
+	-- 4. Duty warp into the zone-128 gate-side content instance (escort
+	--    NPCs seeded on the southbound road — seed/070). spawnType 16
+	--    (0x10) → apply_do_zone_change_content force-reload branch
+	--    (34108 "You have entered an instance." + DeleteAllActors +
+	--    0x00E2(0x10) + zone-in bundle), same as man0g0. The rest of the
+	--    retail entry text ("Protect Sisipu from harm." / "You are now
+	--    bound by duty." / "There are 30 minutes remaining.") is emitted
+	--    post-warp by SimpleContentMan0l101.lua's onZoneIn — messages
+	--    queued here after the warp command would ship into the client's
+	--    Now-Loading gap (the man0l0 Hob-crash shape, see onStart).
+	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
 end
 
 function getJournalInformation(player, quest)
