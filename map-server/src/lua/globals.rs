@@ -71,15 +71,22 @@ pub fn install_globals(
     }
 
     // GetStaticActor(name) / GetStaticActorById(id) — return the actor id
-    // registered under that name, or nil if unknown.
+    // registered under that name, or nil if unknown. A miss is warn-logged:
+    // scripts pass the result straight into client delegates, and a nil
+    // actor argument on the wire crashes the client to character select
+    // (the baderon.lua DftSea incident, 2026-07-03).
     {
         let cats = catalogs.clone();
         let f = lua.create_function(move |_, name: String| {
-            Ok(cats
+            let id = cats
                 .static_actors
                 .read()
                 .ok()
-                .and_then(|s| s.get(&name).copied()))
+                .and_then(|s| s.get(&name).copied());
+            if id.is_none() {
+                tracing::warn!(name, "GetStaticActor: unknown static actor (returning nil)");
+            }
+            Ok(id)
         })?;
         globals.set("GetStaticActor", f)?;
     }

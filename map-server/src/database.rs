@@ -1742,6 +1742,24 @@ impl Database {
         Ok(rows.into_iter().collect())
     }
 
+    /// Static-actor registry (`gamedata_static_actors`, seed 069 — decoded
+    /// from pmeteor's `Data/staticactors.bin`): `GetStaticActor(name)` in
+    /// Lua resolves against this. Rows are `(actorId | 0xA0F00000, name,
+    /// classPath)`; e.g. DftSea = 0xA0F1AFCC, the sea-region default-talk
+    /// quest baderon.lua delegates to. (Garlemald-Server #46, round 6.)
+    pub async fn load_static_actors(&self) -> Result<Vec<(String, u32)>> {
+        self.conn
+            .call_db(|c| {
+                let mut stmt =
+                    c.prepare("SELECT name, actorId FROM gamedata_static_actors ORDER BY actorId")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
     pub async fn load_global_battle_command_list(
         &self,
     ) -> Result<(HashMap<u16, BattleCommand>, HashMap<(u8, i16), Vec<u16>>)> {
