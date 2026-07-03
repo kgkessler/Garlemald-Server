@@ -82,6 +82,11 @@ BARKS = {
 escortState = {};
 
 function onCreate(starterPlayer, contentArea, director)
+	-- Fresh run: hold the duty until the director's post-warp chain has
+	-- the client faded in and interactive (retry-safe reset — the
+	-- director sets it TRUE at the end of its noticeEvent chain).
+	man0l1EscortGo = false;
+
 	escortState[starterPlayer.actorId] = {
 		done = false,        -- terminal latch (arrival signalled OR failed)
 		wpIndex = 1,         -- next ROUTE waypoint Sisipu walks toward
@@ -132,21 +137,14 @@ function onCreate(starterPlayer, contentArea, director)
 	end
 end
 
--- Post-warp entry text (retail order: journal update → 34108 "You have
--- entered an instance." → the three lines below). 34108 rides the Rust
--- content-warp path (apply_do_zone_change_content, right before
--- DeleteAllActors); this hook fires AFTER the zone-in bundle, so these
--- lines land on a client that has the instance loaded instead of
--- shipping into the Now-Loading gap (the man0l0 Hob-crash shape).
--- The three ids are UNVERIFIED candidates (see man0l1.lua TEXT_*) —
--- wrong text renders harmlessly and gets corrected by an in-client
--- probe. Retail also draws the timer line as a centre banner; the
--- banner half (SendDataPacket "attention") is pending the same probe —
--- log-line only for now. (Garlemald-Server #46.)
+-- Entry text moved to the DIRECTOR's post-warp chain (round 7): this
+-- hook fires inside apply_do_zone_change_content immediately after the
+-- bundle flush — ~4s BEFORE the client's RX 0x0007 (wire-proven
+-- 2026-07-03 14:24: the three lines + bark 337 + Sisipu's first walk
+-- steps all shipped into the Now-Loading gap). The director emits them
+-- after its fade-in delegate instead, and the go-latch below holds the
+-- rest of the duty. (Garlemald-Server #46, round 7.)
 function onZoneIn(player, contentArea, director)
-	player:SendGameMessage(GetWorldMaster(), TEXT_PROTECT_SISIPU, 0x20);
-	player:SendGameMessage(GetWorldMaster(), TEXT_BOUND_BY_DUTY, 0x20);
-	player:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 30);
 end
 
 function onDestroy()
@@ -213,9 +211,15 @@ function onUpdate(tick, area)
 	local state = escortState[owner.actorId]
 	if not state or state.done then return end
 
+	-- Hold EVERYTHING (clock, waypoints, barks, wave beats) until the
+	-- director's post-warp chain reports the client faded-in and
+	-- interactive — otherwise the duty runs under the Now-Loading veil
+	-- and the 30-minute clock cheats the player (round 7).
+	if not man0l1EscortGo then return end
+
 	-- ---- Timer (retail: 30-minute limit, reminder lines) ----
 	-- `tick` is the ticker's monotonic 500 ms frame counter; latch the
-	-- first post-warp frame and measure elapsed from there.
+	-- first faded-in frame and measure elapsed from there.
 	state.startTick = state.startTick or tick;
 	local elapsed = tick - state.startTick;
 	if (not state.reminded10) and elapsed >= REMIND_10MIN_TICKS then

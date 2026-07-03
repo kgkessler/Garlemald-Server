@@ -1014,6 +1014,19 @@ impl LuaEngine {
     /// Mirrors C# `LuaEngine.CallLuaFunction(player, contentArea,
     /// "onCreate", true)` semantics, sized for the content/onCreate
     /// path specifically.
+    /// Test-only: evaluate a raw chunk inside a script's cached VM.
+    /// Lets content-script tests simulate cross-script state the
+    /// production flow sets from ANOTHER script in the same VM — e.g.
+    /// QuestDirectorMan0l101 releasing the `man0l1EscortGo` latch after
+    /// its post-warp fade chain (round 7).
+    #[cfg(test)]
+    pub(crate) fn eval_in_script_vm(&self, script_path: &Path, chunk: &str) -> Result<()> {
+        let (lua, _queue) = self.load_script(script_path)?;
+        lua.load(chunk)
+            .exec()
+            .map_err(|e| anyhow::anyhow!("test chunk failed: {e}"))
+    }
+
     pub fn call_content_hook(
         &self,
         script_path: &Path,
@@ -2691,6 +2704,13 @@ mod tests {
             "onCreate must spawn Sisipu (25) + 8 ankle biters (26-33, seed/070 zone-128 route)",
         );
 
+        // Simulate the director's post-warp release (round 7): production
+        // QuestDirectorMan0l101 sets the latch after its fade-in +
+        // TtrBlkNml001 chain; until then onUpdate holds the whole duty.
+        engine
+            .eval_in_script_vm(&script_path, "man0l1EscortGo = true")
+            .expect("latch release");
+
         let escort_actor =
             |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
                 actor_id: 0x4008_0001,
@@ -2865,6 +2885,12 @@ mod tests {
             hp_locks, 1,
             "only the PLAYER keeps the MinimumHpLock floor — Sisipu takes real damage",
         );
+
+        // Simulate the director's post-warp release (round 7) — see the
+        // walks_holds_and_signals test for the rationale.
+        engine
+            .eval_in_script_vm(&script_path, "man0l1EscortGo = true")
+            .expect("latch release");
 
         let escort_actor =
             |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {

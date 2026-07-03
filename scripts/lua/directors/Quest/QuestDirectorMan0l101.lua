@@ -9,7 +9,9 @@ require ("quests/man/man0l1")
 -- QuestDirectorMan0l001 coroutine pattern:
 --
 --   client noticeEvent kick (startMan0l1Content's KickEvent) →
---   onEventStarted closes the kick and parks on "escortComplete" →
+--   onEventStarted runs the post-warp chain (fade-in 604_3 →
+--   processTtrBlkNml001 tutorial block → entry text → EndEvent →
+--   escort go-latch) and parks on "escortComplete" →
 --   the content script's onUpdate fires the signal once Sisipu has led
 --   the player down the zone-128 road to the lighthouse approach
 --   (waypoint arrival — NOT a kill count; the ambush waves are
@@ -36,16 +38,51 @@ end
 function onEventStarted(player, actor, triggerName)
 	man0l1Quest = player:GetQuest("Man0l1");
 
-	-- This noticeEvent kick fires AFTER the duty warp into the zone-128
-	-- content instance (the Rust side defers the 0x012F TX to the
-	-- post-warp ack). The cutscene's after-warp veil was already
-	-- neutralised PRE-warp at the gate (man0l1.lua startMan0l1Content:
-	-- processEvent604 → processEvent604_3 → EndEvent →
-	-- DoZoneChangeContent), so the warp itself is a clean man0g0-style
-	-- warp and the client lands interactive. Just close the kick and
-	-- park on completion. NO tutorial-mode handlers (orderTutorialMode
-	-- would silently re-gate the menu). (Garlemald-Server #46.)
+	-- ROUND 7 — the tutorial-proven post-warp chain. The kick is emitted
+	-- WITH the pre-warp content trio (apply_do_zone_change_content 3a);
+	-- the client queues the 0x012F across the reload and answers this
+	-- noticeEvent mid-load, ~1s before its RX 0x0007 (wire-proven
+	-- 2026-07-03 14:24, identical to the man0l0 tutorial at 05:50). On a
+	-- same-map wipe+0x10 reload NOTHING auto-fades the client in — both
+	-- working tutorials drop the Now-Loading veil from the director's
+	-- FIRST post-kick delegate (processTtrBtl001 ends in
+	-- startFadeInCutSceneDefault, answered post-load). Answering with a
+	-- bare EndEvent instead (the previous shape) leaves the client
+	-- veiled forever — the 14:24 hang. (Garlemald-Server #46, round 7.)
+	--
+	-- (a) Post-warp fade-in: processEvent604_3 = startFadeInCutSceneDefault
+	--     (_waitForMapLoaded → _fadeIn(1) → _waitForFading) — the reload
+	--     has finished by the time the client executes it, so this is the
+	--     veil-dropper, in exactly the slot the tutorials use.
+	callClientFunction(player, "delegateEvent", player, man0l1Quest, "processEvent604_3");
+
+	-- (b) The retail escort-start tutorial block (decoded client
+	--     Man0l1.lua:2431-2497): orderTutorialMode-if-needed, camera
+	--     aim/lookAt + gesture schedules on the 4000604 Sisipu anchor,
+	--     sayFreeDisplayName(4000604, quest, 337) ("Oschon's Torch is due
+	--     south..."), setTutorialMask(false x5, 3), cancels. Unresolvable
+	--     client refs inside the block degrade gracefully (the man0l0
+	--     tutorial runs processTtrBtl001 past its own 1900006 anchor with
+	--     no server-side mapping) — worst case the camera pan/named say
+	--     don't render; the content script's bark loop re-delivers 337.
+	callClientFunction(player, "delegateEvent", player, man0l1Quest, "processTtrBlkNml001");
+
+	-- (c) Retail entry text, now that the client is faded in and can see
+	--     the log (retail order after the journal update + 34108, which
+	--     both already rode the warp). Ids are UNVERIFIED candidates
+	--     (man0l1.lua TEXT_*), pending an in-client probe.
+	player:SendGameMessage(GetWorldMaster(), TEXT_PROTECT_SISIPU, 0x20);
+	player:SendGameMessage(GetWorldMaster(), TEXT_BOUND_BY_DUTY, 0x20);
+	player:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 30);
+
+	-- (d) Close the kick — post-load, like the tutorials (their
+	--     noticeEvent EndEvent goes out well after the reload).
 	player:EndEvent();
+
+	-- (e) Release the duty: the content script's onUpdate holds the
+	--     30-minute clock, Sisipu's waypoint walk and the bark loop on
+	--     this latch so the escort doesn't run under the veil.
+	man0l1EscortGo = true;
 
 	waitForSignal("escortComplete");
 

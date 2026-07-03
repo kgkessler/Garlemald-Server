@@ -165,6 +165,17 @@ TEXT_BOUND_BY_DUTY		= 34110;	-- UNVERIFIED candidate: "You are now bound by duty
 TEXT_UNBOUND_FROM_DUTY	= 34111;	-- UNVERIFIED candidate: "You are no longer bound by duty."
 TEXT_TIME_REMAINING		= 34112;	-- UNVERIFIED candidate: "There are <param> minutes remaining."
 
+-- Escort go-latch (round 7): set TRUE by QuestDirectorMan0l101 once its
+-- post-warp fade-in + tutorial-block delegate chain has the client
+-- interactive; SimpleContentMan0l101.onUpdate holds the 30-minute clock,
+-- Sisipu's waypoint walk and the bark loop until then, so the duty
+-- doesn't run under the Now-Loading veil. Reset FALSE by the content
+-- script's onCreate on every fresh run (retry-safe). Shared via this
+-- module because both the director and the content script require/see
+-- man0l1's globals (single-runner assumption — same documented limit as
+-- the sendSignal names). (Garlemald-Server #46, round 7.)
+man0l1EscortGo = false;
+
 -- Sisipu's on-the-road guidance bark ("Oschon's Torch is due south...")
 -- — man0l1 QUEST-sheet say id 337, CONFIRMED in the decoded client
 -- processTtrBlkNml001. (Her SEQ_055 camp talk is say 119 — that one
@@ -952,9 +963,11 @@ function startMan0l1Content(player, quest)
 	-- The same-map reload is SOLVED: apply_do_zone_change_content's wipe
 	-- + 0x00E2(0x10) recipe (DeleteAllActors + force-reload latch +
 	-- immediate bundle) completes same-map content warps — capture-proven
-	-- on the 193→193 / 184→184 tutorial transitions — because
-	-- processEvent604_3 below neutralises the cutscene's after-warp veil
-	-- IN PLACE before the warp (the veil, not the map resource, was the
+	-- on the 193→193 / 184→184 tutorial transitions. The Now-Loading veil
+	-- over the destination is dropped POST-warp by the director's fade
+	-- delegate chain (QuestDirectorMan0l101 onEventStarted: 604_3 +
+	-- processTtrBlkNml001 — the exact slot processTtrBtl001 occupies in
+	-- both working tutorials; the veil, not the map resource, was the
 	-- original hang; see seed/066 for the superseded zone-129 workaround
 	-- rationale).
 	-- ROLLBACK: flip the 6th CreateContentArea arg back to 129 and the
@@ -981,22 +994,22 @@ function startMan0l1Content(player, quest)
 	--    NQCutScene("man0l604") + startFadeInCutSceneAfterWarp (== engine
 	--    _fadeInAfterWarp(), which ARMS a Now-Loading veil that waits for a warp).
 	--    callClientFunction parks until the cut plays + arms the fade, then returns.
+	--
+	--    NO pre-warp processEvent604_3 here (round 7). The old "neutralise
+	--    the veil in place" step was only ever validated in the zone-129
+	--    cross-map era; on the same-map wipe+0x10 warp it just flashes the
+	--    gate and the warp re-veils, and NOTHING then fades the client back
+	--    in — a same-map 0x10 reload fires no warp-END auto-fade. Both
+	--    working tutorials (man0g0/man0l0, 193→193 / 184→184) drop the veil
+	--    from the DIRECTOR's first post-kick delegate (processTtrBtl001 ends
+	--    in startFadeInCutSceneDefault) — QuestDirectorMan0l101 now does the
+	--    same (604_3 + processTtrBlkNml001 post-warp). Wire-proven
+	--    2026-07-03 14:24: byte-identical bundle to the tutorial, hung only
+	--    because the director answered the kick with a bare EndEvent and no
+	--    fade delegate. (Garlemald-Server #46, round 7.)
 	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
 
-	-- 2. NEUTRALISE the armed after-warp veil BEFORE warping. processEvent604_3 =
-	--    startFadeInCutSceneDefault (_waitForMapLoaded → _fadeIn(1) → _waitForFading):
-	--    the map is still the gate (loaded), so it fades the screen back in in place
-	--    and clears the _fadeInAfterWarp pending state. This is the load-bearing fix
-	--    (PROVEN root cause, packet-level + man0g0 contrast): the content warp itself
-	--    is byte-correct (0x0007 DeleteAllActors + 0x00E2(0x10) force-reload +
-	--    0x0005 SetMap + 0x00CE all delivered, client echoes RX 0x0007), and man0g0
-	--    does the IDENTICAL same-zone 0x10 warp successfully — the ONLY difference is
-	--    that man0g0 never arms an after-warp cutscene veil. With the veil cleared
-	--    here, the following warp is a clean man0g0-style warp whose warp-END resolves
-	--    normally → no stuck "Now Loading". (Garlemald-Server #46.)
-	callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
-
-	-- 3. Close the push event BEFORE the warp. An EndEvent (0x0131)
+	-- 2. Close the push event BEFORE the warp. An EndEvent (0x0131)
 	--    landing mid-reload loses the client's _onPostEvent teardown →
 	--    the session-global desktopWidgetMode-16 mask ("tutorial mode"
 	--    menu lock) — wire-proven; 0x0131 ahead of the 0x00E2 reload
@@ -1004,16 +1017,16 @@ function startMan0l1Content(player, quest)
 	--    transition (see onStart). (Garlemald-Server #46.)
 	player:EndEvent();
 
-	-- 4. Duty warp into the zone-128 gate-side content instance (escort
+	-- 3. Duty warp into the zone-128 gate-side content instance (escort
 	--    NPCs seeded on the southbound road — seed/070). spawnType 16
 	--    (0x10) → apply_do_zone_change_content force-reload branch
 	--    (34108 "You have entered an instance." + DeleteAllActors +
-	--    0x00E2(0x10) + zone-in bundle), same as man0g0. The rest of the
-	--    retail entry text ("Protect Sisipu from harm." / "You are now
-	--    bound by duty." / "There are 30 minutes remaining.") is emitted
-	--    post-warp by SimpleContentMan0l101.lua's onZoneIn — messages
-	--    queued here after the warp command would ship into the client's
-	--    Now-Loading gap (the man0l0 Hob-crash shape, see onStart).
+	--    0x00E2(0x10) + zone-in bundle), same as man0g0. The retail entry
+	--    text ("Protect Sisipu from harm." / "You are now bound by duty."
+	--    / "There are 30 minutes remaining.") is emitted by the DIRECTOR's
+	--    post-warp chain after the fade-in — anything queued here after
+	--    the warp command would ship into the client's Now-Loading gap
+	--    (the man0l0 Hob-crash shape, see onStart).
 	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 16);
 end
 
