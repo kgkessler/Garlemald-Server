@@ -35,21 +35,25 @@ require ("quests/man/man0l1")
 WALK_STEP = 1.6;             -- units per 500 ms tick (escort walking pace)
 HOLD_RADIUS = 28.0;          -- live mob within this of Sisipu/player → hold the walk
 ENGAGE_RADIUS = 18.0;        -- mob pulls onto the escort party inside this
-PLAYER_LEASH = 15.0;         -- Sisipu advances only while the player is within this
-WAYPOINT_RADIUS = 4.0;       -- close enough → next waypoint
-ARRIVAL_RADIUS = 20.0;       -- player+Sisipu inside this of the final waypoint → arrival
+PLAYER_LEASH = 15.0;         -- Sisipu > this from the player → close the gap directly
+WAYPOINT_RADIUS = 4.0;       -- close enough to the lead point → stop stepping
+ARRIVAL_RADIUS = 20.0;       -- player inside this of the lighthouse goal → arrival
+LEAD_DISTANCE = 5.0;         -- how far ahead of the player Sisipu paces while walking
+MOVE_EPSILON = 0.3;          -- player displacement/tick above this = "walking"
 TICKS_PER_SECOND = 2;
 ESCORT_LIMIT_TICKS = 30 * 60 * TICKS_PER_SECOND;    -- retail: "There are 30 minutes remaining."
 REMIND_10MIN_TICKS = 20 * 60 * TICKS_PER_SECOND;    -- 10 minutes remaining
 REMIND_5MIN_TICKS  = 25 * 60 * TICKS_PER_SECOND;    -- 5 minutes remaining
 BARK_INTERVAL_TICKS = 40;                           -- guidance bark every ~20 s
 
--- The southbound road, gate → lighthouse approach. Route-INTERPOLATED
--- between the gate (-63, 33, 164) and pmeteor's SEQ_055 camp warp
--- destination (137.44, 60.33, 1322.0) — exact retail positions are
--- unknowable (the 1.x HUD never drew XYZ); same derivation as the
--- seed/070 ambush clusters, flagged for in-client tuning. The last
--- entry is the arrival point.
+-- Ambush-cluster staging points + the arrival goal (ROUTE[#ROUTE]).
+-- Sisipu NO LONGER walks these as a fixed route (round 7e — the
+-- interpolated Y floated her over the ocean; the navmesh is a stub so
+-- there is no real path). She now paces the player; only the LAST entry
+-- is still used, as the lighthouse arrival goal (~pmeteor's SEQ_055 camp
+-- warp origin 137.44/60.33/1322). The intermediate rows document where
+-- seed/070's ankle-biter clusters sit along the road (proximity
+-- ambushes), flagged for in-client tuning.
 ROUTE = {
 	{ x = -34.9, y = 38.2, z = 250.0 },
 	{ x =  -2.7, y = 42.4, z = 450.0 },   -- wave 1 cluster (bnpc 26-28)
@@ -285,54 +289,69 @@ function onUpdate(tick, area)
 	end
 
 	-- ---- Arrival ----
-	-- Road clear and both Sisipu and the player inside the lighthouse-
-	-- approach radius → arrival bark → the director's kickEventContinue
-	-- machinery (processEvent605 echo → SEQ_055 → camp warp) takes over.
+	-- The PLAYER reaching the lighthouse-approach point ends the duty
+	-- (the journal objective marker points them there). Sisipu is leashed
+	-- to the player below, so she is always in range too. → arrival bark
+	-- → the director's kickEventContinue machinery (processEvent605 echo →
+	-- SEQ_055 → camp warp) takes over.
 	local goal = ROUTE[#ROUTE];
-	if state.wpIndex > #ROUTE
-		or (dist2d(escort.positionX, escort.positionZ, goal.x, goal.z) <= ARRIVAL_RADIUS
-			and dist2d(owner.positionX, owner.positionZ, goal.x, goal.z) <= ARRIVAL_RADIUS) then
+	if dist2d(owner.positionX, owner.positionZ, goal.x, goal.z) <= ARRIVAL_RADIUS then
 		state.done = true;
 		emitBark(owner, BARKS.arrival);
 		sendSignal("escortComplete");
 		return;
 	end
 
-	-- ---- Sisipu LEADS (retail: she walks the route, the player
-	-- follows; she waits when the player dawdles or a fight is on) ----
+	-- ---- Sisipu PACES the player (round 7e) ----
+	-- garlemald's navmesh is a STUB (StraightLineNavmesh) — no collision
+	-- mesh, no ground-height query — so a fixed interpolated waypoint
+	-- route walked Sisipu straight over the ocean at a floating Y (the
+	-- 21:xx report). Without a real path she instead moves RELATIVE TO THE
+	-- PLAYER, always at the PLAYER'S ground Y (the client-reported height
+	-- of walkable terrain): she leads a short step ahead in the player's
+	-- own movement direction and closes the gap when she falls behind, so
+	-- she can never leave ground the player can stand on and never floats.
+	-- The player navigates by the journal objective marker; Sisipu
+	-- accompanies. (Garlemald-Server #46, round 7e.)
+	local py = owner.positionY;
 	local dPlayer = dist2d(escort.positionX, escort.positionZ, owner.positionX, owner.positionZ);
+
+	-- Player's movement this tick (drives the lead direction).
+	local last = state.lastOwnerX and { x = state.lastOwnerX, z = state.lastOwnerZ } or nil;
+	state.lastOwnerX = owner.positionX;
+	state.lastOwnerZ = owner.positionZ;
+	local moved = last and dist2d(owner.positionX, owner.positionZ, last.x, last.z) or 0;
+
 	if dPlayer > PLAYER_LEASH then
-		-- Player lagging — she waits and (rate-limited) chides. The
-		-- dawdle say id is an unprobed nil slot today.
+		-- Fell behind (fight, cliff detour) — close straight to the player.
+		local d = math.max(dPlayer, 0.001);
+		local dx = (owner.positionX - escort.positionX) / d;
+		local dz = (owner.positionZ - escort.positionZ) / d;
+		local step = math.min(WALK_STEP, dPlayer);
+		escort:MoveTo(escort.positionX + dx * step, py, escort.positionZ + dz * step,
+			math.atan(dx, dz), 1);
+	elseif moved > MOVE_EPSILON then
+		-- Player walking — lead a short step ahead in their direction.
+		local mdx = (owner.positionX - last.x) / moved;
+		local mdz = (owner.positionZ - last.z) / moved;
+		local tx = owner.positionX + mdx * LEAD_DISTANCE;
+		local tz = owner.positionZ + mdz * LEAD_DISTANCE;
+		local d = dist2d(escort.positionX, escort.positionZ, tx, tz);
+		if d > WAYPOINT_RADIUS then
+			local dx = (tx - escort.positionX) / d;
+			local dz = (tz - escort.positionZ) / d;
+			local step = math.min(WALK_STEP, d);
+			escort:MoveTo(escort.positionX + dx * step, py, escort.positionZ + dz * step,
+				math.atan(dx, dz), 1);
+		end
+		-- Guidance bark ("Oschon's Torch is due south...") every ~20 s
+		-- while walking — say 337, wire-confirmed.
 		if state.lastBarkTick == nil or tick - state.lastBarkTick >= BARK_INTERVAL_TICKS then
 			state.lastBarkTick = tick;
-			emitBark(owner, BARKS.dawdle);
+			emitBark(owner, BARKS.guidance);
 		end
-		return;
 	end
-
-	local wp = ROUTE[state.wpIndex];
-	local d = dist2d(escort.positionX, escort.positionZ, wp.x, wp.z);
-	if d <= WAYPOINT_RADIUS then
-		state.wpIndex = state.wpIndex + 1;
-		return;
-	end
-	local step = math.min(WALK_STEP, d);
-	local dx = (wp.x - escort.positionX) / d;
-	local dz = (wp.z - escort.positionZ) / d;
-	escort:MoveTo(
-		escort.positionX + dx * step,
-		wp.y,
-		escort.positionZ + dz * step,
-		math.atan(dx, dz),
-		1)   -- moveState 1 = walk
-
-	-- Guidance bark ("Oschon's Torch is due south...") every ~20 s of
-	-- walking — say 337, wire-confirmed.
-	if state.lastBarkTick == nil or tick - state.lastBarkTick >= BARK_INTERVAL_TICKS then
-		state.lastBarkTick = tick;
-		emitBark(owner, BARKS.guidance);
-	end
+	-- Player idle and Sisipu in leash range → she holds (no move).
 end
 
 -- Leave-duty teardown (the commandContent confirmed-leave, driven from

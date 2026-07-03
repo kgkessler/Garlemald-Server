@@ -2738,11 +2738,14 @@ mod tests {
             snap
         };
 
-        // Tick 1 — road clear (the only live mob is the far third
-        // cluster), player at her side: Sisipu LEADS toward ROUTE[1]
-        // (-34.9, 38.2, 250) from her seed/070 spawn (-49, 36.43, 162),
-        // so a walking step must move her along the route (z increasing
-        // above 162, x increasing above -49).
+        // Round 7e — Sisipu PACES the player (no fixed waypoint route;
+        // the navmesh is a stub). Tick 1a SEEDS the player's last
+        // position (first tick has no movement delta, so no lead step
+        // yet). Tick 1b advances the player +12 in z (walking toward the
+        // goal) with the road clear (only the far third-cluster mob
+        // live), and Sisipu must lead a step in the player's movement
+        // direction — z increasing above her spawn 162 — at the PLAYER'S
+        // ground Y (36), never her interpolated spawn Y.
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
         area.players.push(near_player((-52.0, 36.0, 158.0)));
@@ -2750,20 +2753,30 @@ mod tests {
             .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
         area.monsters
             .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
-        let result = engine.call_content_on_update(&script_path, 1, area);
-        assert!(result.error.is_none(), "tick1: {:?}", result.error);
+        let seed = engine.call_content_on_update(&script_path, 1, area);
+        assert!(seed.error.is_none(), "tick1a: {:?}", seed.error);
+
+        let q = CommandQueue::new();
+        let mut area = sample_content_area(q.clone());
+        area.players.push(near_player((-52.0, 36.0, 170.0))); // walked +12 z
+        area.allies
+            .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
+        area.monsters
+            .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
+        let result = engine.call_content_on_update(&script_path, 2, area);
+        assert!(result.error.is_none(), "tick1b: {:?}", result.error);
         let step = result.commands.iter().find_map(|c| match c {
             LuaCommand::MoveActorToPosition {
                 actor_id: 0x4008_0001,
-                x,
+                y,
                 z,
                 ..
-            } => Some((*x, *z)),
+            } => Some((*y, *z)),
             _ => None,
         });
         assert!(
-            step.is_some_and(|(x, z)| z > 162.0 && x > -49.0),
-            "clear road + close player must step the escort toward ROUTE[1]; got {:?}",
+            step.is_some_and(|(y, z)| z > 162.0 && (y - 36.0).abs() < 0.01),
+            "player walking forward must lead Sisipu a step in that direction at the player's Y; got {:?}",
             result.commands,
         );
 
