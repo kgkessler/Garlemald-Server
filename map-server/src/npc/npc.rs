@@ -118,7 +118,14 @@ impl Npc {
         custom_display_name: Option<String>,
     ) -> Self {
         let composite_id = (4u32 << 28) | (area_id << 19) | (actor_number & 0x7FFFF);
+        let unique_id: String = unique_id.into();
         let mut character = Character::new(composite_id);
+        // Mirror the seed uniqueId onto BaseActor so the registry-
+        // reachable Character (all the event dispatcher ever sees)
+        // can resolve `unique/<zone>/<class>/<uniqueId>.lua` — the
+        // wrapper field below is kept for the spawner-side callers.
+        // (Garlemald-Server #46, round 5 — Baderon default talk.)
+        character.base.unique_id = unique_id.clone();
         character.base.position_x = x;
         character.base.position_y = y;
         character.base.position_z = z;
@@ -182,7 +189,7 @@ impl Npc {
         Self {
             character,
             actor_class_id: actor_class.actor_class_id,
-            unique_id: unique_id.into(),
+            unique_id,
             npc_work,
             npc_spawn_type: NpcSpawnType::NORMAL,
             class_path,

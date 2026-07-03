@@ -28,8 +28,17 @@ function init(npc)
 	return false, false, 0, 0;	
 end
 
-function onEventStarted(player, aetheryte, triggerName)	
-	
+function onEventStarted(player, aetheryte, triggerName)
+
+	-- First-touch attunement — mirrors AetheryteParent.lua (see its
+	-- onEventStarted comment): unlock the touched gate's own node before
+	-- anything else so TeleportCommand.lua's attunement gate opens for it.
+	-- (Garlemald-Server #46, round 5.)
+	local touchedAetheryteId = aetheryte:GetActorClassId();
+	if (player:HasAetheryteNodeUnlocked(touchedAetheryteId) == false) then
+		player:UnlockAetheryteNode(touchedAetheryteId);
+	end
+
 	if (player:GetGuildleveDirector() ~= nil) then
 		doGuildleveMenu(player, aetheryte);
 	else

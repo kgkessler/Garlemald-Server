@@ -62,6 +62,16 @@ pub const MAIN_STATE_MOUNTED: u16 = 0x0F;
 pub struct BaseActor {
     pub actor_id: u32,
     pub actor_name: String,
+    /// Seed `uniqueId` from `server_eventnpc_spawn_locations`
+    /// ("baderon", "aergwynt", …) — distinct from the generated
+    /// `actor_name` ("pplStd_…@…"). The unique-script resolver
+    /// (`unique/<zone>/<class>/<uniqueId>.lua`) keys on THIS, so the
+    /// event dispatcher needs it registry-reachable; resolving with
+    /// `actor_name` never matched a unique override and every named
+    /// populace NPC fell through to the base class script
+    /// (Garlemald-Server #46, round 5 — Baderon default talk). Empty
+    /// for players and for NPCs spawned without a seed uniqueId.
+    pub unique_id: String,
     pub display_name_id: u32,
     pub custom_display_name: String,
     pub current_main_state: u16,
@@ -294,6 +304,18 @@ pub struct CharaState {
     /// authoritative runtime copy; `PlayerState.current_title` stays as
     /// the login-DTO shape (same split as the GC / homepoint fields).
     pub current_title: u32,
+    /// Attuned aetherytes (`characters_aetherytes`, migration 068),
+    /// hydrated at session-begin — same registry-reachability
+    /// motivation as `homepoint` / `npc_linkshells` above. Keyed by
+    /// aetheryte actor class id (128xxxx, the `characters.homepoint`
+    /// namespace). Mutated by the `UnlockAetheryte` apply arm
+    /// (first-touch attunement, Garlemald-Server #46 round 5) and by
+    /// `SetHomePoint` (setting home implies attunement — the pre-068
+    /// in-memory behaviour of `Player::set_home_point`). Read by
+    /// `PlayerSnapshot::unlocked_aetherytes`, which feeds the
+    /// `HasAetheryteNodeUnlocked` gates in AetheryteParent.lua /
+    /// TeleportCommand.lua.
+    pub unlocked_aetherytes: std::collections::HashSet<u32>,
     /// "Standard NPC" / Path Companion scratchpad — set by C#
     /// `Player.SetSNpc(nickname, actorClassId, classType)` in the
     /// man200 MSQ branch. Persisted to migration-051 columns
@@ -385,6 +407,7 @@ impl Default for CharaState {
             guildleves_local: Vec::new(),
             guildleves_regional: Vec::new(),
             current_title: 0,
+            unlocked_aetherytes: std::collections::HashSet::new(),
             snpc_nickname: String::new(),
             snpc_skin: 0,
             snpc_personality: 0,

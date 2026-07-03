@@ -1981,6 +1981,28 @@ impl UserData for LuaPlayer {
         methods.add_method("HasAetheryteNodeUnlocked", |_, this, id: u32| {
             Ok(this.snapshot.unlocked_aetherytes.contains(&id))
         });
+        // `player:UnlockAetheryteNode(id)` — first-touch aetheryte
+        // attunement (Garlemald-Server #46, round 5). Companion write
+        // half of `HasAetheryteNodeUnlocked` above; pushed by
+        // AetheryteParent.lua / AetheryteChild.lua `onEventStarted`.
+        // The apply arm (`apply_unlock_aetheryte`, quest_apply.rs)
+        // mutates `CharaState::unlocked_aetherytes` + persists to
+        // `characters_aetherytes`. NOTE the usual snapshot staleness:
+        // a `HasAetheryteNodeUnlocked(id)` read *later in the same
+        // hook* still sees the pre-unlock snapshot (same accepted
+        // pattern as `ReadNpcLsMsg`'s npc_ls_from note) — the scripts
+        // guard with `if not Has... then Unlock... end` so this never
+        // double-fires in practice.
+        methods.add_method("UnlockAetheryteNode", |_, this, id: u32| {
+            push(
+                &this.queue,
+                LuaCommand::UnlockAetheryte {
+                    player_id: this.snapshot.actor_id,
+                    aetheryte_id: id,
+                },
+            );
+            Ok(())
+        });
         methods.add_method("HasTrait", |_, this, id: u16| {
             Ok(this.snapshot.traits.contains(&id))
         });
@@ -5143,7 +5165,6 @@ impl UserData for LuaQuestHandle {
         const NPCLS_INACTIVE: u8 = 1;
         const NPCLS_ACTIVE: u8 = 2;
         const NPCLS_ALERT: u8 = 3;
-        const MSG_GLOW_EMANATES: u32 = 25119;
         methods.add_method("NewNpcLsMsg", |_, this, from: u32| {
             // Mirror C# `Quest::NewNpcLsMsg`:
             // 1. owner.AddNpcLs(from) if !HasNpcLs (PlayerSetNpcLs
@@ -5153,8 +5174,14 @@ impl UserData for LuaQuestHandle {
             //    (now persisted via migration 050).
             // 3. owner.SetNpcLs(from, NPCLS_ALERT) — flip the icon
             //    glow on.
-            // 4. Send the "A glow emanates from the <NpcLs> linkpearl"
-            //    system message (id 25119).
+            // 4. The "A glow emanates from the <NpcLs> linkpearl"
+            //    system message (text sheet 25119) is emitted by the
+            //    QuestSetNpcLsFrom apply arm
+            //    (`apply_quest_set_npc_ls_from`, quest_apply.rs) as a
+            //    real 25119 text-sheet packet — pmeteor Quest.cs:149
+            //    parity. No literal-text SendMessage here: pushing the
+            //    placeholder string "[sheet:25119:N]" alongside leaked
+            //    the raw sheet reference into the client chat log.
             push(
                 &this.queue,
                 LuaCommand::QuestSetNpcLsFrom {
@@ -5169,15 +5196,6 @@ impl UserData for LuaQuestHandle {
                     player_id: this.player_id,
                     npc_ls_id: from,
                     state: NPCLS_ALERT,
-                },
-            );
-            push(
-                &this.queue,
-                LuaCommand::SendMessage {
-                    actor_id: this.player_id,
-                    message_type: 0x20,
-                    sender: String::new(),
-                    text: format!("[sheet:{}:{}]", MSG_GLOW_EMANATES, from),
                 },
             );
             Ok(())

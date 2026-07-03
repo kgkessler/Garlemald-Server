@@ -3051,16 +3051,14 @@ impl WorldManager {
         //      + player's name. Empty X08 is what the client treats
         //      as malformed and hard-crashes on.
         {
-            const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
-            const GROUP_TYPE_PARTY: u32 = 0x2711;
-            let group_index: u64 = PARTY_SOLO_SELF_FLAG | (actor_id as u64);
             let location_code = zone_actor_id as u64;
             let sequence_id = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default();
             // Roster: the player/leader row first (localized_name=-1 ⇒
-            // use custom name; flag1=false = not leader flag; is_online=
+            // use custom name; is_self=true ⇒ row flag 0 — retail flags
+            // every NON-self row, see `row_for_actor`'s doc; is_online=
             // true since they're obviously logged in), then one row per
             // `session.transient_party_members` entry — the accumulated
             // `currentParty:AddMember` calls from content scripts (e.g.
@@ -3069,23 +3067,28 @@ impl WorldManager {
             // roster, but re-emitting the SAME group_index here with a
             // hardcoded single-member roster made the client REPLACE it,
             // emptying the party HUD at zone-in. Name resolution mirrors
-            // `processor::apply_party_add_member`: registry display name,
-            // synthetic `bnpc_<id>` fallback for a not-yet-registered
-            // member (rare race window). (Garlemald-Server #46.)
+            // `quest_apply::emit_party_group_trio`: registry display
+            // name, synthetic `bnpc_<id>` fallback for a not-yet-
+            // registered member (rare race window). (Garlemald-Server
+            // #46.)
             let mut members = Vec::with_capacity(1 + session.transient_party_members.len());
             members.push(tx::groups::GroupMember::row_for_actor(
                 actor_id,
                 &actor_name,
                 display_name_id,
+                true,
             ));
-            // (id, name, position) per non-self roster member — position
-            // feeds the per-member 0x018D map marker below; `None` when
-            // the member isn't in the registry yet. Row encoding via
-            // `GroupMember::row_for_actor`: an NPC ally (empty display
-            // name) must ship `localized_name = display_name_id` or the
-            // client's PartyParameterWidget draws nothing for the row
-            // (see the helper's doc — Garlemald-Server #46, round 4).
-            let mut member_details: Vec<(u32, String, Option<common::Vector3>)> = Vec::new();
+            // (id, name, display_name_id, position) per non-self roster
+            // member — position feeds the per-member 0x018D map marker
+            // below; `None` when the member isn't in the registry yet;
+            // display_name_id feeds the 0x018B row (real id for
+            // game-data NPCs, 0xFFFFFFFF for custom-named actors). Row
+            // encoding via `GroupMember::row_for_actor`: an NPC ally
+            // (empty display name) must ship `localized_name =
+            // display_name_id` or the client's PartyParameterWidget
+            // draws nothing for the row (see the helper's doc —
+            // Garlemald-Server #46, round 4).
+            let mut member_details: Vec<(u32, String, u32, Option<common::Vector3>)> = Vec::new();
             for &mid in &session.transient_party_members {
                 // Defensive: the transient list excludes the leader by
                 // convention (see `Session.transient_party_members`), but
@@ -3093,33 +3096,58 @@ impl WorldManager {
                 if mid == actor_id {
                     continue;
                 }
-                let (row, name, member_pos) = if let Some(h) = registry.get(mid).await {
-                    let c = h.character.read().await;
-                    (
-                        tx::groups::GroupMember::row_for_actor(
-                            mid,
-                            c.base.display_name(),
-                            c.base.display_name_id,
-                        ),
-                        c.base.display_name().to_string(),
-                        Some(c.base.position()),
-                    )
-                } else {
-                    tracing::warn!(
-                        session = session_id,
-                        member = format!("0x{mid:08X}"),
-                        "zone-in party roster: member not in registry, using placeholder name",
-                    );
-                    let placeholder = format!("bnpc_{mid:08X}");
-                    (
-                        tx::groups::GroupMember::row_for_actor(mid, &placeholder, 0),
-                        placeholder,
-                        None,
-                    )
-                };
-                member_details.push((mid, name, member_pos));
+                let (row, name, member_display_name_id, member_pos) =
+                    if let Some(h) = registry.get(mid).await {
+                        let c = h.character.read().await;
+                        // 0x018B display-name id follows the X08 row
+                        // convention: a game-data NPC (empty display
+                        // name) resolves by its localized id; a
+                        // custom-named actor ships 0xFFFFFFFF and the
+                        // name string wins.
+                        let dnid = if c.base.display_name().is_empty() {
+                            c.base.display_name_id
+                        } else {
+                            tx::groups::SET_GROUP_LAYOUT_ID_PLAYER_DISPLAY_NAME
+                        };
+                        (
+                            tx::groups::GroupMember::row_for_actor(
+                                mid,
+                                c.base.display_name(),
+                                c.base.display_name_id,
+                                false,
+                            ),
+                            c.base.display_name().to_string(),
+                            dnid,
+                            Some(c.base.position()),
+                        )
+                    } else {
+                        tracing::warn!(
+                            session = session_id,
+                            member = format!("0x{mid:08X}"),
+                            "zone-in party roster: member not in registry, using placeholder name",
+                        );
+                        let placeholder = format!("bnpc_{mid:08X}");
+                        (
+                            tx::groups::GroupMember::row_for_actor(mid, &placeholder, 0, false),
+                            placeholder,
+                            tx::groups::SET_GROUP_LAYOUT_ID_PLAYER_DISPLAY_NAME,
+                            None,
+                        )
+                    };
+                member_details.push((mid, name, member_display_name_id, member_pos));
                 members.push(row);
             }
+            // Group id from the shared fresh-per-composition scheme:
+            // solo keeps the immutable login id; a multi-member roster
+            // ships under a NEW id keyed by the session's composition
+            // ordinal — re-sending a changed roster under an id the
+            // client already registered is ignored (#46 round 5 wire
+            // finding; see `party_group_index`'s doc). The 0x018D/
+            // 0x018B companions below MUST carry this same id: retail's
+            // `invite_join_party.pcapng` shows one id shared by the
+            // party trio (frame#92) and every 0x018D (frames #9..#96).
+            let group_index =
+                tx::groups::party_group_index(actor_id, members.len(), session.party_group_ordinal);
             let mut offset = 0usize;
             let group_pkts = vec![
                 tx::groups::build_group_header(
@@ -3127,7 +3155,7 @@ impl WorldManager {
                     location_code,
                     sequence_id,
                     group_index,
-                    GROUP_TYPE_PARTY,
+                    tx::groups::GROUP_TYPE_PLAYER_PARTY,
                     -1,
                     "",
                     members.len() as u32,
@@ -3182,7 +3210,7 @@ impl WorldManager {
                 z: position.z,
                 orientation: rotation,
             }];
-            for (mid, _name, member_pos) in &member_details {
+            for (mid, _name, _dnid, member_pos) in &member_details {
                 let Some(p) = member_pos else { continue };
                 markers.push(tx::groups::PartyMapMarker {
                     player_id: *mid,
@@ -3195,8 +3223,8 @@ impl WorldManager {
             }
             let mut sub = tx::groups::build_party_map_marker_update(
                 actor_id,
-                tx::groups::PARTY_MAP_MARKER_SOLO_GROUP_ID,
-                tx::groups::PARTY_MAP_MARKER_GROUP_TYPE_PLAYER_PARTY,
+                group_index,
+                tx::groups::GROUP_TYPE_PLAYER_PARTY,
                 &markers,
             );
             sub.set_target_id(session_id);
@@ -3224,7 +3252,7 @@ impl WorldManager {
             // player is logged in).
             let mut sub = tx::groups::build_set_group_layout_id(
                 actor_id,
-                tx::groups::PARTY_MAP_MARKER_SOLO_GROUP_ID,
+                group_index,
                 actor_id,
                 tx::groups::SET_GROUP_LAYOUT_ID_PLAYER_DISPLAY_NAME,
                 0,
@@ -3234,16 +3262,18 @@ impl WorldManager {
             sub.set_target_id(session_id);
             client.send_bytes(sub.to_bytes()).await;
             // …and one row per transient roster member. Display-name id
-            // follows the X08 roster convention above (localized_name=-1
-            // ⇒ the name string wins), matching how the pre-warp
-            // `apply_party_add_member` trio already presented these
-            // members to the client.
-            for (mid, name, _member_pos) in &member_details {
+            // follows the X08 roster convention above: a game-data NPC
+            // ally (empty display name) ships its REAL localized id so
+            // the client resolves the row label from its text sheets;
+            // custom-named actors ship 0xFFFFFFFF and the name string
+            // wins. (#46 round 5 — these rows used to hardcode the
+            // player sentinel, leaving NPC rows label-less.)
+            for (mid, name, member_display_name_id, _member_pos) in &member_details {
                 let mut sub = tx::groups::build_set_group_layout_id(
                     actor_id,
-                    tx::groups::PARTY_MAP_MARKER_SOLO_GROUP_ID,
+                    group_index,
                     *mid,
-                    tx::groups::SET_GROUP_LAYOUT_ID_PLAYER_DISPLAY_NAME,
+                    *member_display_name_id,
                     0,
                     1,
                     name,

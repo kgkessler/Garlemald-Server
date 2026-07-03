@@ -123,6 +123,18 @@ pub struct Session {
     /// added at broadcast time so the slot[0]=requester convention
     /// stays consistent. B2 of the SEQ_005 unblock plan.
     pub transient_party_members: Vec<u32>,
+    /// Party-composition ordinal — bumped every time
+    /// `transient_party_members` changes (member push in the
+    /// `PartyAddMember` appliers, roster clear in the
+    /// `ContentFinished` teardown). Feeds
+    /// `packets::send::groups::party_group_index`: the retail wire
+    /// finding (#46 round 5, vs `invite_join_party.pcapng`) is that
+    /// the 1.x client registers a party group id ONCE and ignores
+    /// roster changes re-sent under an id it already holds — so every
+    /// multi-member composition must ship the trio under a FRESH
+    /// group_index. Solo emissions ignore this and keep the immutable
+    /// login id.
+    pub party_group_ordinal: u32,
     /// Per-director transient roster, keyed by `director_actor_id`.
     /// Same idea as `transient_party_members` but for directors —
     /// accumulates as `director:AddMember(actor)` fires (combat

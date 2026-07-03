@@ -144,24 +144,20 @@ NPCLS_MSGS = {
 	{161, 162, 163, 164}
 };
 
--- Stage the Baderon-recipe AfterQuestWarpDirector trio ahead of a
--- same-map warp. Every Limsa 230/133-family transition (public<->private
--- flips, intra-family moves) reuses already-resident geometry, so the
--- client's 0x00E2-scheduled reload has no completion path — RX 0x0007
--- never comes and the Now-Loading veil (whether armed by a cutscene's
--- startFadeInCutSceneAfterWarp or by the reload itself) never clears.
--- The kick is deferred by the login arm until after the zone-in bundle;
--- the client's noticeEvent -> onNotice -> EndEvent round-trip runs
--- MyPlayer slot 66 _fadeInNowLoadingForNoticeEventJustInArea, clearing
--- the veil (wire-proven 04:23:21, seq000_onTalk). Call this immediately
--- BEFORE the warp, after player:EndEvent(). (Garlemald-Server #46, r2.)
-local function stageAfterQuestWarpDirector(player)
-	local director = GetWorldManager():GetArea(player:GetZoneID()):CreateDirector("AfterQuestWarpDirector", false);
-	player:AddDirector(director);
-	director:StartDirector(true);
-	player:SetLoginDirector(director);
-	player:KickEvent(director, "noticeEvent", true);
-end
+-- Round 5 (Garlemald-Server #46): the round-2 stageAfterQuestWarpDirector
+-- helper and its per-warp kicks are gone. Wire-proven: the wipe +
+-- 0x00E2(0x10) warp recipe completes on its own — warp-END (RX 0x0007)
+-- arrives independent of any kick — so the Now-Loading veil never needed
+-- the noticeEvent round-trip. Worse, the kick actively broke the session:
+-- the client orders desktopWidgetMode(16) on EVERY event begin
+-- (_onPreEvent) and only _onPostEvent cancels it — a kick whose EndEvent
+-- lands mid-reload loses that teardown and leaves the session-global
+-- desktopWidget masked (the "tutorial mode" menu lock). pmeteor stages
+-- this director at exactly ONE site: the Baderon SEQ_000→SEQ_003 beat
+-- (seq000_onTalk below), whose kicked noticeEvent drives the
+-- processEventTu_001 tutorial hook — that one is retail's design and
+-- stays. onNotice keeps its else→EndEvent arm as a safety net for it
+-- (and any stray kick).
 
 function onStart(player, quest)
 	quest:StartSequence(SEQ_000);
@@ -251,9 +247,6 @@ function onStateChange(player, quest, sequence)
 		-- onStateChange, then latches.
 		if (subseqMSK >= 4 and not data:GetFlag(FLAG_SEQ7_MSK_EXITED)) then
 			data:SetFlag(FLAG_SEQ7_MSK_EXITED);
-			-- Same-map private->public flip: needs the director kick or
-			-- the rescue itself hangs on Now Loading (see helper above).
-			stageAfterQuestWarpDirector(player);
 			GetWorldManager():WarpToPublicArea(player);
 		end
 	elseif (sequence == SEQ_035) then
@@ -333,9 +326,6 @@ function onTalk(player, quest, npc)
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent600");
 			quest:StartSequence(SEQ_040);
 			player:EndEvent();
-			-- processEvent600 arms the AfterWarp veil (decoded Man0l1.lua:1246)
-			-- and the warp below is same-map — director kick required.
-			stageAfterQuestWarpDirector(player);
 			GetWorldManager():WarpToPrivateArea(player, "PrivateAreaMasterPast", 5);
 		end
 	elseif (sequence == SEQ_040) then
@@ -380,9 +370,6 @@ function onTalk(player, quest, npc)
 				callClientFunction(player, "delegateEvent", player, quest, "processEvent615");
 				quest:StartSequence(SEQ_065);
 				player:EndEvent();
-				-- processEvent615 arms the AfterWarp veil (decoded
-				-- Man0l1.lua:1783); same-map warp — director kick required.
-				stageAfterQuestWarpDirector(player);
 				GetWorldManager():WarpToPublicArea(player, -42.0, 37.678, 155.694, -1.25);
 				return;
 			else
@@ -411,9 +398,6 @@ function onTalk(player, quest, npc)
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent630");
 			player:EndEvent();
 			quest:StartSequence(SEQ_080);
-			-- processEvent630 arms the AfterWarp veil (decoded
-			-- Man0l1.lua:1900); same-map warp — director kick required.
-			stageAfterQuestWarpDirector(player);
 			GetWorldManager():WarpToPrivateArea(player, "PrivateAreaMasterPast", 4, -504.985, 42.490, 433.712, 2.35);
 		end
 	elseif (sequence == SEQ_080) then
@@ -545,25 +529,6 @@ function seq007_onTalk(player, quest, npc, classId)
 			-- warp; the early return keeps that shared EndEvent serving the
 			-- other branches exactly once.
 			player:EndEvent();
-			-- processEvent050 ends with startFadeInCutSceneAfterWarp (decoded
-			-- Man0l1.lua:753) — it ARMS a Now-Loading veil, and the warp
-			-- below is same-map (230 public -> 230 PrivateAreaMasterPast/3,
-			-- both sea0Town01a): the client's scheduled reload has no
-			-- completion path (RX 0x0007 never comes), so the veil never
-			-- clears on its own. Instead of neutralizing the veil in place
-			-- (the round-1 processEvent604_3, which flashed the world back
-			-- in mid-transition), use the Baderon recipe (seq000_onTalk,
-			-- wire-proven 04:23:21): AfterQuestWarpDirector +
-			-- SetLoginDirector + KickEvent BEFORE the warp. The login arm
-			-- defers the kick until after the zone-in bundle; the client's
-			-- noticeEvent -> onNotice -> EndEvent round-trip runs MyPlayer
-			-- slot 66 _fadeInNowLoadingForNoticeEventJustInArea, clearing
-			-- the veil. (Garlemald-Server #46, round 2.)
-			local director = GetWorldManager():GetArea(230):CreateDirector("AfterQuestWarpDirector", false);
-			player:AddDirector(director);
-			director:StartDirector(true);
-			player:SetLoginDirector(director);
-			player:KickEvent(director, "noticeEvent", true);
 			GetWorldManager():WarpToPrivateArea(player, "PrivateAreaMasterPast", 3);
 			return;
 		elseif (subseqMSK == 0) then
@@ -650,26 +615,6 @@ function onPush(player, quest, npc)
 			data:IncCounter(CNTR_SEQ7_MSK);
 			player:EndEvent();
 			quest:UpdateENPCs();
-			-- processEvent040 ends with startFadeInCutSceneAfterWarp (decoded
-			-- Man0l1.lua:706), arming a Now-Loading veil — and the DoZoneChange
-			-- below is same-map (230 -> 230, sea0Town01a), where the client's
-			-- scheduled reload has no completion path (RX 0x0007 never comes),
-			-- so nothing ever tears the veil down. The round-1 fix neutralized
-			-- the veil in place with processEvent604_3, but that fades the
-			-- world IN for ~1.4s between cutscene and warp — the AfterWarp
-			-- veil is supposed to BE the transition cover. Use the Baderon
-			-- recipe instead (SEQ_000 branch above, wire-proven 04:23:21):
-			-- stage an AfterQuestWarpDirector + SetLoginDirector + KickEvent
-			-- BEFORE the warp. The login arm defers the kick until after the
-			-- zone-in bundle; the client's noticeEvent -> onNotice ->
-			-- EndEvent round-trip then runs MyPlayer slot 66
-			-- _fadeInNowLoadingForNoticeEventJustInArea, which clears the
-			-- veil. (Garlemald-Server #46, round 2.)
-			local director = GetWorldManager():GetArea(230):CreateDirector("AfterQuestWarpDirector", false);
-			player:AddDirector(director);
-			director:StartDirector(true);
-			player:SetLoginDirector(director);
-			player:KickEvent(director, "noticeEvent", true);
 			GetWorldManager():DoZoneChange(player, 230, nil, 0, 15, -620.0, 29.476, -70.050, 0.791);
 		elseif (classId == ECHO_EXIT_TRIGGER) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent060");
@@ -679,9 +624,9 @@ function onPush(player, quest, npc)
 			-- play on a live screen between processEvent060 and the exit
 			-- warp. The startFadeInCutSceneAfterWarp veil armed by 060
 			-- (decoded Man0l1.lua:1135) stays up as the transition cover
-			-- and the AfterQuestWarpDirector kick below clears it
-			-- post-warp — the same shape as the wire-proven-complete
-			-- MSK_TRIGGER and ISANDOREL sites. (Garlemald-Server #46, r4.)
+			-- and the warp's own warp-END (RX 0x0007) clears it
+			-- post-reload — no director kick (see the round-5 note above
+			-- onStart). (Garlemald-Server #46, r4/r5.)
 			data:IncCounter(CNTR_SEQ7_MSK);
 			if (data:GetCounter(CNTR_SEQ7_CUL) == 1) then
 				seq007_endSequence(player, quest);
@@ -692,21 +637,6 @@ function onPush(player, quest, npc)
 			data:SetFlag(FLAG_SEQ7_MSK_EXITED);
 			player:EndEvent();
 			quest:UpdateENPCs();
-			-- The WarpToPublicArea below is same-map (PrivateAreaMasterPast/3
-			-- -> 230 public, both sea0Town01a) — the client's scheduled
-			-- reload has no completion path (RX 0x0007 never comes), so the
-			-- Now-Loading veil would hang forever. Stage the Baderon-recipe
-			-- AfterQuestWarpDirector kick BEFORE the warp (seq000_onTalk,
-			-- wire-proven 04:23:21): the login arm defers it until after the
-			-- zone-in bundle, and the noticeEvent -> onNotice -> EndEvent
-			-- round-trip runs MyPlayer slot 66
-			-- _fadeInNowLoadingForNoticeEventJustInArea to clear the veil.
-			-- (Garlemald-Server #46, round 2.)
-			local director = GetWorldManager():GetArea(230):CreateDirector("AfterQuestWarpDirector", false);
-			player:AddDirector(director);
-			director:StartDirector(true);
-			player:SetLoginDirector(director);
-			player:KickEvent(director, "noticeEvent", true);
 			GetWorldManager():WarpToPublicArea(player);
 		end
 	elseif (sequence == SEQ_048) then
@@ -743,9 +673,6 @@ function onPush(player, quest, npc)
 			quest:NewNpcLsMsg(1);
 			quest:StartSequence(SEQ_090);
 			quest:UpdateENPCs();
-			-- processEvent635 arms the AfterWarp veil (decoded
-			-- Man0l1.lua:2176); same-map warp — director kick required.
-			stageAfterQuestWarpDirector(player);
 			GetWorldManager():WarpToPublicArea(player);
 		end
 	end
@@ -837,10 +764,6 @@ function onEmote(player, quest, npc, eventName)
 				if (eventName == "emoteDefault6") then
 					callClientFunction(player, "delegateEvent", player, quest, "processEvent602");
 					player:EndEvent();
-					-- processEvent602 arms no veil (decoded Man0l1.lua:1566,
-					-- talk turns only) but the same-map reload itself raises
-					-- Now Loading with no completion path — kick required.
-					stageAfterQuestWarpDirector(player);
 					GetWorldManager():WarpToPublicArea(player);
 					quest:StartSequence(SEQ_048);
 					return;
@@ -887,15 +810,14 @@ function onNotice(player, quest, target)
 		player:RunEventFunction("delegateEvent", player, quest, "processEventTu_001");
 		player:EndEvent();
 	else
-		-- Every other sequence: the noticeEvent is a pure Now-Loading
-		-- veil-clearer (the SEQ_007 musketeer warps and the teleport
-		-- belt-and-braces kick both stage an AfterQuestWarpDirector before
-		-- a same-map warp). The client only needs the EndEvent — receiving
-		-- it for the kicked noticeEvent runs MyPlayer slot 66
-		-- _fadeInNowLoadingForNoticeEventJustInArea, which tears the veil
-		-- down. NO quest state is touched here: leaving the event open
-		-- instead would event-lock the client (movement + menus dead, see
-		-- the SEQ_003 comment above). (Garlemald-Server #46, round 2.)
+		-- Safety net (round 5: the only staged AfterQuestWarpDirector kick
+		-- left is the Baderon SEQ_000→SEQ_003 beat — see the note above
+		-- onStart). A kicked noticeEvent that lands after the sequence has
+		-- already advanced (or any stray kick, e.g. the escort content
+		-- director's) still routes here, and the client only needs the
+		-- EndEvent to close it. NO quest state is touched: leaving the
+		-- event open instead would event-lock the client (movement + menus
+		-- dead, see the SEQ_003 comment above). (Garlemald-Server #46.)
 		player:EndEvent();
 	end
 

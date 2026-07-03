@@ -355,6 +355,14 @@ impl Player {
 
     pub fn set_home_point(&mut self, aetheryte_id: u32) {
         self.player.homepoint = aetheryte_id;
+        // Setting home implies attunement. This helper is pure (no DB
+        // handle in scope — see the module doc); the durable half
+        // lives in the `SetHomePoint` apply arm
+        // (`PacketProcessor::apply_set_home_point`), which mirrors
+        // this insert onto the registry-reachable
+        // `CharaState::unlocked_aetherytes` and persists it via
+        // `db.insert_character_aetheryte` (`characters_aetherytes`,
+        // migration 068). (Garlemald-Server #46, round 5.)
         self.helpers.unlocked_aetherytes.insert(aetheryte_id);
     }
 

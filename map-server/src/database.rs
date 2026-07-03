@@ -2482,6 +2482,49 @@ impl Database {
         Ok(())
     }
 
+    /// Attuned-aetheryte write-through (`characters_aetherytes`,
+    /// migration 068 — Garlemald-Server #46, round 5). INSERT OR
+    /// IGNORE keeps re-touching an already-attuned aetheryte (and the
+    /// `SetHomePoint` implied-attunement path) idempotent against the
+    /// (characterId, aetheryteId) primary key. `aetheryte_id` is the
+    /// aetheryte's actor class id (128xxxx — the `characters.homepoint`
+    /// namespace).
+    pub async fn insert_character_aetheryte(&self, chara_id: u32, aetheryte_id: u32) -> Result<()> {
+        self.conn
+            .call_db(move |c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO characters_aetherytes (characterId, aetheryteId)
+                     VALUES (:cid, :aid)",
+                    named_params! { ":cid": chara_id, ":aid": aetheryte_id },
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Load the character's attuned-aetheryte set for session-begin
+    /// hydration into `CharaState::unlocked_aetherytes` — the read
+    /// half of [`Self::insert_character_aetheryte`]. Migration 068
+    /// back-fills each existing character's non-zero homepoint, so
+    /// pre-068 characters keep the one attunement the old in-memory
+    /// path recorded.
+    pub async fn load_character_aetherytes(&self, chara_id: u32) -> Result<Vec<u32>> {
+        let rows = self
+            .conn
+            .call_db(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT aetheryteId FROM characters_aetherytes WHERE characterId = :cid",
+                )?;
+                let rows: Vec<u32> = stmt
+                    .query_map(named_params! { ":cid": chara_id }, |r| r.get::<_, u32>(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
     // =======================================================================
     // Quests / guildleves
     // =======================================================================

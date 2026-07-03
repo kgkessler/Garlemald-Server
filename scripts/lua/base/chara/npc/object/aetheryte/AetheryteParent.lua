@@ -33,6 +33,20 @@ end
 
 function onEventStarted(player, aetheryte, triggerName)
 
+	-- First-touch attunement (Garlemald-Server #46, round 5): retail's
+	-- order is attunement side-effects FIRST, then the quest beat the same
+	-- touch drives (the intro-quest arms below). Same id namespace as
+	-- doNormalMenu's HasAetheryteNodeUnlocked(childNodes[n]) gate — the
+	-- aetheryte's actor class id (the aetheryteTeleportPositions /
+	-- teleportMenuToAetheryte 128xxxx keys). UnlockAetheryteNode persists
+	-- to characters_aetherytes (seed 068); TeleportCommand.lua gates its
+	-- destinations on the same set, so an aetheryte you have never touched
+	-- refuses teleports until you attune here.
+	local touchedAetheryteId = aetheryte:GetActorClassId();
+	if (player:HasAetheryteNodeUnlocked(touchedAetheryteId) == false) then
+		player:UnlockAetheryteNode(touchedAetheryteId);
+	end
+
 	-- Main Scenario Intro Quests — attuning the opening-city aetheryte
 	-- advances the "go attune" step. Ported from pmeteor's
 	-- AetheryteParent.lua:36-62 (garlemald previously omitted this block,

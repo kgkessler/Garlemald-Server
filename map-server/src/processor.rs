@@ -384,6 +384,24 @@ impl PacketProcessor {
         // reads this without a DB round-trip.
         character.chara.homepoint = loaded.homepoint;
         character.chara.homepoint_inn = loaded.homepoint_inn;
+        // Attuned-aetheryte hydration (`characters_aetherytes`,
+        // migration 068 — Garlemald-Server #46, round 5). Feeds
+        // `PlayerSnapshot::unlocked_aetherytes` so the
+        // `HasAetheryteNodeUnlocked` gates (AetheryteParent.lua menu,
+        // TeleportCommand.lua destination check) survive a relog.
+        // Loaded directly here rather than through `LoadedPlayer`
+        // (the DTO lives in gamedata.rs) — same direct-DB shape as
+        // `load_completed_quests` below.
+        match self.db.load_character_aetherytes(actor_id).await {
+            Ok(ids) => character.chara.unlocked_aetherytes = ids.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    actor = actor_id,
+                    "load_character_aetherytes failed; starting with empty attunement set",
+                );
+            }
+        }
         // Hotbar hydration — mirror the loaded equipped commands into
         // CharaState so `PlayerSnapshot::hotbar` reads from the live
         // registry-reachable state. EquipAbility/UnequipAbility/
@@ -1770,6 +1788,24 @@ impl PacketProcessor {
             LC::SetHomePointInn { player_id, inn_id } => {
                 self.apply_set_home_point_inn(player_id, inn_id).await;
             }
+            // First-touch aetheryte attunement — the live path is the
+            // runtime drain (aetheryte touches are NPC events), but the
+            // login applier mirrors the arm for hook symmetry, matching
+            // how `SendMessage` / `SetHomePoint` exist on both paths.
+            // (Garlemald-Server #46, round 5.)
+            LC::UnlockAetheryte {
+                player_id,
+                aetheryte_id,
+            } => {
+                crate::runtime::quest_apply::apply_unlock_aetheryte(
+                    player_id,
+                    aetheryte_id,
+                    &self.registry,
+                    &self.db,
+                    &self.world,
+                )
+                .await;
+            }
             LC::PlayerSetNpcLs {
                 player_id,
                 npc_ls_id,
@@ -2316,7 +2352,16 @@ impl PacketProcessor {
             // needs the leader's session + client handle to broadcast
             // the group packet trio. Everything else flows through
             // the standard runtime drain.
+            //
+            // PartyAddMember is coalesced (#46 round 5): roster
+            // updates apply per-command, but the GroupHeader/Begin/
+            // X08/End trio is emitted ONCE per leader after the loop
+            // — a script pass adding several allies used to ship one
+            // trio per member, and the intermediate-roster trios have
+            // no retail analogue (retail emits exactly one trio per
+            // composition, under a fresh group id).
             let mut runtime_cmds = Vec::with_capacity(partial.commands.len());
+            let mut party_trio_leaders: Vec<u32> = Vec::new();
             for cmd in partial.commands {
                 match cmd {
                     crate::lua::command::LuaCommand::SpawnBattleNpcById {
@@ -2357,8 +2402,16 @@ impl PacketProcessor {
                         leader_actor_id,
                         member_actor_id,
                     } => {
-                        self.apply_party_add_member(leader_actor_id, member_actor_id)
-                            .await;
+                        crate::runtime::quest_apply::apply_party_add_member_roster(
+                            leader_actor_id,
+                            member_actor_id,
+                            &self.registry,
+                            &self.world,
+                        )
+                        .await;
+                        if !party_trio_leaders.contains(&leader_actor_id) {
+                            party_trio_leaders.push(leader_actor_id);
+                        }
                     }
                     crate::lua::command::LuaCommand::DirectorAddMember {
                         director_actor_id,
@@ -2380,6 +2433,16 @@ impl PacketProcessor {
                     }
                     other => runtime_cmds.push(other),
                 }
+            }
+            // One trio per leader for the batch's final composition
+            // (see the coalescing note above the partition loop).
+            for leader_actor_id in party_trio_leaders {
+                crate::runtime::quest_apply::emit_party_group_trio(
+                    leader_actor_id,
+                    &self.registry,
+                    &self.world,
+                )
+                .await;
             }
             if !runtime_cmds.is_empty() {
                 crate::runtime::quest_apply::apply_runtime_lua_commands(
@@ -2909,158 +2972,6 @@ impl PacketProcessor {
             pos = ?(x, y, z),
             "SpawnActor applied — actor inserted into zone + registry, \
              spawn bundle deferred to post-warp send_zone_in_bundle",
-        );
-    }
-
-    /// B2 of the SEQ_005 unblock plan — port of C#
-    /// `Party::AddMember` semantics for the local-zone case (the
-    /// only path the combat-tutorial scripts exercise). Updates
-    /// the leader session's transient member list and re-broadcasts
-    /// the GroupHeader / GroupMembersBegin / GroupMembersX08 /
-    /// GroupMembersEnd sequence so the client's party-list UI
-    /// shows the freshly-added ally.
-    ///
-    /// Phase B2 simplifications:
-    ///   * No persistent server-side party state; the roster lives
-    ///     on `Session.transient_party_members` and re-broadcasts
-    ///     the full list every change. Cross-zone sync (which would
-    ///     route through world-server's `OP_WORLD_PARTY_INVITE` →
-    ///     `PartyManager::add_member` flow) is a follow-up.
-    ///   * No client-side accept prompt; the new member auto-joins
-    ///     (matches the tutorial use case where the allies are NPCs
-    ///     with no client of their own).
-    ///   * Member names default to a synthetic `bnpc_<id>` if the
-    ///     actor isn't in the registry yet (rare race window).
-    async fn apply_party_add_member(&self, leader_actor_id: u32, member_actor_id: u32) {
-        let Some(leader_handle) = self.registry.get(leader_actor_id).await else {
-            tracing::debug!(
-                leader = format!("0x{leader_actor_id:08X}"),
-                "PartyAddMember skipped — leader not in registry",
-            );
-            return;
-        };
-        let session_id = leader_handle.session_id;
-        let leader_name = {
-            let c = leader_handle.character.read().await;
-            c.base.display_name().to_string()
-        };
-
-        // Append to transient roster. Idempotent: if the member is
-        // already in the list (script double-fired AddMember) the
-        // re-broadcast still produces the same packet content.
-        let members_actor_ids = {
-            let Some(mut snap) = self.world.session(session_id).await else {
-                tracing::debug!(
-                    session = session_id,
-                    "PartyAddMember skipped — no session for leader",
-                );
-                return;
-            };
-            if !snap.transient_party_members.contains(&member_actor_id) {
-                snap.transient_party_members.push(member_actor_id);
-            }
-            let ids = snap.transient_party_members.clone();
-            self.world.upsert_session(snap).await;
-            ids
-        };
-
-        // Build GroupMember rows: leader first, then the transient
-        // adds. Encoding via `GroupMember::row_for_actor` — an NPC ally
-        // (empty display name) must carry its localized display-name id
-        // in `localized_name` or the client's PartyParameterWidget
-        // renders a blank row (Garlemald-Server #46, round 4; see the
-        // helper's doc). Falls back to a "bnpc_<id>" placeholder row if
-        // the member isn't registered yet (B1's spawn happens in the
-        // same drain so this should normally resolve).
-        let mut members = Vec::with_capacity(1 + members_actor_ids.len());
-        members.push(crate::packets::send::groups::GroupMember::row_for_actor(
-            leader_actor_id,
-            &leader_name,
-            0,
-        ));
-        for &mid in &members_actor_ids {
-            let member = if let Some(h) = self.registry.get(mid).await {
-                let c = h.character.read().await;
-                crate::packets::send::groups::GroupMember::row_for_actor(
-                    mid,
-                    c.base.display_name(),
-                    c.base.display_name_id,
-                )
-            } else {
-                crate::packets::send::groups::GroupMember::row_for_actor(
-                    mid,
-                    &format!("bnpc_{mid:08X}"),
-                    0,
-                )
-            };
-            members.push(member);
-        }
-
-        // Build the trio. Group index uses the same solo-self flag
-        // pattern `send_zone_in_bundle` uses; sequence_id is fresh.
-        // Tutorial allies don't promote the player out of the
-        // synthetic solo-self party — they just join it.
-        const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
-        const GROUP_TYPE_PARTY: u32 = 0x2711;
-        let group_index: u64 = PARTY_SOLO_SELF_FLAG | (leader_actor_id as u64);
-        let zone_actor_id = leader_handle.zone_id;
-        let location_code = zone_actor_id as u64;
-        let sequence_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or_default();
-
-        let mut offset = 0usize;
-        let mut subs = vec![
-            crate::packets::send::groups::build_group_header(
-                leader_actor_id,
-                location_code,
-                sequence_id,
-                group_index,
-                GROUP_TYPE_PARTY,
-                -1,
-                "",
-                members.len() as u32,
-            ),
-            crate::packets::send::groups::build_group_members_begin(
-                leader_actor_id,
-                location_code,
-                sequence_id,
-                group_index,
-                members.len() as u32,
-            ),
-            crate::packets::send::groups::build_group_members_x08(
-                leader_actor_id,
-                location_code,
-                sequence_id,
-                &members,
-                &mut offset,
-            ),
-            crate::packets::send::groups::build_group_members_end(
-                leader_actor_id,
-                location_code,
-                sequence_id,
-                group_index,
-            ),
-        ];
-
-        let Some(client) = self.world.client(session_id).await else {
-            tracing::debug!(
-                session = session_id,
-                "PartyAddMember skipped — no client handle"
-            );
-            return;
-        };
-        for sub in &mut subs {
-            sub.set_target_id(session_id);
-            client.send_bytes(sub.to_bytes()).await;
-        }
-
-        tracing::info!(
-            leader = format!("0x{leader_actor_id:08X}"),
-            member = format!("0x{member_actor_id:08X}"),
-            roster = members.len(),
-            "PartyAddMember applied (B2: transient roster + group trio rebroadcast)",
         );
     }
 
@@ -4917,6 +4828,12 @@ impl PacketProcessor {
             let homepoint_inn = {
                 let mut c = handle.character.write().await;
                 c.chara.homepoint = homepoint;
+                // Setting home implies attunement — mirror of the pure
+                // `Player::set_home_point` helper's in-memory insert,
+                // on the registry-reachable set the snapshots actually
+                // read. Persisted below alongside the homepoint.
+                // (Garlemald-Server #46, round 5.)
+                c.chara.unlocked_aetherytes.insert(homepoint);
                 c.chara.homepoint_inn
             };
             if let Err(e) = self
@@ -4931,6 +4848,21 @@ impl PacketProcessor {
                     "SetHomePoint: DB persist failed",
                 );
                 return;
+            }
+            // Durable half of the implied attunement (INSERT OR IGNORE,
+            // `characters_aetherytes` migration 068) — the pure helper
+            // has no DB handle in scope, so the apply arm owns this.
+            if let Err(e) = self
+                .db
+                .insert_character_aetheryte(player_id, homepoint)
+                .await
+            {
+                tracing::warn!(
+                    player = player_id,
+                    homepoint,
+                    err = %e,
+                    "SetHomePoint: attunement persist failed",
+                );
             }
         } else {
             // Offline persist path — Lua can't realistically hit this
@@ -4954,6 +4886,20 @@ impl PacketProcessor {
                     "SetHomePoint (offline): DB persist failed",
                 );
                 return;
+            }
+            // Implied attunement, offline flavour (same INSERT OR
+            // IGNORE as the online branch above).
+            if let Err(e) = self
+                .db
+                .insert_character_aetheryte(player_id, homepoint)
+                .await
+            {
+                tracing::warn!(
+                    player = player_id,
+                    homepoint,
+                    err = %e,
+                    "SetHomePoint (offline): attunement persist failed",
+                );
             }
         }
         tracing::info!(player = player_id, homepoint, "SetHomePoint applied");
@@ -5007,6 +4953,99 @@ impl PacketProcessor {
             }
         }
         tracing::info!(player = player_id, inn_id, "SetHomePointInn applied");
+    }
+
+    /// Reply to the client's `work/achieveAetheryte` 0x012F work-sync
+    /// request — pmeteor-parity interim (Player.cs:1182-1190
+    /// `SendAchievedAetheryte`): an ALL-TRUE `Bitstream(512, true)`
+    /// sliced to the requested bit window, i.e. "every aetheryte
+    /// achieved". pmeteor ships this exact fake, so the client's
+    /// achievement-flavoured aetheryte bits have never been real on any
+    /// Meteor-derived server; the real teleport enforcement is the
+    /// server-authoritative `HasAetheryteNodeUnlocked` gate in
+    /// TeleportCommand.lua / AetheryteParent.lua backed by
+    /// `characters_aetherytes`.
+    ///
+    /// TODO(#46 round 5): the per-bit mapping aetheryte-class-id →
+    /// bit-index is unmapped; once known, slice a real bitset built from
+    /// `CharaState::unlocked_aetherytes` instead of all-TRUE.
+    ///
+    /// Wire shape (pmeteor `SetActorPropetyPacket` bitfield mode,
+    /// 0x0137):
+    ///   [0]     runningByteTotal
+    ///   [1]     slice length (`AddBitfield` uses payload len as the
+    ///           type byte)
+    ///   [2..6]  murmur2("work.event_achieve_aetheryte")
+    ///   […]     slice bytes (bit-packed from..=to window with a
+    ///           trailing 0x03 page byte — `Bitstream.GetSlice`)
+    ///   […]     target marker `0x82 + 5 + len(target)`, 0x09,
+    ///           u16 from, u16 to, ASCII "work/achieveAetheryte"
+    async fn send_achieved_aetheryte(&self, player_id: u32, from: u16, to: u16) {
+        const TARGET: &str = "work/achieveAetheryte";
+        const BITFIELD_BITS: u16 = 512;
+        let Some(handle) = self.registry.get(player_id).await else {
+            return;
+        };
+        let Some(client) = self.world.client(handle.session_id).await else {
+            return;
+        };
+        // Defensive clamps — C# would throw on an inverted/oversized
+        // window; a hostile client shouldn't be able to panic the sim.
+        let to = to.min(BITFIELD_BITS - 1);
+        let from = from.min(to);
+        // Port of `Bitstream::GetSlice(from, to)` for all-true data:
+        // slice length is (to-from)/8 (+1 when the window has a partial
+        // byte) + 1 trailing page byte (0x03). Full bytes are 0xFF; C#
+        // only writes the partial byte when it lands exactly at len-2
+        // (bug-for-bug faithful: a window like from=0,to=8 drops its
+        // 9th bit on the floor, same as pmeteor).
+        let span = (to - from) as usize;
+        let mut slice = vec![0u8; span / 8 + usize::from(!span.is_multiple_of(8)) + 1];
+        let last = slice.len() - 1;
+        slice[last] = 0x03;
+        let total_bits = span + 1;
+        let full_bytes = total_bits / 8;
+        for b in slice.iter_mut().take(full_bytes) {
+            *b = 0xFF;
+        }
+        let partial_bits = total_bits % 8;
+        if partial_bits != 0 && slice.len() >= 2 && full_bytes == slice.len() - 2 {
+            slice[full_bytes] = (1u8 << partial_bits) - 1;
+        }
+        // Assemble the 0x0137 body in bitfield mode. The
+        // ActorPropertyPacketBuilder doesn't speak bitfield targets
+        // (its `done()` seals with the plain `0x82+len` marker), so
+        // the body is laid out manually per the shape above.
+        let mut data = crate::packets::send::body(0xA8);
+        let id = common::utils::murmur_hash2("work.event_achieve_aetheryte", 0);
+        let mut cur = 1usize;
+        data[cur] = slice.len() as u8;
+        data[cur + 1..cur + 5].copy_from_slice(&id.to_le_bytes());
+        cur += 5;
+        data[cur..cur + slice.len()].copy_from_slice(&slice);
+        cur += slice.len();
+        data[cur] = 0x82u8 + 5 + TARGET.len() as u8;
+        data[cur + 1] = 0x09;
+        data[cur + 2..cur + 4].copy_from_slice(&from.to_le_bytes());
+        data[cur + 4..cur + 6].copy_from_slice(&to.to_le_bytes());
+        cur += 6;
+        data[cur..cur + TARGET.len()].copy_from_slice(TARGET.as_bytes());
+        cur += TARGET.len();
+        // runningByteTotal counts everything after the header byte.
+        data[0] = (cur - 1) as u8;
+        let mut sub = SubPacket::new(
+            crate::packets::opcodes::OP_SET_ACTOR_PROPERTY,
+            player_id,
+            data,
+        );
+        sub.set_target_id(handle.session_id);
+        client.send_bytes(sub.to_bytes()).await;
+        tracing::debug!(
+            player = player_id,
+            from,
+            to,
+            "work/achieveAetheryte all-TRUE bitfield sent (pmeteor-parity interim)",
+        );
     }
 
     /// `player:SetNpcLs(id, state)` / `player:AddNpcLs(id)` /
@@ -7399,21 +7438,52 @@ impl PacketProcessor {
             OP_RX_DATA_REQUEST => {
                 // 44 events/session. Same opcode as outbound
                 // KickEvent — direction disambiguates. Client asks
-                // for a GAM-property refresh by path; payload at
-                // body[0..4] is u32 target_actor_id, body[4..24] is
-                // a null-padded ASCII property path
-                // (e.g. "charaWork/exp"), body[24..32] is variable
-                // trailing data.
-                let prop_path = if sub.data.len() >= 24 {
-                    extract_null_terminated_ascii(&sub.data[4..24])
+                // for a GAM-property refresh by path. pmeteor
+                // `WorkSyncRequestPacket.cs` decodes:
+                //   body[0..4]  = u32 target actor id
+                //   body[4]     = 0x09 marker → BITFIELD request:
+                //                 body[5..7] = u16 `from` bit index,
+                //                 body[7..9] = u16 `to` bit index,
+                //                 null-terminated path at body[9..]
+                //   otherwise   → plain request, path at body[4..]
+                // The previous fixed body[4..24] extraction predated
+                // the marker discovery — bitfield requests (the
+                // "work/achieveAetheryte" family) decoded as a
+                // "\t…" garbage path and never matched. (Garlemald-
+                // Server #46, round 5.)
+                let is_bitfield = sub.data.len() >= 9 && sub.data[4] == 0x09;
+                let (bit_from, bit_to, path_start) = if is_bitfield {
+                    (
+                        u16::from_le_bytes(sub.data[5..7].try_into().unwrap()),
+                        u16::from_le_bytes(sub.data[7..9].try_into().unwrap()),
+                        9usize,
+                    )
+                } else {
+                    (0, 0, 4usize)
+                };
+                let prop_path = if sub.data.len() > path_start {
+                    extract_null_terminated_ascii(&sub.data[path_start..])
                 } else {
                     String::new()
                 };
-                tracing::debug!(
-                    source = source,
-                    property = %prop_path,
-                    "RX 0x012F data-request (no-op pending property-refresh handler)",
-                );
+                match prop_path.as_str() {
+                    "work/achieveAetheryte" => {
+                        tracing::debug!(
+                            source = source,
+                            from = bit_from,
+                            to = bit_to,
+                            "RX 0x012F work-sync: achieveAetheryte",
+                        );
+                        self.send_achieved_aetheryte(source, bit_from, bit_to).await;
+                    }
+                    _ => {
+                        tracing::debug!(
+                            source = source,
+                            property = %prop_path,
+                            "RX 0x012F data-request (no-op pending property-refresh handler)",
+                        );
+                    }
+                }
             }
             OP_RX_GROUP_CREATED => {
                 // 270 events/session — highest-volume IN gap. Same
@@ -9056,11 +9126,12 @@ impl PacketProcessor {
             name: c.base.actor_name.clone(),
             class_name: c.base.class_name.clone(),
             class_path: c.base.class_path.clone(),
-            // `unique_id` isn't stored on BaseActor yet — Meteor's
-            // equivalent comes from the spawn-row `uniqueId` column.
-            // Scripts that read `npc:GetUniqueId()` will see an empty
-            // string until the spawn pipeline starts populating it.
-            unique_id: String::new(),
+            // Seed `uniqueId` (spawn-row column), mirrored onto
+            // BaseActor by `Npc::new` since round 5 — scripts that
+            // read `npc:GetUniqueId()` now see the real value
+            // ("baderon", …) instead of the documented-empty interim.
+            // (Garlemald-Server #46, round 5.)
+            unique_id: c.base.unique_id.clone(),
             zone_id: c.base.zone_id,
             zone_name: String::new(),
             state: c.base.current_main_state,
@@ -10006,7 +10077,12 @@ pub(crate) fn build_player_snapshot_for_login(
         completed_quests: Vec::new(),
         active_quests: Vec::new(),
         active_quest_states: Vec::new(),
-        unlocked_aetherytes: Vec::new(),
+        // Hydrated from `characters_aetherytes` at session-begin (see
+        // the `load_character_aetherytes` block in the LoadedPlayer
+        // hydration) — a hardcoded empty Vec here made every
+        // `HasAetheryteNodeUnlocked` gate fail after a relog.
+        // (Garlemald-Server #46, round 5.)
+        unlocked_aetherytes: c.chara.unlocked_aetherytes.iter().copied().collect(),
         traits: Vec::new(),
         inventory: Vec::new(),
         login_director_actor_id: c.chara.login_director_actor_id,

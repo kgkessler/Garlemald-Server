@@ -261,6 +261,19 @@ pub async fn apply_runtime_lua_command(
             apply_send_message(actor_id, message_type, &sender, &text, registry, world).await;
             true
         }
+        // `player:UnlockAetheryteNode(id)` — first-touch aetheryte
+        // attunement from AetheryteParent.lua / AetheryteChild.lua
+        // `onEventStarted` (Garlemald-Server #46, round 5). The
+        // aetheryte-touch event runs on this runtime drain, so this
+        // arm is the live path; the login applier carries a mirror
+        // arm for hook symmetry.
+        LC::UnlockAetheryte {
+            player_id,
+            aetheryte_id,
+        } => {
+            apply_unlock_aetheryte(player_id, aetheryte_id, registry, db, world).await;
+            true
+        }
         // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
         // linkshell narration line (0x0161 DispId-sender family).
         LC::SendGameMessageLocalizedDisplayName {
@@ -1068,15 +1081,17 @@ async fn apply_director_add_member(
     );
 }
 
-/// `currentParty:AddMember(actor)` — appends `member_actor_id` to the
-/// leader's transient party roster (`session.transient_party_members`)
-/// and re-emits the GroupHeader / GroupMembersBegin / X08 / End trio to
-/// the leader's client so the in-game party panel shows the new member.
-/// Used by `SimpleContent30010.lua::onCreate` to add Yda + Papalymo
-/// (battle-NPC allies) to the player's party UI — without this they
-/// never appear in the party panel even though they spawn fine in the
-/// world.
-async fn apply_party_add_member(
+/// Roster half of `currentParty:AddMember(actor)` — appends
+/// `member_actor_id` to the leader's transient party roster
+/// (`session.transient_party_members`) and bumps the session's
+/// party-composition ordinal when the roster actually changed (the
+/// ordinal feeds `groups::party_group_index`'s fresh-per-composition
+/// group id — #46 round 5). No wire emission: callers pair this with
+/// [`emit_party_group_trio`], either immediately (single-command path)
+/// or once per drain batch (the retail shape — pmeteor/retail never
+/// ship the intermediate roster=2 trio when two allies join in one
+/// script pass).
+pub(crate) async fn apply_party_add_member_roster(
     leader_actor_id: u32,
     member_actor_id: u32,
     registry: &ActorRegistry,
@@ -1109,15 +1124,41 @@ async fn apply_party_add_member(
     };
     if !snap.transient_party_members.contains(&member_actor_id) {
         snap.transient_party_members.push(member_actor_id);
+        // Composition changed → the next trio must ship under a fresh
+        // group_index (the client ignores roster changes re-sent under
+        // an id it already registered — #46 round 5 wire finding).
+        snap.party_group_ordinal = snap.party_group_ordinal.wrapping_add(1);
     }
-    let roster_ids: Vec<u32> = snap.transient_party_members.clone();
     world.upsert_session(snap).await;
+}
+
+/// Emit the party GroupHeader / GroupMembersBegin / X08 / End trio for
+/// the leader's CURRENT transient roster to the leader's client — the
+/// wire half of `currentParty:AddMember`. Shared by the runtime drain
+/// (one emission per batch), the processor's content-area partition
+/// loop, and the single-command applier.
+pub(crate) async fn emit_party_group_trio(
+    leader_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(leader_handle) = registry.get(leader_actor_id).await else {
+        return;
+    };
+    let session_id = leader_handle.session_id;
+    let Some(snap) = world.session(session_id).await else {
+        return;
+    };
+    let roster_ids: Vec<u32> = snap.transient_party_members.clone();
+    let composition_ordinal = snap.party_group_ordinal;
 
     // Build the roster: leader first, then the transient members.
     // Encoding via `GroupMember::row_for_actor` — an NPC ally (empty
     // display name) must carry its localized display-name id in
     // `localized_name` or the client's PartyParameterWidget renders a
     // blank row (Garlemald-Server #46, round 4; see the helper's doc).
+    // The leader is the recipient, so their row is the only `is_self`
+    // one (retail flags every non-self row — #46 round 5).
     let leader_name = {
         let c = leader_handle.character.read().await;
         c.base.display_name().to_string()
@@ -1127,6 +1168,7 @@ async fn apply_party_add_member(
         leader_actor_id,
         &leader_name,
         0,
+        true,
     ));
     for &mid in &roster_ids {
         let member = if let Some(h) = registry.get(mid).await {
@@ -1135,23 +1177,30 @@ async fn apply_party_add_member(
                 mid,
                 c.base.display_name(),
                 c.base.display_name_id,
+                false,
             )
         } else {
             crate::packets::send::groups::GroupMember::row_for_actor(
                 mid,
                 &format!("bnpc_{mid:08X}"),
                 0,
+                false,
             )
         };
         members.push(member);
     }
 
-    // Emit the trio. Mirrors the solo-party block in
-    // `world_manager.rs::send_zone_in_bundle` (lines ~1885-1942):
-    // group_index = SOLO_FLAG | leader_actor_id, GROUP_TYPE_PARTY=0x2711.
-    const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
-    const GROUP_TYPE_PARTY: u32 = 0x2711;
-    let group_index: u64 = PARTY_SOLO_SELF_FLAG | (leader_actor_id as u64);
+    // Emit the trio. Mirrors the party block in
+    // `world_manager.rs::send_zone_in_bundle`: group_index from the
+    // shared fresh-per-composition scheme (solo keeps the immutable
+    // login id; multi-member compositions get a NEW id keyed by the
+    // session ordinal — see `party_group_index`'s doc for the retail
+    // evidence).
+    let group_index = crate::packets::send::groups::party_group_index(
+        leader_actor_id,
+        members.len(),
+        composition_ordinal,
+    );
     let location_code = leader_handle.zone_id as u64;
     let sequence_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1165,7 +1214,7 @@ async fn apply_party_add_member(
             location_code,
             sequence_id,
             group_index,
-            GROUP_TYPE_PARTY,
+            crate::packets::send::groups::GROUP_TYPE_PLAYER_PARTY,
             -1,
             "",
             members.len() as u32,
@@ -1206,10 +1255,27 @@ async fn apply_party_add_member(
 
     tracing::debug!(
         leader = format!("0x{leader_actor_id:08X}"),
-        member = format!("0x{member_actor_id:08X}"),
         roster_size = members.len(),
-        "PartyAddMember applied (transient roster updated + party trio re-emitted)",
+        group_index = format!("0x{group_index:016X}"),
+        "party group trio emitted for current roster",
     );
+}
+
+/// `currentParty:AddMember(actor)` — single-command path: roster update
+/// then an immediate trio emission. Batched callers
+/// (`apply_runtime_lua_commands`, the processor's content-area
+/// partition loop) call the two halves directly so a multi-AddMember
+/// batch ships ONE trio for the final composition instead of one per
+/// call — the intermediate-roster trios have no retail analogue and
+/// each one churned the client's group registration (#46 round 5).
+async fn apply_party_add_member(
+    leader_actor_id: u32,
+    member_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    apply_party_add_member_roster(leader_actor_id, member_actor_id, registry, world).await;
+    emit_party_group_trio(leader_actor_id, registry, world).await;
 }
 
 /// `actor:PlayAnimation(animation_id)` — port of C#
@@ -1807,7 +1873,13 @@ pub(crate) async fn apply_content_finished(
     //    either — `RemoveDirector` drops it from `ownedDirectors`
     //    before any `SendZoneInPackets` runs.
     snap.transient_director_members.remove(&director_id);
-    snap.transient_party_members.clear();
+    if !snap.transient_party_members.is_empty() {
+        snap.transient_party_members.clear();
+        // Composition changed (back to solo) — keep the party-group
+        // ordinal in step so the NEXT multi-member composition ships
+        // under a fresh group_index (see `groups::party_group_index`).
+        snap.party_group_ordinal = snap.party_group_ordinal.wrapping_add(1);
+    }
     snap.active_content_script = None;
     if snap
         .login_director
@@ -2613,7 +2685,27 @@ pub async fn apply_runtime_lua_commands(
     world: &WorldManager,
     lua: Option<&Arc<LuaEngine>>,
 ) {
+    // Party-trio coalescing (#46 round 5): a script pass that
+    // `currentParty:AddMember`s several allies used to emit one full
+    // GroupHeader/Begin/X08/End trio PER member — the intermediate
+    // roster trios have no retail analogue (retail ships exactly one
+    // trio per composition, under a fresh group id), and each header
+    // churned the client's group registration. Roster updates apply
+    // per-command below; the single trio per affected leader is
+    // emitted after the batch.
+    let mut party_trio_leaders: Vec<u32> = Vec::new();
     for cmd in cmds {
+        if let LuaCommandKind::PartyAddMember {
+            leader_actor_id,
+            member_actor_id,
+        } = cmd
+        {
+            apply_party_add_member_roster(leader_actor_id, member_actor_id, registry, world).await;
+            if !party_trio_leaders.contains(&leader_actor_id) {
+                party_trio_leaders.push(leader_actor_id);
+            }
+            continue;
+        }
         // Keep a copy for diagnostics only when DEBUG is enabled for this
         // target, so non-debug filters pay nothing. The drain is low-frequency
         // (quest-hook command batches), so the clone cost is negligible. We log
@@ -2630,6 +2722,11 @@ pub async fn apply_runtime_lua_commands(
                 "runtime lua command unhandled (login-scoped or unrecognised)",
             );
         }
+    }
+    // One trio per leader for the batch's final composition (see the
+    // coalescing note above the loop).
+    for leader_actor_id in party_trio_leaders {
+        emit_party_group_trio(leader_actor_id, registry, world).await;
     }
 }
 
@@ -5453,6 +5550,68 @@ pub(crate) async fn apply_send_message(
         %sender,
         %text,
         "SendMessage emitted",
+    );
+}
+
+/// `player:UnlockAetheryteNode(id)` — first-touch aetheryte attunement
+/// (Garlemald-Server #46, round 5). Inserts into the registry-reachable
+/// `CharaState::unlocked_aetherytes` set (skips everything if already
+/// present — re-touching an attuned aetheryte is a no-op), persists via
+/// `characters_aetherytes` (migration 068, INSERT OR IGNORE), and toasts
+/// the attunement confirmation into the player's system log.
+///
+/// The toast is a literal-text `SendMessagePacket` (the same path
+/// `TeleportCommand.lua`'s "not attuned" denial uses) rather than a
+/// text-sheet id: pmeteor never implemented an attunement toast (its
+/// only "attune" hit is a GM-command comment) and the round-5
+/// investigation didn't surface the retail 1.x sheet id.
+/// TODO(#46 round 5): swap for the retail text-sheet emission
+/// (`build_text_sheet_no_source_auto`, 25xxx/33xxx system family —
+/// cf. the 25118 "linkpearl obtained" toast in
+/// [`apply_player_set_npc_ls`]) once the attunement text id is mapped.
+pub(crate) async fn apply_unlock_aetheryte(
+    player_id: u32,
+    aetheryte_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let newly_unlocked = {
+        let mut c = handle.character.write().await;
+        c.chara.unlocked_aetherytes.insert(aetheryte_id)
+    };
+    if !newly_unlocked {
+        tracing::debug!(
+            player = player_id,
+            aetheryte = aetheryte_id,
+            "UnlockAetheryte: already attuned, no-op",
+        );
+        return;
+    }
+    if let Err(e) = db.insert_character_aetheryte(player_id, aetheryte_id).await {
+        tracing::warn!(
+            player = player_id,
+            aetheryte = aetheryte_id,
+            err = %e,
+            "UnlockAetheryte: DB persist failed",
+        );
+    }
+    apply_send_message(
+        player_id,
+        crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+        "",
+        "You are now attuned to the aetheryte.",
+        registry,
+        world,
+    )
+    .await;
+    tracing::info!(
+        player = player_id,
+        aetheryte = aetheryte_id,
+        "UnlockAetheryte applied",
     );
 }
 
