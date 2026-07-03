@@ -277,6 +277,94 @@ fn push_master_spawn(
     ));
 }
 
+fn lp_bool(b: bool) -> common::luaparam::LuaParam {
+    if b {
+        common::luaparam::LuaParam::True
+    } else {
+        common::luaparam::LuaParam::False
+    }
+}
+
+/// The destination-zone wire header the client needs before it will
+/// treat a zone's actors as addressable: 0x0010 SetDalamud + 0x000C
+/// SetMusic + 0x000D SetWeather + 0x0005 SetMap, in the login bundle's
+/// order. Shared by `send_zone_in_bundle` (every login/warp) and
+/// `do_seamless_zone_change` (boundary flips) — a flip that moved only
+/// server-side bookkeeping left the client crossing into the
+/// destination's geometry while still holding the ORIGIN zone's SetMap
+/// context, and its talk sender (decomp `PlayerBaseClass.lua:98-160`
+/// gate) silently refused to start events against the new zone's
+/// actors (the Limsa seamless softlock: repeated RX 0x00CD
+/// target-selects on Baderon with ZERO 0x012D EventStart, 23:48 +
+/// 00:11-00:12 wire windows). (Garlemald-Server #46, round 4.)
+#[allow(clippy::too_many_arguments)]
+fn push_zone_header_packets(
+    subpackets: &mut Vec<common::subpacket::SubPacket>,
+    actor_id: u32,
+    dalamud_phase: i8,
+    music_id: u16,
+    music_mode: u16,
+    weather_id: u16,
+    weather_transition: u16,
+    region_id: u32,
+    zone_actor_id: u32,
+) {
+    subpackets.extend([
+        tx::misc::build_set_dalamud(actor_id, dalamud_phase),
+        tx::misc::build_set_music(actor_id, music_id, music_mode),
+        tx::misc::build_set_weather(actor_id, weather_id, weather_transition),
+        tx::misc::build_set_map(actor_id, region_id, zone_actor_id),
+    ]);
+}
+
+/// The 15 LuaParams of the PUBLIC-zone `Zone.CreateScriptBindPacket`
+/// (pmeteor Zone.cs):
+///   classPath, false, true, zoneName, "", -1,
+///   canRideChocobo?1:0 (byte), canStealth, isInn,
+///   false, false, false, true, isInstanceRaid, isEntranceDesion
+/// We don't track `isEntranceDesion` per-session so pass false (the
+/// C# default — the flag only flips during seamless boundary
+/// crossings). Shared by `send_zone_in_bundle`'s public arm and the
+/// seamless-flip area-master emission in `do_seamless_zone_change`
+/// (the private-area variant stays inline in the bundle — flips are
+/// public↔public by construction). (Garlemald-Server #46, round 4.)
+fn public_zone_bind_params(
+    class_path: &str,
+    zone_name: &str,
+    can_ride_chocobo: bool,
+    can_stealth: bool,
+    is_inn: bool,
+    is_instance_raid: bool,
+) -> Vec<common::luaparam::LuaParam> {
+    vec![
+        common::luaparam::LuaParam::String(class_path.to_string()),
+        common::luaparam::LuaParam::False,
+        common::luaparam::LuaParam::True,
+        common::luaparam::LuaParam::String(zone_name.to_string()),
+        common::luaparam::LuaParam::String(String::new()),
+        common::luaparam::LuaParam::Int32(-1),
+        // C# `Zone.CreateScriptBindPacket` passes
+        // `canRideChocobo ? (byte)1 : (byte)0` — explicit byte cast,
+        // LuaParam type 0xC (1 payload byte) on the wire. Emitting
+        // this as UInt32 would inject three extra zero bytes into
+        // the param stream and shift every following param out of
+        // alignment. The 1.23b client's Lua reads the parsed params
+        // positionally; a misaligned stream is read as `nil` where
+        // a value was expected, which surfaces as the Client Script
+        // ERROR "attempt to index a nil value" the client reports
+        // back to us wrapped in an EventStart packet.
+        common::luaparam::LuaParam::Byte(if can_ride_chocobo { 1 } else { 0 }),
+        lp_bool(can_stealth),
+        lp_bool(is_inn),
+        common::luaparam::LuaParam::False,
+        common::luaparam::LuaParam::False,
+        common::luaparam::LuaParam::False,
+        common::luaparam::LuaParam::True,
+        lp_bool(is_instance_raid),
+        common::luaparam::LuaParam::False,
+    ]
+}
+
 /// Emit the 11-packet NPC spawn bundle a single visible actor needs on
 /// a client's zone-in. Mirrors C# `Npc.GetSpawnPackets`:
 ///   AddActor + Speed + SpawnPosition + Appearance + Name + State +
@@ -2100,16 +2188,23 @@ impl WorldManager {
             } else {
                 bgm_day
             };
+        subpackets.push(tx::actor::build_set_actor_is_zoning(actor_id, false));
+        // Dalamud/Music/Weather/SetMap — the shared destination-zone
+        // header (also emitted by `do_seamless_zone_change` on a
+        // boundary flip; see `push_zone_header_packets`). Music mode
+        // 0x01 = EFFECT_IMMEDIATE (pmeteor `SendZoneInPackets`).
+        push_zone_header_packets(
+            &mut subpackets,
+            actor_id,
+            self.world_settings.dalamud_phase,
+            music_id,
+            0x01,
+            self.world_settings.weather_id,
+            self.world_settings.weather_transition,
+            region_id,
+            zone_actor_id,
+        );
         subpackets.extend(vec![
-            tx::actor::build_set_actor_is_zoning(actor_id, false),
-            tx::misc::build_set_dalamud(actor_id, self.world_settings.dalamud_phase),
-            tx::misc::build_set_music(actor_id, music_id, 0x01),
-            tx::misc::build_set_weather(
-                actor_id,
-                self.world_settings.weather_id,
-                self.world_settings.weather_transition,
-            ),
-            tx::misc::build_set_map(actor_id, region_id, zone_actor_id),
             tx::actor::build_add_actor(actor_id, 8),
             tx::actor::build_0x132(actor_id, 0x0B, "commandForced"),
             tx::actor::build_0x132(actor_id, 0x0A, "commandDefault"),
@@ -2422,13 +2517,6 @@ impl WorldManager {
                 z.core.is_instance_raid,
             )
         };
-        fn lp_bool(b: bool) -> common::luaparam::LuaParam {
-            if b {
-                common::luaparam::LuaParam::True
-            } else {
-                common::luaparam::LuaParam::False
-            }
-        }
         let (area_master_class_name, area_master_params): (
             String,
             Vec<common::luaparam::LuaParam>,
@@ -2458,33 +2546,17 @@ impl WorldManager {
         } else {
             (
                 zone_class_name.clone(),
-                vec![
-                    common::luaparam::LuaParam::String(zone_class_path.clone()),
-                    common::luaparam::LuaParam::False,
-                    common::luaparam::LuaParam::True,
-                    common::luaparam::LuaParam::String(zone_name.clone()),
-                    common::luaparam::LuaParam::String(String::new()),
-                    common::luaparam::LuaParam::Int32(-1),
-                    // C# `Zone.CreateScriptBindPacket` passes
-                    // `canRideChocobo ? (byte)1 : (byte)0` — explicit byte cast,
-                    // LuaParam type 0xC (1 payload byte) on the wire. Emitting
-                    // this as UInt32 would inject three extra zero bytes into
-                    // the param stream and shift every following param out of
-                    // alignment. The 1.23b client's Lua reads the parsed params
-                    // positionally; a misaligned stream is read as `nil` where
-                    // a value was expected, which surfaces as the Client Script
-                    // ERROR "attempt to index a nil value" the client reports
-                    // back to us wrapped in an EventStart packet.
-                    common::luaparam::LuaParam::Byte(if can_ride_chocobo { 1 } else { 0 }),
-                    lp_bool(can_stealth),
-                    lp_bool(is_inn),
-                    common::luaparam::LuaParam::False,
-                    common::luaparam::LuaParam::False,
-                    common::luaparam::LuaParam::False,
-                    common::luaparam::LuaParam::True,
-                    lp_bool(is_instance_raid),
-                    common::luaparam::LuaParam::False,
-                ],
+                // The 15-param public Zone bind — shared with the
+                // seamless-flip emission; see `public_zone_bind_params`
+                // for the byte-cast alignment note.
+                public_zone_bind_params(
+                    &zone_class_path,
+                    &zone_name,
+                    can_ride_chocobo,
+                    can_stealth,
+                    is_inn,
+                    is_instance_raid,
+                ),
             )
         };
         let area_master_name = format!("_areaMaster@{:05X}", zone_actor_id << 8);
@@ -3001,17 +3073,18 @@ impl WorldManager {
             // synthetic `bnpc_<id>` fallback for a not-yet-registered
             // member (rare race window). (Garlemald-Server #46.)
             let mut members = Vec::with_capacity(1 + session.transient_party_members.len());
-            members.push(tx::groups::GroupMember {
+            members.push(tx::groups::GroupMember::row_for_actor(
                 actor_id,
-                localized_name: -1,
-                unknown2: 0,
-                flag1: false,
-                is_online: true,
-                name: actor_name.clone(),
-            });
+                &actor_name,
+                display_name_id,
+            ));
             // (id, name, position) per non-self roster member — position
             // feeds the per-member 0x018D map marker below; `None` when
-            // the member isn't in the registry yet.
+            // the member isn't in the registry yet. Row encoding via
+            // `GroupMember::row_for_actor`: an NPC ally (empty display
+            // name) must ship `localized_name = display_name_id` or the
+            // client's PartyParameterWidget draws nothing for the row
+            // (see the helper's doc — Garlemald-Server #46, round 4).
             let mut member_details: Vec<(u32, String, Option<common::Vector3>)> = Vec::new();
             for &mid in &session.transient_party_members {
                 // Defensive: the transient list excludes the leader by
@@ -3020,26 +3093,32 @@ impl WorldManager {
                 if mid == actor_id {
                     continue;
                 }
-                let (name, member_pos) = if let Some(h) = registry.get(mid).await {
+                let (row, name, member_pos) = if let Some(h) = registry.get(mid).await {
                     let c = h.character.read().await;
-                    (c.base.display_name().to_string(), Some(c.base.position()))
+                    (
+                        tx::groups::GroupMember::row_for_actor(
+                            mid,
+                            c.base.display_name(),
+                            c.base.display_name_id,
+                        ),
+                        c.base.display_name().to_string(),
+                        Some(c.base.position()),
+                    )
                 } else {
                     tracing::warn!(
                         session = session_id,
                         member = format!("0x{mid:08X}"),
                         "zone-in party roster: member not in registry, using placeholder name",
                     );
-                    (format!("bnpc_{mid:08X}"), None)
+                    let placeholder = format!("bnpc_{mid:08X}");
+                    (
+                        tx::groups::GroupMember::row_for_actor(mid, &placeholder, 0),
+                        placeholder,
+                        None,
+                    )
                 };
-                member_details.push((mid, name.clone(), member_pos));
-                members.push(tx::groups::GroupMember {
-                    actor_id: mid,
-                    localized_name: -1,
-                    unknown2: 0,
-                    flag1: false,
-                    is_online: true,
-                    name,
-                });
+                member_details.push((mid, name, member_pos));
+                members.push(row);
             }
             let mut offset = 0usize;
             let group_pkts = vec![
@@ -3320,7 +3399,7 @@ impl WorldManager {
         destination_zone_id: u32,
         position: Vector3,
     ) -> Result<()> {
-        let Some(_dest_zone) = self.zone(destination_zone_id).await else {
+        let Some(dest_zone) = self.zone(destination_zone_id).await else {
             return Ok(());
         };
 
@@ -3372,12 +3451,108 @@ impl WorldManager {
                 session.merged_zone_id = None;
             }
         }
+
+        // Tell the CLIENT about the crossing. A flip that moved only
+        // server-side bookkeeping left the client inside zone-133
+        // geometry while still holding zone-230 context, and its talk
+        // sender (decomp `PlayerBaseClass.lua:98-160` gate) silently
+        // refused to start events against the new zone's actors — the
+        // Limsa seamless softlock: repeated RX 0x00CD target-selects on
+        // Baderon with ZERO 0x012D EventStart (23:48 / 00:11-00:12 wire
+        // windows), re-blocking Baderon after every warp landing.
+        // pmeteor's `Player.SendSeamlessZoneInPackets` (Player.cs:637)
+        // ships SetMusic + SetWeather + SetMap on every flip
+        // (WorldManager.cs:709-737); the decomp additionally shows the
+        // client needs the DESTINATION zone's AreaMaster ScriptBind
+        // (e.g. src=0x00000085 `_areaMaster@08500` class
+        // ZoneMasterSeaS0) — present in every login bundle, previously
+        // never sent on a flip. NO actor deletes/re-adds here: the
+        // no-delete flip design stands (see the `actor_instance_list`
+        // note above — a re-AddActor resets the receiver's +0x5c/+0x7d
+        // event-readiness gates mid-stream). The area master's own
+        // AddActor is immediately followed by its fresh ScriptBind, so
+        // it ends the crossing event-ready even on repeated back-and-
+        // forth flips. (Garlemald-Server #46, round 4.)
+        if let Some(client) = self.client(session_id).await {
+            let (
+                zone_actor_id,
+                region_id,
+                bgm_day,
+                zone_name,
+                class_path,
+                class_name,
+                can_ride_chocobo,
+                can_stealth,
+                is_inn,
+                is_instance_raid,
+            ) = {
+                let z = dest_zone.read().await;
+                (
+                    z.core.actor_id,
+                    z.core.region_id as u32,
+                    z.core.bgm_day,
+                    z.core.zone_name.clone(),
+                    z.core.class_path.clone(),
+                    z.core.class_name.clone(),
+                    z.core.can_ride_chocobo,
+                    z.core.can_stealth,
+                    z.core.is_inn,
+                    z.core.is_instance_raid,
+                )
+            };
+            let mut subpackets: Vec<common::subpacket::SubPacket> = Vec::new();
+            // Music mode 0x04 = EFFECT_FADEIN — pmeteor's flip uses the
+            // fade (SendSeamlessZoneInPackets), unlike the login
+            // bundle's 0x01 EFFECT_IMMEDIATE.
+            push_zone_header_packets(
+                &mut subpackets,
+                actor_id,
+                self.world_settings.dalamud_phase,
+                bgm_day,
+                0x04,
+                self.world_settings.weather_id,
+                self.world_settings.weather_transition,
+                region_id,
+                zone_actor_id,
+            );
+            // Destination AreaMaster — full 7-packet master spawn
+            // (AddActor + Speed + Position + Name + State + IsZoning +
+            // ScriptBind), same shape the login bundle sends. Flips are
+            // public↔public by construction, so the PUBLIC Zone bind
+            // applies.
+            push_master_spawn(
+                &mut subpackets,
+                zone_actor_id,
+                format!("_areaMaster@{:05X}", zone_actor_id << 8),
+                class_name,
+                public_zone_bind_params(
+                    &class_path,
+                    &zone_name,
+                    can_ride_chocobo,
+                    can_stealth,
+                    is_inn,
+                    is_instance_raid,
+                ),
+            );
+            for mut sub in subpackets {
+                // Untargeted subpackets are dropped by the world-server
+                // proxy fan-out — stamp every one.
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+        } else {
+            tracing::debug!(
+                session = session_id,
+                "seamless zone change: no client handle — crossing packets skipped",
+            );
+        }
+
         tracing::info!(
             actor = format!("0x{actor_id:08X}"),
             session = session_id,
             from = old_zone_id,
             to = destination_zone_id,
-            "seamless zone change",
+            "seamless zone change (destination SetMap header + area-master bind emitted)",
         );
         Ok(())
     }

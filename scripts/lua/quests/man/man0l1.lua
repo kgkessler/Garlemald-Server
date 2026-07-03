@@ -605,7 +605,16 @@ function seq007_onTalk(player, quest, npc, classId)
 end
 
 function seq007_endSequence(player, quest)
-	callClientFunction(player, "delegateEvent", player, quest, "processEvent033");
+	-- processEvent033 is just two worldMaster:say lines (decoded client
+	-- Man0l1.lua:596-610) — no player interaction. Wire-proven (round-3
+	-- ECHO_EXIT capture): the client answers processEvent060 and
+	-- processEvent604_3 but NEVER answers 033's EventUpdate, so the
+	-- coroutine parked here forever and the EndEvent/SetFlag/exit-warp
+	-- tail never ran. Deliver both lines server-side instead — text ids
+	-- 333/334 on the man0l1 QUEST sheet, same sheet as the working
+	-- 320/321 sends in onStart (wire-confirmed text_owner_id=2700193202).
+	player:SendGameMessage(quest, 333, 0x20);
+	player:SendGameMessage(quest, 334, 0x20);
 	quest:NewNpcLsMsg(1);
 end
 
@@ -664,19 +673,15 @@ function onPush(player, quest, npc)
 			GetWorldManager():DoZoneChange(player, 230, nil, 0, 15, -620.0, 29.476, -70.050, 0.791);
 		elseif (classId == ECHO_EXIT_TRIGGER) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent060");
-			-- Armed-veil neutralizer (processEvent604_3 =
-			-- startFadeInCutSceneDefault): processEvent060 ends with
-			-- startFadeInCutSceneAfterWarp (decoded Man0l1.lua:1135),
-			-- arming a Now-Loading veil. Unlike the MSK_TRIGGER /
-			-- ISANDOREL sites (which warp immediately and let the
-			-- AfterQuestWarpDirector kick clear the veil post-warp), this
-			-- site still has a cutscene to play BEFORE its warp: the
-			-- neutralizer must run ahead of seq007_endSequence so
-			-- processEvent033 (26s) plays on a live screen and its
-			-- EventUpdate resumes this coroutine — with the veil up, the
-			-- chain died here and the EndEvent/NewNpcLsMsg/exit-warp tail
-			-- never ran. (Wire-proven in the round-2 retest.)
-			callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
+			-- No processEvent604_3 neutralizer here anymore (round 4):
+			-- seq007_endSequence now delivers 033's two lines server-side
+			-- (SendGameMessage — see that function), so nothing needs to
+			-- play on a live screen between processEvent060 and the exit
+			-- warp. The startFadeInCutSceneAfterWarp veil armed by 060
+			-- (decoded Man0l1.lua:1135) stays up as the transition cover
+			-- and the AfterQuestWarpDirector kick below clears it
+			-- post-warp — the same shape as the wire-proven-complete
+			-- MSK_TRIGGER and ISANDOREL sites. (Garlemald-Server #46, r4.)
 			data:IncCounter(CNTR_SEQ7_MSK);
 			if (data:GetCounter(CNTR_SEQ7_CUL) == 1) then
 				seq007_endSequence(player, quest);

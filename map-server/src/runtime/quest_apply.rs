@@ -1114,35 +1114,36 @@ async fn apply_party_add_member(
     world.upsert_session(snap).await;
 
     // Build the roster: leader first, then the transient members.
-    // Names come from each actor's `character.base.display_name()`.
+    // Encoding via `GroupMember::row_for_actor` — an NPC ally (empty
+    // display name) must carry its localized display-name id in
+    // `localized_name` or the client's PartyParameterWidget renders a
+    // blank row (Garlemald-Server #46, round 4; see the helper's doc).
     let leader_name = {
         let c = leader_handle.character.read().await;
         c.base.display_name().to_string()
     };
     let mut members: Vec<crate::packets::send::groups::GroupMember> = Vec::new();
-    members.push(crate::packets::send::groups::GroupMember {
-        actor_id: leader_actor_id,
-        localized_name: -1,
-        unknown2: 0,
-        flag1: false,
-        is_online: true,
-        name: leader_name,
-    });
+    members.push(crate::packets::send::groups::GroupMember::row_for_actor(
+        leader_actor_id,
+        &leader_name,
+        0,
+    ));
     for &mid in &roster_ids {
-        let name = if let Some(h) = registry.get(mid).await {
+        let member = if let Some(h) = registry.get(mid).await {
             let c = h.character.read().await;
-            c.base.display_name().to_string()
+            crate::packets::send::groups::GroupMember::row_for_actor(
+                mid,
+                c.base.display_name(),
+                c.base.display_name_id,
+            )
         } else {
-            format!("bnpc_{mid:08X}")
+            crate::packets::send::groups::GroupMember::row_for_actor(
+                mid,
+                &format!("bnpc_{mid:08X}"),
+                0,
+            )
         };
-        members.push(crate::packets::send::groups::GroupMember {
-            actor_id: mid,
-            localized_name: -1,
-            unknown2: 0,
-            flag1: false,
-            is_online: true,
-            name,
-        });
+        members.push(member);
     }
 
     // Emit the trio. Mirrors the solo-party block in
@@ -2035,6 +2036,43 @@ pub(crate) async fn apply_do_zone_change(
         return;
     }
 
+    // LOGIN-WINDOW deferral — a warp drained while the client is still
+    // loading zone-in bundle #1 must NOT fire a second world-load. The
+    // login arm re-runs quest `onStateChange` AFTER dispatching the
+    // login bundle (processor.rs `handle_language_code`), and a rescue
+    // warp drained there (man0l1's PrivateAreaMasterPast/3 relog arm's
+    // `WarpToPublicArea`) used to apply immediately: wipe pair + bundle
+    // #2 + kick landed 6-15 ms behind bundle #1 and the client's
+    // UI/event layer never finished initializing — dead menus/talks for
+    // the whole session (wire 00:09:23.876-.891). Park the WHOLE warp
+    // (no session/character/DB mutation yet — the replay performs all
+    // of it) and let the `RX 0x0007` arm apply it against a
+    // fully-loaded client. Last writer wins if several warps drain in
+    // the window. (Garlemald-Server #46, round 4.)
+    if let Some(mut snap) = world.session(session_id).await
+        && snap.defer_warps_until_zone_in_ack
+    {
+        snap.deferred_login_warp = Some(crate::data::DeferredWarp {
+            player_id,
+            zone_id,
+            private_area: private_area.clone(),
+            private_area_type,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+        });
+        world.upsert_session(snap).await;
+        tracing::info!(
+            player = player_id,
+            zone = zone_id,
+            ?private_area,
+            "DoZoneChange parked until login zone-in ack (login-window warp deferral)",
+        );
+        return;
+    }
+
     // Pre-move zone + private-area routing — feeds the transition
     // classification in step 4 (same-seamless-family detection needs to
     // know the ORIGIN was public; `do_zone_change_with_private_area`
@@ -2198,6 +2236,17 @@ pub(crate) async fn apply_do_zone_change(
 
     if let Some(mut snap) = world.session(session_id).await {
         snap.destination_spawn_type = spawn_type;
+        // The immediate wipe+0x10 recipe never parks a `pending_zone_in`,
+        // so `handle_update_position`'s stale-report guard didn't cover
+        // it: a 0x00CA sent pre-Now-Loading (old-zone coords) landed
+        // AFTER the warp applied, overwrote the warped position, and
+        // pointed the partner-zone scan at the origin (34 phantom
+        // Drowning Wench NPCs streamed into the camp view 8 ms after
+        // the 23:44:06 133→128 bundle). Latch until the client's
+        // RX 0x0007 zone-in-complete. (Garlemald-Server #46, round 4.)
+        if use_wipe_reload_recipe {
+            snap.reload_in_flight = true;
+        }
         world.upsert_session(snap).await;
     }
 

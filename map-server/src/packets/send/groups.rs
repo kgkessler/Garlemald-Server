@@ -48,6 +48,54 @@ pub struct GroupMember {
     pub name: String,
 }
 
+impl GroupMember {
+    /// Party-row encoding for an actor in the extended-temp group 10001
+    /// (0x2711) — the ONLY group the client's party HUD reads: decomp
+    /// `CharaBaseClass:getPlayerParty` is literally
+    /// `self:_getExtendedTemporaryGroup(10001)`, and the
+    /// PartyParameterWidget (bottom-right ally rows — DESIGNED for NPC
+    /// members, it renders `???` when `actor:isPlayer() == false`)
+    /// resolves each row's label from these fields:
+    ///
+    /// * PLAYER (non-empty display name): `localized_name = -1`
+    ///   ("custom name used", per the 0x017C wiki note) + the name
+    ///   string in the 0x20-byte slot field.
+    /// * NPC (empty display name, e.g. a `currentParty:AddMember`'d
+    ///   tutorial ally like Y'shtola): retail's 10001 X08 rows carry
+    ///   the NPC's LOCALIZED DISPLAY-NAME ID in `localized_name` with
+    ///   an empty name string — the client looks the label up in its
+    ///   own text sheets. Garlemald's emitters used to ship
+    ///   `{ localized_name: -1, name: "" }` for NPCs (their
+    ///   `display_name()` is empty), which the widget draws as nothing
+    ///   — the round-1 "party-adds don't render" break.
+    ///
+    /// `BaseActor::new` seeds `display_name_id = 0xFFFFFFFF`, so an NPC
+    /// without a real display-name id degrades to `-1` — the previous
+    /// (blank-row) behaviour, never garbage. (Garlemald-Server #46,
+    /// round 4.)
+    pub fn row_for_actor(actor_id: u32, display_name: &str, display_name_id: u32) -> Self {
+        if display_name.is_empty() {
+            Self {
+                actor_id,
+                localized_name: display_name_id as i32,
+                unknown2: 0,
+                flag1: false,
+                is_online: true,
+                name: String::new(),
+            }
+        } else {
+            Self {
+                actor_id,
+                localized_name: -1,
+                unknown2: 0,
+                flag1: false,
+                is_online: true,
+                name: display_name.to_string(),
+            }
+        }
+    }
+}
+
 /// Fixed member-slot size in Meteor: u32+i32+u32+byte+byte+name[0x20] =
 /// 0x2E bytes written, slot is 0x30 with two trailing pad bytes.
 const GROUP_MEMBER_SLOT_BYTES: usize = 0x30;
@@ -840,6 +888,48 @@ mod tests {
 
         // numEntries u32 then 4 bytes trailing pad.
         assert_eq!(&body[0x290..0x298], &[0x01, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// A 3-member 10001 party trio (player leader + two NPC allies) must
+    /// round-trip with count=3 and the NPC rows carrying
+    /// `localizedName = displayNameId` — the encoding the client's
+    /// PartyParameterWidget resolves NPC row labels from (see
+    /// `GroupMember::row_for_actor`). (Garlemald-Server #46, round 4.)
+    #[test]
+    fn party_x08_npc_rows_carry_display_name_id() {
+        const NPC_YSHTOLA_ID: u32 = 0x4534_0006;
+        const NPC_STHALMANN_ID: u32 = 0x4534_0007;
+        const YSHTOLA_DISPLAY_NAME_ID: u32 = 3_020_045;
+        const STHALMANN_DISPLAY_NAME_ID: u32 = 3_020_046;
+        let members = vec![
+            // Player: non-empty display name → custom-name row.
+            GroupMember::row_for_actor(0x0000_02AE, "Aert Zeverith", 0xFFFF_FFFF),
+            // NPC allies: empty display name → display-name-id row.
+            GroupMember::row_for_actor(NPC_YSHTOLA_ID, "", YSHTOLA_DISPLAY_NAME_ID),
+            GroupMember::row_for_actor(NPC_STHALMANN_ID, "", STHALMANN_DISPLAY_NAME_ID),
+        ];
+        let mut offset = 0usize;
+        let pkt = build_group_members_x08(0x0000_02AE, 0xA6, 0x01, &members, &mut offset);
+        assert_eq!(offset, 3);
+        // Count at body 0x10 + 0x30*8 = 0x190.
+        assert_eq!(&pkt.data[0x190..0x194], &[3, 0, 0, 0]);
+        // Slot 0 (player, body 0x10): localized_name = -1, name populated.
+        assert_eq!(&pkt.data[0x14..0x18], &(-1i32).to_le_bytes());
+        assert_eq!(&pkt.data[0x1E..0x22], b"Aert");
+        // Slot 1 (NPC, body 0x40): actor id + localized_name =
+        // display_name_id, name field all-zero.
+        assert_eq!(&pkt.data[0x40..0x44], &NPC_YSHTOLA_ID.to_le_bytes());
+        assert_eq!(
+            &pkt.data[0x44..0x48],
+            &(YSHTOLA_DISPLAY_NAME_ID as i32).to_le_bytes()
+        );
+        assert!(pkt.data[0x4E..0x6E].iter().all(|b| *b == 0));
+        // Slot 2 (NPC, body 0x70): same shape.
+        assert_eq!(&pkt.data[0x70..0x74], &NPC_STHALMANN_ID.to_le_bytes());
+        assert_eq!(
+            &pkt.data[0x74..0x78],
+            &(STHALMANN_DISPLAY_NAME_ID as i32).to_le_bytes()
+        );
     }
 
     #[test]

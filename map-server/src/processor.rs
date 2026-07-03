@@ -268,6 +268,17 @@ impl PacketProcessor {
         session.destination_y = spawn.y;
         session.destination_z = spawn.z;
         session.destination_rot = rotation;
+        // LOGIN window opens here and closes on the client's first
+        // RX 0x0007: any warp drained in between (the login arm re-runs
+        // quest onStateChange AFTER dispatching zone-in bundle #1, and
+        // a rescue arm may emit WarpToPublicArea) is parked on
+        // `deferred_login_warp` instead of firing a second world-load
+        // under the still-initializing client (#46 round 4; see
+        // `Session::defer_warps_until_zone_in_ack`). This upsert is a
+        // fresh `Session::new`, so a relog can never inherit a stale
+        // `reload_in_flight` / deferred-warp latch from a crashed
+        // predecessor session.
+        session.defer_warps_until_zone_in_ack = true;
         self.world.upsert_session(session).await;
 
         // 3. Build a Character from the loaded row and register it.
@@ -844,48 +855,8 @@ impl PacketProcessor {
             // deleted that zone.lua too (pmeteor 26fd79be); the single
             // bundle kick from player.lua onBeginLogin is sufficient,
             // as Gridania/Ul'dah always demonstrated.
-            let zone_name = match self.world.zone(zone).await {
-                Some(z) => z.read().await.core.zone_name.clone(),
-                None => String::new(),
-            };
-            if !zone_name.is_empty() {
-                let zone_script = engine.resolver().zone(&zone_name);
-                if zone_script.exists() {
-                    let snapshot = {
-                        let c = handle.character.read().await;
-                        build_player_snapshot_for_login(&c)
-                    };
-                    let result =
-                        engine.call_player_hook_best_effort(&zone_script, "onZoneIn", snapshot);
-                    let cmd_count = result.commands.len();
-                    for cmd in result.commands {
-                        self.apply_post_zone_in_lua_command(&handle, session_id, cmd)
-                            .await;
-                    }
-                    match result.error {
-                        None => tracing::info!(
-                            session = session_id,
-                            actor = actor_id,
-                            zone = %zone_name,
-                            commands = cmd_count,
-                            "onZoneIn lua hook ran"
-                        ),
-                        Some(e) => tracing::warn!(
-                            error = %e,
-                            session = session_id,
-                            actor = actor_id,
-                            zone = %zone_name,
-                            commands = cmd_count,
-                            "onZoneIn lua hook errored; applied partial commands"
-                        ),
-                    }
-                } else {
-                    tracing::debug!(
-                        path = %zone_script.display(),
-                        "zone.lua not present; skipping onZoneIn"
-                    );
-                }
-            }
+            self.run_zone_on_zone_in_hook(&handle, session_id, zone)
+                .await;
         }
 
         // Arm quest ENPC state on login / relog. A continuous playthrough sets
@@ -1007,6 +978,64 @@ impl PacketProcessor {
             other => {
                 tracing::debug!(?other, "post-zone-in lua cmd (unhandled)");
             }
+        }
+    }
+
+    /// Fire `zone.lua:onZoneIn` for `zone_id` against this player and
+    /// drain the resulting commands through
+    /// `apply_post_zone_in_lua_command`. Shared by the login arm (C#
+    /// `WorldManager.DoZoneIn`'s tail, WorldManager.cs:1468) and the
+    /// seamless-flip arm in `handle_update_position` (C#
+    /// `DoSeamlessZoneChange`'s tail, WorldManager.cs:947 — pmeteor
+    /// runs the DESTINATION zone's onZoneIn on every boundary flip;
+    /// garlemald previously only ran it at login). No-op without a Lua
+    /// engine or when the zone ships no zone.lua (the common case).
+    /// (Garlemald-Server #46, round 4.)
+    async fn run_zone_on_zone_in_hook(&self, handle: &ActorHandle, session_id: u32, zone_id: u32) {
+        let Some(engine) = self.lua.as_ref() else {
+            return;
+        };
+        let zone_name = match self.world.zone(zone_id).await {
+            Some(z) => z.read().await.core.zone_name.clone(),
+            None => String::new(),
+        };
+        if zone_name.is_empty() {
+            return;
+        }
+        let zone_script = engine.resolver().zone(&zone_name);
+        if !zone_script.exists() {
+            tracing::debug!(
+                path = %zone_script.display(),
+                "zone.lua not present; skipping onZoneIn"
+            );
+            return;
+        }
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_for_login(&c)
+        };
+        let result = engine.call_player_hook_best_effort(&zone_script, "onZoneIn", snapshot);
+        let cmd_count = result.commands.len();
+        for cmd in result.commands {
+            self.apply_post_zone_in_lua_command(handle, session_id, cmd)
+                .await;
+        }
+        match result.error {
+            None => tracing::info!(
+                session = session_id,
+                actor = handle.actor_id,
+                zone = %zone_name,
+                commands = cmd_count,
+                "onZoneIn lua hook ran"
+            ),
+            Some(e) => tracing::warn!(
+                error = %e,
+                session = session_id,
+                actor = handle.actor_id,
+                zone = %zone_name,
+                commands = cmd_count,
+                "onZoneIn lua hook errored; applied partial commands"
+            ),
         }
     }
 
@@ -2936,33 +2965,35 @@ impl PacketProcessor {
         };
 
         // Build GroupMember rows: leader first, then the transient
-        // adds. Look up names; default to "bnpc_<id>" placeholder if
+        // adds. Encoding via `GroupMember::row_for_actor` — an NPC ally
+        // (empty display name) must carry its localized display-name id
+        // in `localized_name` or the client's PartyParameterWidget
+        // renders a blank row (Garlemald-Server #46, round 4; see the
+        // helper's doc). Falls back to a "bnpc_<id>" placeholder row if
         // the member isn't registered yet (B1's spawn happens in the
         // same drain so this should normally resolve).
         let mut members = Vec::with_capacity(1 + members_actor_ids.len());
-        members.push(crate::packets::send::groups::GroupMember {
-            actor_id: leader_actor_id,
-            localized_name: -1,
-            unknown2: 0,
-            flag1: false,
-            is_online: true,
-            name: leader_name,
-        });
+        members.push(crate::packets::send::groups::GroupMember::row_for_actor(
+            leader_actor_id,
+            &leader_name,
+            0,
+        ));
         for &mid in &members_actor_ids {
-            let name = if let Some(h) = self.registry.get(mid).await {
+            let member = if let Some(h) = self.registry.get(mid).await {
                 let c = h.character.read().await;
-                c.base.display_name().to_string()
+                crate::packets::send::groups::GroupMember::row_for_actor(
+                    mid,
+                    c.base.display_name(),
+                    c.base.display_name_id,
+                )
             } else {
-                format!("bnpc_{mid:08X}")
+                crate::packets::send::groups::GroupMember::row_for_actor(
+                    mid,
+                    &format!("bnpc_{mid:08X}"),
+                    0,
+                )
             };
-            members.push(crate::packets::send::groups::GroupMember {
-                actor_id: mid,
-                localized_name: -1,
-                unknown2: 0,
-                flag1: false,
-                is_online: true,
-                name,
-            });
+            members.push(member);
         }
 
         // Build the trio. Group index uses the same solo-self flag
@@ -3223,9 +3254,16 @@ impl PacketProcessor {
 
         // 3. Update the session's spawn_type / destination fields. The
         //    helper above set zone + xyz/rot but not the spawn_type
-        //    arg the bundle uses.
+        //    arg the bundle uses. Also latch `reload_in_flight` — the
+        //    content warp is the other immediate wipe+0x10 emitter
+        //    (same shape as `quest_apply::apply_do_zone_change`'s
+        //    resident-geometry branch), so a stale pre-Now-Loading
+        //    0x00CA would otherwise overwrite the warped position /
+        //    stream phantom partner-zone NPCs. Cleared by the client's
+        //    RX 0x0007 zone-in-complete. (Garlemald-Server #46, round 4.)
         if let Some(mut snap) = self.world.session(session_id).await {
             snap.destination_spawn_type = spawn_type;
+            snap.reload_in_flight = true;
             self.world.upsert_session(snap).await;
         }
 
@@ -7307,30 +7345,7 @@ impl PacketProcessor {
             // surface in tracing instead of being invisible. Counts
             // are from the 56-capture retail audit
             // (`captures/retail_pcap_gap_analysis.md`).
-            OP_RX_ZONE_IN_COMPLETE => {
-                // 24 events/session. Wiki: "Unknown 0x007"; semantics
-                // per Meteor: client signals it's safe to receive
-                // world-spawn packets after zone-in init. Today
-                // garlemald uses `OP_RX_LANGUAGE_CODE` (0x0006) as
-                // the deferred trigger, but 0x0007 is its successor —
-                // promotion to explicit dispatch here keeps the
-                // existing language-code path authoritative while
-                // surfacing 0x0007 events for future feature work
-                // (e.g. retail uses this as the "DoZoneIn complete"
-                // signal alongside or instead of 0x0006).
-                tracing::debug!(
-                    source = source,
-                    "RX 0x0007 zone-in-complete signal (no-op pending dedicated handler)",
-                );
-                // Content warps no longer defer any NPC reveal to this echo:
-                // `apply_do_zone_change_content` flips `warp_complete` /
-                // `content_warp_acked` inline at warp time and ships the content
-                // NPCs IN the zone-in bundle (the 0x10 force-reload path). The
-                // old same-map escort (spawnType 0x16) held its NPCs out of the
-                // bundle and revealed them here on the post-warp echo; that path
-                // was removed when the escort moved cross-map to zone 129, so
-                // there is nothing left to do here. (Garlemald #46.)
-            }
+            OP_RX_ZONE_IN_COMPLETE => self.handle_zone_in_complete(source).await,
             OP_RX_LOCK_TARGET => {
                 // 66 events/session. Wiki: "Target Locked". Client
                 // sends this when the player target-locks an actor
@@ -9213,7 +9228,83 @@ impl PacketProcessor {
         Ok(())
     }
 
-    async fn handle_update_position(&self, session_id: u32, data: &[u8]) -> Result<()> {
+    /// RX 0x0007 zone-in-complete — the client signals it finished
+    /// loading and it's safe to receive world-spawn packets (24
+    /// events/session in the retail audit; wiki: "Unknown 0x007").
+    /// Today garlemald still uses `OP_RX_LANGUAGE_CODE` (0x0006) as the
+    /// login trigger; 0x0007 is its per-zone-in successor. Two session
+    /// latches resolve here (#46 round 4):
+    ///
+    /// 1. `reload_in_flight` — set by the immediate wipe+0x10 reload
+    ///    emitters (`quest_apply::apply_do_zone_change` resident-
+    ///    geometry branch / `apply_do_zone_change_content`); while set,
+    ///    stale pre-Now-Loading 0x00CA reports are dropped. The echo
+    ///    means the client is standing at the warped position, so
+    ///    position streaming can resume.
+    /// 2. `defer_warps_until_zone_in_ack` + `deferred_login_warp` — a
+    ///    warp drained during the LOGIN window (the man0l1 rescue arm's
+    ///    `WarpToPublicArea` out of PrivateAreaMasterPast/3) was parked
+    ///    instead of firing a second world-load 6-15 ms behind login
+    ///    bundle #1; the FIRST 0x0007 of the session applies it now, as
+    ///    a normal in-session warp against a fully-loaded client. The
+    ///    replayed `apply_do_zone_change` performs the position/zone
+    ///    persistence the warp would have done live.
+    ///
+    /// Content warps no longer defer any NPC reveal to this echo:
+    /// `apply_do_zone_change_content` flips `warp_complete` /
+    /// `content_warp_acked` inline at warp time and ships the content
+    /// NPCs IN the zone-in bundle (the 0x10 force-reload path). The old
+    /// same-map escort (spawnType 0x16) held its NPCs out of the bundle
+    /// and revealed them here; that path was removed when the escort
+    /// moved cross-map to zone 129. (Garlemald #46.)
+    ///
+    /// `pub(crate)` so integration tests can simulate the client's
+    /// zone-in echo directly.
+    pub(crate) async fn handle_zone_in_complete(&self, session_id: u32) {
+        let deferred_warp = if let Some(mut snap) = self.world.session(session_id).await {
+            snap.reload_in_flight = false;
+            snap.defer_warps_until_zone_in_ack = false;
+            let deferred = snap.deferred_login_warp.take();
+            self.world.upsert_session(snap).await;
+            deferred
+        } else {
+            None
+        };
+        tracing::debug!(
+            session = session_id,
+            deferred_warp = deferred_warp.is_some(),
+            "RX 0x0007 zone-in-complete — reload/login latches cleared",
+        );
+        if let Some(w) = deferred_warp {
+            tracing::info!(
+                session = session_id,
+                player = w.player_id,
+                zone = w.zone_id,
+                private_area = ?w.private_area,
+                "applying login-deferred warp on zone-in ack (login-window warp deferral)",
+            );
+            crate::runtime::quest_apply::apply_do_zone_change(
+                w.player_id,
+                w.zone_id,
+                w.private_area,
+                w.private_area_type,
+                w.spawn_type,
+                w.x,
+                w.y,
+                w.z,
+                w.rotation,
+                &self.registry,
+                &self.db,
+                &self.world,
+                self.lua.as_ref(),
+            )
+            .await;
+        }
+    }
+
+    /// `pub(crate)` so integration tests can drive the stale-position /
+    /// reload-latch flow directly (mirrors `apply_login_lua_command`).
+    pub(crate) async fn handle_update_position(&self, session_id: u32, data: &[u8]) -> Result<()> {
         let pkt = match UpdatePlayerPositionPacket::parse(data) {
             Ok(p) => p,
             Err(e) => {
@@ -9228,12 +9319,15 @@ impl PacketProcessor {
         let actor_id = handle.actor_id;
 
         // Hold stale position reports off the character while a
-        // deferred zone-in is parked — the client keeps reporting
-        // OLD-zone coordinates through the Now-Loading gap (retail
-        // captures show the same), and writing them would relocate the
-        // warp destination before the bundle reads it.
+        // deferred zone-in is parked OR an immediate wipe+0x10 reload
+        // is in flight (`reload_in_flight`, cleared by RX 0x0007) — the
+        // client keeps reporting OLD-zone coordinates through the
+        // Now-Loading gap (retail captures show the same), and writing
+        // them would relocate the warp destination before the bundle
+        // reads it / point `send_instance_update`'s partner-zone scan
+        // at the origin (the 34-phantom-NPC stream, #46 round 4).
         if let Some(session) = self.world.session(session_id).await
-            && session.pending_zone_in.is_some()
+            && (session.pending_zone_in.is_some() || session.reload_in_flight)
         {
             return Ok(());
         }
@@ -9334,7 +9428,7 @@ impl PacketProcessor {
         //     armed regardless of stream timing. Mirrors pmeteor re-arming
         //     quest ENPCs per stream-in with NO zone predicate
         //     (Session.UpdateInstance → GetQuestsForNpc). (Garlemald-Server #46.)
-        if seamless_dest.is_some() {
+        if let Some(dest) = seamless_dest {
             let active_quest_ids: Vec<u32> = {
                 let c = handle.character.read().await;
                 c.quest_journal
@@ -9347,6 +9441,13 @@ impl PacketProcessor {
             for quest_id in active_quest_ids {
                 self.apply_quest_update_enpcs(actor_id, quest_id).await;
             }
+            // 3d. pmeteor parity: `DoSeamlessZoneChange` ends with
+            //     `LuaEngine.CallLuaFunction(player, newZone, "onZoneIn",
+            //     true)` (WorldManager.cs:947) — run the DESTINATION
+            //     zone.lua's onZoneIn on every flip, same shared hook the
+            //     login arm uses. (Garlemald-Server #46, round 4.)
+            self.run_zone_on_zone_in_hook(&handle, session_id, dest)
+                .await;
         }
 
         // 4. Proximity-push dispatch is now CLIENT-SIDE. The

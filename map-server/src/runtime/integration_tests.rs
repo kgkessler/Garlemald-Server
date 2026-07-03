@@ -16334,6 +16334,292 @@ async fn send_instance_update_streams_seamless_partner_zone_npc() {
     );
 }
 
+/// Garlemald-Server #46 round 4 (R4b) — the immediate wipe+0x10 reload
+/// recipe must latch `reload_in_flight` so a STALE 0x00CA (old-zone
+/// coords, sent by the client pre-Now-Loading) can't overwrite the
+/// warped position or point `send_instance_update`'s partner-zone scan
+/// back at the origin (wire 23:44:06: teleport 133→128, 34 phantom
+/// Drowning Wench NPCs streamed into the camp view 8 ms after the
+/// bundle). The client's RX 0x0007 zone-in-complete clears the latch
+/// and position streaming resumes.
+#[tokio::test]
+async fn reload_latch_holds_stale_position_updates_until_zone_in_ack() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, SeamlessBoundary, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const PLAYER_ID: u32 = 1;
+    const TOWN_NPC_ID: u32 = 0x4000_0031; // seeded in old zone 133
+    const CAMP_NPC_ID: u32 = 0x4000_0032; // seeded in new zone 128
+    const OLD_ZONE: u32 = 133; // sea0Town01
+    const NEW_ZONE: u32 = 128; // sea0Field01
+    const LIMSA_REGION: u16 = 101;
+    // Old-zone (town) coords the stale report carries; warped camp
+    // coords; a camp NPC two 50-unit grid cells out from the warp point
+    // (the stream scan is cell-based, ±1 cell) so only the post-ack
+    // walk to the adjacent cell streams it.
+    const TOWN_POS: (f32, f32, f32) = (0.0, 0.0, 0.0);
+    const CAMP_POS: (f32, f32, f32) = (500.0, 0.0, 500.0); // cell 10
+    const CAMP_NPC_POS: (f32, f32, f32) = (610.0, 0.0, 610.0); // cell 12
+    const POST_ACK_POS: (f32, f32, f32) = (555.0, 0.0, 555.0); // cell 11
+
+    fn position_report(x: f32, y: f32, z: f32) -> Vec<u8> {
+        // UpdatePlayerPositionPacket wire body: u64 timestamp +
+        // f32 x/y/z/rot + u16 move_state.
+        let mut v = Vec::with_capacity(26);
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&x.to_le_bytes());
+        v.extend_from_slice(&y.to_le_bytes());
+        v.extend_from_slice(&z.to_le_bytes());
+        v.extend_from_slice(&0f32.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v
+    }
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+
+    for (zone_id, name) in [(OLD_ZONE, "sea0Town01"), (NEW_ZONE, "sea0Field01")] {
+        let zone = Zone::new(
+            zone_id,
+            name.to_string(),
+            LIMSA_REGION,
+            String::new(),
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        world.register_zone(zone).await;
+    }
+    // 133/128 seam registered (makes the 133→128 warp classify as
+    // `merged_pair_public` → the immediate wipe+0x10 recipe). All three
+    // boxes sit far from every test position so no flip/merge fires.
+    world
+        .register_seamless_boundary(SeamlessBoundary {
+            id: 1,
+            region_id: LIMSA_REGION as u32,
+            zone_id_1: OLD_ZONE,
+            zone_id_2: NEW_ZONE,
+            zone1_x1: -1000.0,
+            zone1_y1: -1000.0,
+            zone1_x2: -900.0,
+            zone1_y2: -900.0,
+            zone2_x1: 900.0,
+            zone2_y1: 900.0,
+            zone2_x2: 1000.0,
+            zone2_y2: 1000.0,
+            merge_x1: -500.0,
+            merge_y1: -500.0,
+            merge_x2: -400.0,
+            merge_y2: -400.0,
+        })
+        .await;
+
+    // Player in town zone 133.
+    let mut player = Character::new(PLAYER_ID);
+    player.base.zone_id = OLD_ZONE;
+    registry
+        .insert(ActorHandle::new(
+            PLAYER_ID,
+            ActorKindTag::Player,
+            OLD_ZONE,
+            PLAYER_ID,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    world
+        .register_client(PLAYER_ID, ClientHandle::new(PLAYER_ID, tx))
+        .await;
+    let mut session = MapSession::new(PLAYER_ID);
+    session.current_zone_id = OLD_ZONE;
+    world.upsert_session(session).await;
+    {
+        let zone_arc = world.zone(OLD_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: PLAYER_ID,
+                kind: ActorKind::Player,
+                position: Vector3::new(TOWN_POS.0, TOWN_POS.1, TOWN_POS.2),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    // Town NPC in 133 near the OLD position — the phantom candidate the
+    // stale report would stream via the partner-zone scan.
+    let mut town_npc = Character::new(TOWN_NPC_ID);
+    town_npc.base.zone_id = OLD_ZONE;
+    town_npc.chara.actor_class_id = 1_000_057;
+    town_npc.base.actor_name = "tavern_populace".to_string();
+    registry
+        .insert(ActorHandle::new(
+            TOWN_NPC_ID,
+            ActorKindTag::Npc,
+            OLD_ZONE,
+            0,
+            town_npc,
+        ))
+        .await;
+    {
+        let zone_arc = world.zone(OLD_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: TOWN_NPC_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(3.0, 0.0, 3.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+    // Camp NPC in 128, outside the warp bundle's scan radius from the
+    // camp spawn — only the post-ack position report walks it into range.
+    let mut camp_npc = Character::new(CAMP_NPC_ID);
+    camp_npc.base.zone_id = NEW_ZONE;
+    camp_npc.chara.actor_class_id = 1_500_013;
+    camp_npc.base.actor_name = "battlewarden".to_string();
+    registry
+        .insert(ActorHandle::new(
+            CAMP_NPC_ID,
+            ActorKindTag::Npc,
+            NEW_ZONE,
+            0,
+            camp_npc,
+        ))
+        .await;
+    {
+        let zone_arc = world.zone(NEW_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: CAMP_NPC_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(CAMP_NPC_POS.0, CAMP_NPC_POS.1, CAMP_NPC_POS.2),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+
+    // Wipe+0x10 warp 133→128 (seam pair, both public, same region →
+    // the resident-geometry recipe; latches `reload_in_flight`).
+    crate::runtime::quest_apply::apply_do_zone_change(
+        PLAYER_ID, NEW_ZONE, None, 0, 2, CAMP_POS.0, CAMP_POS.1, CAMP_POS.2, 0.0, &registry, &db,
+        &world, None,
+    )
+    .await;
+    assert!(
+        world.session(PLAYER_ID).await.unwrap().reload_in_flight,
+        "wipe+0x10 warp must latch reload_in_flight",
+    );
+    // Drain the warp bundle.
+    while rx.try_recv().is_ok() {}
+
+    // STALE 0x00CA — old-zone (town) coords arriving pre-Now-Loading.
+    processor
+        .handle_update_position(
+            PLAYER_ID,
+            &position_report(TOWN_POS.0, TOWN_POS.1, TOWN_POS.2),
+        )
+        .await
+        .unwrap();
+    let mut stale_streamed: Vec<u32> = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR {
+                stale_streamed.push(sub.header.source_id);
+            }
+        }
+    }
+    assert!(
+        stale_streamed.is_empty(),
+        "stale pre-ack 0x00CA must stream ZERO actors (got {stale_streamed:?})",
+    );
+    let pos = {
+        let handle = registry.get(PLAYER_ID).await.unwrap();
+        let c = handle.character.read().await;
+        c.base.position()
+    };
+    assert_eq!(
+        (pos.x, pos.y, pos.z),
+        CAMP_POS,
+        "stale pre-ack 0x00CA must not overwrite the warped position",
+    );
+
+    // RX 0x0007 zone-in-complete → latch clears, streaming resumes.
+    processor.handle_zone_in_complete(PLAYER_ID).await;
+    assert!(
+        !world.session(PLAYER_ID).await.unwrap().reload_in_flight,
+        "RX 0x0007 must clear reload_in_flight",
+    );
+    processor
+        .handle_update_position(
+            PLAYER_ID,
+            &position_report(POST_ACK_POS.0, POST_ACK_POS.1, POST_ACK_POS.2),
+        )
+        .await
+        .unwrap();
+    let mut post_ack_streamed: Vec<u32> = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR {
+                post_ack_streamed.push(sub.header.source_id);
+            }
+        }
+    }
+    assert!(
+        post_ack_streamed.contains(&CAMP_NPC_ID),
+        "post-ack 0x00CA must resume streaming (camp NPC expected, got {post_ack_streamed:?})",
+    );
+    assert!(
+        !post_ack_streamed.contains(&TOWN_NPC_ID),
+        "the old zone's town NPC must never stream into the camp view",
+    );
+}
+
 /// Garlemald-Server #46 live test round 2 — `send_instance_update` must
 /// also ENABLE the streamed actor's event conditions (SetEventStatus
 /// 0x0136), not just register them, or the 1.x client treats the NPC as
