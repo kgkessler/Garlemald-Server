@@ -38,9 +38,16 @@ function onCreate(starterPlayer, contentArea, director)
 	mob1:ChangeState(2);
 	mob2:ChangeState(2);
 	mob3:ChangeState(2);
-	-- Party-add the allies so the HUD roster shows their HP bars (the
-	-- 1.x party list reads the real party group, not the content
-	-- group). ContentFinished clears the transient roster at teardown.
+	-- Party-add the allies (Garlemald-Server #46, round 4 — the round-2
+	-- removal was WRONG): decomp-proven, the bottom-right ally HP rows
+	-- are the PartyParameterWidget reading getPlayerParty() — the
+	-- extended-temp 10001 party group EXCLUSIVELY; the widget connector
+	-- has no arm for the 30006 content group, which triggers no party UI
+	-- at all. The round-1 party-adds were correct and failed only
+	-- because the NPC rows shipped an empty name field — the party X08
+	-- row encoding now carries the localized display_name_id, and '???'
+	-- HP rows are retail-correct for NPC party members. Allies only —
+	-- never the mobs or the director.
 	starterPlayer.currentParty:AddMember(yshtola.actorId);
 	starterPlayer.currentParty:AddMember(sthalmann.actorId);
 	-- No-die guarantees for the tutorial (MinimumHpLock floor-1 clamp);

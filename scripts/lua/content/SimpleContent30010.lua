@@ -39,15 +39,16 @@ function onCreate(starterPlayer, contentArea, director)
     mob1:ChangeState(2);
     mob2:ChangeState(2);
     mob3:ChangeState(2);
-	-- Party-add the allies (MeteorReborn SimpleContent30010.lua:17-18)
-	-- so the HUD roster renders Yda/Papalymo HP bars — the 1.x party
-	-- list reads the real party group (10001), and the content-group
-	-- 30006 roster alone never lit the bars in any live run (#28 issue:
-	-- "Yda and Papalymo's health should show in my Roster"). The
-	-- quest_system_mac variant omits these lines, but its tutorial also
-	-- never shows ally bars; MeteorReborn (Decimus's rescript) is the
-	-- canonical reference. ContentFinished clears the transient party
-	-- roster at teardown, so the party is solo again entering Gridania.
+	-- Party-add the allies (Garlemald-Server #46, round 4 — the round-2
+	-- removal was WRONG): decomp-proven, the bottom-right ally HP rows
+	-- are the PartyParameterWidget reading getPlayerParty() — the
+	-- extended-temp 10001 party group EXCLUSIVELY; the widget connector
+	-- has no arm for the 30006 content group, which triggers no party UI
+	-- at all. The round-1 party-adds were correct and failed only
+	-- because the NPC rows shipped an empty name field — the party X08
+	-- row encoding now carries the localized display_name_id, and '???'
+	-- HP rows are retail-correct for NPC party members. Allies only —
+	-- never the mobs or the director.
 	starterPlayer.currentParty:AddMember(papalymo.actorId);
 	starterPlayer.currentParty:AddMember(yda.actorId);
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);

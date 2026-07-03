@@ -37,6 +37,12 @@ function onEventStarted(player, director, eventType, eventName)
 	elseif (player:HasQuest(110006) == true) then
 		quest = player:GetQuest(110006);
 		quest:OnNotice(player);
+	else
+		-- No routed quest: still close the notice event. The kicked
+		-- noticeEvent's EndEvent round-trip is what runs the client's
+		-- MyPlayer slot 66 veil clearer; leaving it open would
+		-- event-lock the client (Garlemald-Server #46, round 2).
+		player:EndEvent();
 	end
 end
 

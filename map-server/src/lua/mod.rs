@@ -2715,8 +2715,11 @@ mod tests {
             };
 
         // Tick 1 — road clear (the only live mob is the far third
-        // cluster): the escort takes a walking step toward waypoint 1
-        // (south = +Z).
+        // cluster): the escort FOLLOWS the player. The player snapshot sits
+        // at the origin (0,0,0); the escort starts at (-60, 33.15, 170), so a
+        // walking step must move it TOWARD the player (z decreasing below 170,
+        // x increasing above -60). (See SimpleContentMan0l101.lua onUpdate
+        // follow-the-player rewrite — the old +Z waypoint walk was removed.)
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
         area.players.push(sample_snapshot());
@@ -2729,14 +2732,15 @@ mod tests {
         let step = result.commands.iter().find_map(|c| match c {
             LuaCommand::MoveActorToPosition {
                 actor_id: 0x4008_0001,
+                x,
                 z,
                 ..
-            } => Some(*z),
+            } => Some((*x, *z)),
             _ => None,
         });
         assert!(
-            step.is_some_and(|z| z > 170.0),
-            "clear road must step the escort south; got {:?}",
+            step.is_some_and(|(x, z)| z < 170.0 && x > -60.0),
+            "clear road must step the escort toward the player; got {:?}",
             result.commands,
         );
 
@@ -2768,8 +2772,10 @@ mod tests {
             result.commands,
         );
 
-        // Ticks 3-6 — sequential waypoint arrivals on a cleared road,
-        // ending with the completion signal at the final waypoint.
+        // Ticks 3-6 — the road is now fully cleared (no monsters left in the
+        // roster), so completion is keyed on the kill count (#mobs == 0), not
+        // a waypoint arrival: escortComplete must fire. Escort positions are
+        // cosmetic here.
         let waypoints = [
             (-52.0f32, 210.0f32),
             (-36.0, 255.0),
@@ -2788,14 +2794,14 @@ mod tests {
                 "arrival tick {i}: {:?}",
                 result.error
             );
-            signaled = result
+            signaled |= result
                 .commands
                 .iter()
                 .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete"));
         }
         assert!(
             signaled,
-            "final waypoint with a clear road must fire escortComplete",
+            "a cleared road (no monsters left) must fire escortComplete",
         );
     }
 

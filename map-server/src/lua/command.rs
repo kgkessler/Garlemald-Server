@@ -642,6 +642,21 @@ pub enum LuaCommand {
         player_id: u32,
         inn_id: u8,
     },
+    /// `player:UnlockAetheryteNode(aetheryteId)` — first-touch aetheryte
+    /// attunement (Garlemald-Server #46, round 5). Pushed by
+    /// `AetheryteParent.lua` / `AetheryteChild.lua` `onEventStarted`
+    /// when `HasAetheryteNodeUnlocked` is false. The apply arm inserts
+    /// into the registry-reachable `CharaState::unlocked_aetherytes`
+    /// set, persists via `characters_aetherytes` (migration 068,
+    /// INSERT OR IGNORE), and toasts the attunement line — making the
+    /// `TeleportCommand.lua` destination gate and the aetheryte menu's
+    /// per-child gates survive a relog. `aetheryte_id` is the
+    /// aetheryte's actor class id (128xxxx — same namespace as
+    /// `characters.homepoint`).
+    UnlockAetheryte {
+        player_id: u32,
+        aetheryte_id: u32,
+    },
     /// `player:SavePlayTime()` — accumulate elapsed seconds on the
     /// in-memory `play_time` field (via `Player.get_play_time(true)`)
     /// and persist via `db.save_player_play_time`. Called by

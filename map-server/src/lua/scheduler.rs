@@ -65,14 +65,50 @@ impl std::fmt::Debug for ParkedCoroutine {
     }
 }
 
+/// "Owner unknown" stamp for an event park that landed outside an
+/// [`EventOwnerContextScope`] (e.g. a pre-warp director park from the
+/// `DoZoneChangeContent` drain). `handle_event_start`'s resume gate must
+/// treat these as unattributable — neither resumable nor purgeable by
+/// owner identity — and fall through to the legacy dispatch paths.
+pub const EVENT_OWNER_UNKNOWN: u32 = 0;
+
+/// A `_WAIT_EVENT` park plus the identity of the event that owns it.
+///
+/// pmeteor's `mSleepingOnPlayerEvent` carries no owner identity, so its
+/// `LuaEngine.cs::EventStarted` resume arm resumes ANY parked coroutine
+/// on ANY later EventStart — which is exactly the stale-coroutine hijack
+/// garlemald hit live (a parked Charlys talk surviving a relog was
+/// resumed by a Hobriaut talk, silently draining `QuestIncCounter` +
+/// `AddGil(2000)` + `EndEvent`). Stamping the owning event's actor id at
+/// park time lets the EventStart resume gate match pmeteor's
+/// resume-or-fresh split WITHOUT the cross-owner hijack.
+/// (Garlemald-Server #46.)
+#[derive(Debug)]
+struct ParkedEventCoroutine {
+    /// Actor id of the event owner (NPC / director / command static
+    /// actor) whose EventStart/EventUpdate dispatch parked this
+    /// coroutine, or [`EVENT_OWNER_UNKNOWN`] when the park landed
+    /// outside any owner-context scope.
+    event_owner_actor_id: u32,
+    coroutine: ParkedCoroutine,
+}
+
 #[derive(Debug, Default)]
 pub struct CoroutineScheduler {
     /// Coroutines sleeping on a deadline (millis since UNIX epoch).
     sleeping_on_time: Vec<(u64, ParkedCoroutine)>,
     /// Coroutines sleeping on a named signal.
     sleeping_on_signal: HashMap<String, Vec<ParkedCoroutine>>,
-    /// Coroutines sleeping on the next event update for a player.
-    sleeping_on_player_event: HashMap<u32, ParkedCoroutine>,
+    /// Coroutines sleeping on the next event update for a player,
+    /// stamped with the actor id of the event that owns them.
+    sleeping_on_player_event: HashMap<u32, ParkedEventCoroutine>,
+    /// Owner actor id to stamp onto any `_WAIT_EVENT` park that lands
+    /// for a player while an [`EventOwnerContextScope`] is alive. Keyed
+    /// by player actor id; set/cleared by the scope guard around the
+    /// EventStart/EventUpdate dispatch sections (the park itself happens
+    /// deep inside a `spawn_blocking` script drain that has no owner in
+    /// scope — see `LuaEngine::repark`).
+    event_owner_context: HashMap<u32, u32>,
 }
 
 impl CoroutineScheduler {
@@ -112,7 +148,23 @@ impl CoroutineScheduler {
                  continuation/mutations are dropped (Garlemald-Server #46 diagnostic)",
             );
         }
-        self.sleeping_on_player_event.insert(player_id, coroutine);
+        // Stamp the owning event's identity from the surrounding
+        // owner-context scope. The park key can be the historical
+        // player_id=0 fallback (mlua drops yield args past the first for
+        // some capture shapes), so prefer the coroutine's own
+        // `owner_player_id` when looking the context up.
+        let event_owner_actor_id = [coroutine.owner_player_id, player_id]
+            .into_iter()
+            .filter(|id| *id != 0)
+            .find_map(|id| self.event_owner_context.get(&id).copied())
+            .unwrap_or(EVENT_OWNER_UNKNOWN);
+        self.sleeping_on_player_event.insert(
+            player_id,
+            ParkedEventCoroutine {
+                event_owner_actor_id,
+                coroutine,
+            },
+        );
     }
 
     /// Wake every time-parked coroutine whose deadline has passed. Returns
@@ -133,7 +185,76 @@ impl CoroutineScheduler {
 
     /// Pop the coroutine parked against a specific player's event channel.
     pub fn take_event(&mut self, player_id: u32) -> Option<ParkedCoroutine> {
-        self.sleeping_on_player_event.remove(&player_id)
+        self.sleeping_on_player_event
+            .remove(&player_id)
+            .map(|p| p.coroutine)
+    }
+
+    /// The stamped event-owner actor id of the player's parked
+    /// `_WAIT_EVENT` coroutine, or `None` when nothing is parked. Uses
+    /// the same player-id → 0 fallback lookup
+    /// `LuaEngine::fire_player_event_and_drain` resumes through, so the
+    /// gate that reads this and the resume that follows always see the
+    /// same coroutine. [`EVENT_OWNER_UNKNOWN`] means "parked but
+    /// unattributable" (landed outside an owner-context scope).
+    pub fn parked_event_owner(&self, player_id: u32) -> Option<u32> {
+        self.sleeping_on_player_event
+            .get(&player_id)
+            .or_else(|| {
+                if player_id != 0 {
+                    self.sleeping_on_player_event.get(&0)
+                } else {
+                    None
+                }
+            })
+            .map(|p| p.event_owner_actor_id)
+    }
+
+    /// Drop the player's parked `_WAIT_EVENT` coroutine (same
+    /// player-id → 0 fallback as [`Self::parked_event_owner`]) without
+    /// resuming it. The EventStart gate calls this when a NEW event
+    /// arrives while a coroutine stamped with a DIFFERENT owner is still
+    /// parked — the stale continuation must not survive to hijack a
+    /// later resume. Returns `true` if something was dropped.
+    pub fn discard_parked_event(&mut self, player_id: u32) -> bool {
+        if self.sleeping_on_player_event.remove(&player_id).is_some() {
+            return true;
+        }
+        player_id != 0 && self.sleeping_on_player_event.remove(&0).is_some()
+    }
+
+    /// Record that any `_WAIT_EVENT` park landing for `player_id` (until
+    /// [`Self::clear_event_owner_context`]) belongs to the event owned by
+    /// `owner_actor_id`. Prefer the RAII [`EventOwnerContextScope`] over
+    /// calling this directly.
+    pub fn set_event_owner_context(&mut self, player_id: u32, owner_actor_id: u32) {
+        self.event_owner_context.insert(player_id, owner_actor_id);
+    }
+
+    pub fn clear_event_owner_context(&mut self, player_id: u32) {
+        self.event_owner_context.remove(&player_id);
+    }
+
+    /// RAII wrapper around `set_event_owner_context` /
+    /// `clear_event_owner_context` — hold the returned scope across a
+    /// dispatch section (which may `await` into `spawn_blocking` script
+    /// drains) so every `_WAIT_EVENT` park the section produces is
+    /// stamped with the owning event's actor id, and the stamp context
+    /// can't leak past an early return. Last-writer-wins per player:
+    /// the packet pipeline is per-session sequential, so nested scopes
+    /// for one player don't occur in practice.
+    pub fn event_owner_scope(
+        scheduler: &Arc<Mutex<Self>>,
+        player_id: u32,
+        owner_actor_id: u32,
+    ) -> EventOwnerContextScope {
+        if let Ok(mut s) = scheduler.lock() {
+            s.set_event_owner_context(player_id, owner_actor_id);
+        }
+        EventOwnerContextScope {
+            scheduler: Arc::clone(scheduler),
+            player_id,
+        }
     }
 
     /// Drop every parked coroutine owned by `player_id`, across all
@@ -159,7 +280,12 @@ impl CoroutineScheduler {
         // from the owning player (the historical player_id=0 fallback)
         // — purge by either identity.
         self.sleeping_on_player_event
-            .retain(|k, v| *k != player_id && v.owner_player_id != player_id);
+            .retain(|k, v| *k != player_id && v.coroutine.owner_player_id != player_id);
+        // Drop any pending owner-context stamp too — the player's
+        // dispatch section can't outlive the purge (session teardown /
+        // ContentFinished), and a leaked stamp would mis-attribute the
+        // next unrelated park.
+        self.event_owner_context.remove(&player_id);
         before
             - (self.pending_time_count() + self.pending_signal_count() + self.pending_event_count())
     }
@@ -184,6 +310,23 @@ impl CoroutineScheduler {
 
     pub fn pending_event_count(&self) -> usize {
         self.sleeping_on_player_event.len()
+    }
+}
+
+/// RAII guard for the scheduler's per-player event-owner context — see
+/// [`CoroutineScheduler::event_owner_scope`]. Clearing on `Drop` keeps
+/// early-returning dispatch paths from leaking a stamp onto the next
+/// unrelated park.
+pub struct EventOwnerContextScope {
+    scheduler: Arc<Mutex<CoroutineScheduler>>,
+    player_id: u32,
+}
+
+impl Drop for EventOwnerContextScope {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.scheduler.lock() {
+            s.clear_event_owner_context(self.player_id);
+        }
     }
 }
 
@@ -333,6 +476,99 @@ pub fn value_to_command_arg(value: &Value) -> LuaCommandArg {
             }
         }
         _ => LuaCommandArg::Nil,
+    }
+}
+
+#[cfg(test)]
+mod event_owner_stamp_tests {
+    use super::*;
+
+    fn parked(lua: &Arc<Lua>, owner_player_id: u32) -> ParkedCoroutine {
+        let f = lua.create_function(|_, ()| Ok(())).unwrap();
+        ParkedCoroutine {
+            lua: Arc::clone(lua),
+            thread: lua.create_thread(f).unwrap(),
+            queue: CommandQueue::new(),
+            owner_player_id,
+        }
+    }
+
+    /// A park landing inside an owner-context scope must carry the
+    /// event owner's actor id; one landing outside must carry
+    /// `EVENT_OWNER_UNKNOWN` (the EventStart gate falls through on
+    /// those instead of purging a legit pre-warp director park).
+    #[test]
+    fn park_event_stamps_owner_from_context() {
+        let lua = Arc::new(Lua::new());
+        let mut sched = CoroutineScheduler::default();
+
+        sched.set_event_owner_context(42, 0x46D0_0123);
+        sched.park_event(42, parked(&lua, 42));
+        assert_eq!(sched.parked_event_owner(42), Some(0x46D0_0123));
+
+        sched.clear_event_owner_context(42);
+        assert!(sched.take_event(42).is_some());
+        sched.park_event(42, parked(&lua, 42));
+        assert_eq!(sched.parked_event_owner(42), Some(EVENT_OWNER_UNKNOWN));
+    }
+
+    /// The historical player_id=0 park-key fallback: the context is
+    /// keyed by the coroutine's real `owner_player_id`, and lookups by
+    /// the real player id fall back to the 0-keyed entry — matching
+    /// `fire_player_event_and_drain`'s take path.
+    #[test]
+    fn zero_key_fallback_still_resolves_owner_stamp() {
+        let lua = Arc::new(Lua::new());
+        let mut sched = CoroutineScheduler::default();
+
+        sched.set_event_owner_context(42, 0x46D0_0456);
+        // Yield lost the player arg → parked under key 0, but the
+        // coroutine still knows its owning player.
+        sched.park_event(0, parked(&lua, 42));
+        assert_eq!(sched.parked_event_owner(42), Some(0x46D0_0456));
+
+        assert!(sched.discard_parked_event(42));
+        assert_eq!(sched.parked_event_owner(42), None);
+        assert!(!sched.discard_parked_event(42));
+    }
+
+    /// `purge_owner` (session teardown / ContentFinished) must drop the
+    /// event park AND the pending owner-context stamp so a relog can
+    /// never resume a stale continuation (the Charlys→Hobriaut 2,000
+    /// gil hijack). (Garlemald-Server #46.)
+    #[test]
+    fn purge_owner_drops_event_park_and_context() {
+        let lua = Arc::new(Lua::new());
+        let mut sched = CoroutineScheduler::default();
+
+        sched.set_event_owner_context(42, 0x46D0_0789);
+        sched.park_event(42, parked(&lua, 42));
+        assert_eq!(sched.purge_owner(42), 1);
+        assert_eq!(sched.parked_event_owner(42), None);
+
+        // The stamp is gone too: a fresh park is unattributable.
+        sched.park_event(42, parked(&lua, 42));
+        assert_eq!(sched.parked_event_owner(42), Some(EVENT_OWNER_UNKNOWN));
+    }
+
+    /// The RAII scope stamps while alive and stops stamping after drop
+    /// (early-return safety in `handle_event_start`).
+    #[test]
+    fn event_owner_scope_clears_on_drop() {
+        let lua = Arc::new(Lua::new());
+        let shared = CoroutineScheduler::shared();
+
+        {
+            let _scope = CoroutineScheduler::event_owner_scope(&shared, 42, 0x46D0_0AAA);
+            let mut s = shared.lock().unwrap();
+            s.park_event(42, parked(&lua, 42));
+            assert_eq!(s.parked_event_owner(42), Some(0x46D0_0AAA));
+            assert!(s.take_event(42).is_some());
+        }
+
+        let mut s = shared.lock().unwrap();
+        s.park_event(42, parked(&lua, 42));
+        assert_eq!(s.parked_event_owner(42), Some(EVENT_OWNER_UNKNOWN));
     }
 }
 

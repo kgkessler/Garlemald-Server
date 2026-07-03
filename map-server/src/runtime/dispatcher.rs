@@ -256,19 +256,29 @@ pub async fn dispatch_battle_event(
                 zone,
             )
             .await;
-            // Hostile claim flip: `npcWork.hateType = 3` (ENGAGED_PARTY)
-            // turns on the overhead + target-HUD HP gauge and the
-            // claimed nameplate colour. pmeteor ships 3 unconditionally
-            // from spawn (BattleNpc.cs:160) and the judge tolerates the
-            // absent occupancy group as long as the solo-party 0x017C
-            // group is registered (it is, since the nameplate-crash fix).
+            // Hostile engage flip: `npcWork.hateType = 2` (HATE_TYPE_ENGAGED)
+            // — the engaged ORANGE nameplate tint, party-independent.
+            // NEVER 3: the round-2 decomp of `DepictionJudge:
+            // judgeNameplate()` showed 3 renders RED only when the mob's
+            // party is the player party's occupancy group (which needs
+            // the 0x0187 Set Occupancy Group claim wiring garlemald
+            // doesn't emit); without the claim the client falls through
+            // to the PURPLE "claimed by another party" tint (2026-07-01
+            // retest). The judge RE-RUNS on every WorkSync — no latch —
+            // so this live flip re-colors the plate; hateType drives
+            // COLOR only (no HP gauge — `_setNameplateGauge` is a RET
+            // 0x8 stub in 1.23b). Full table on
+            // `build_npc_hate_type_packet`.
             // Allies/players skip — friendly nameplates stay passive.
             let is_hostile_bnpc = matches!(
                 registry.get(*owner_actor_id).await.map(|h| h.kind),
                 Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
             );
             if is_hostile_bnpc {
-                let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 3);
+                let sub = tx::actor::build_npc_hate_type_packet(
+                    *owner_actor_id,
+                    crate::npc::HATE_TYPE_ENGAGED,
+                );
                 send_to_self_if_player(registry, world, *owner_actor_id, sub.to_bytes()).await;
                 broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
                     .await;
@@ -2344,6 +2354,20 @@ pub(crate) async fn apply_die(
         zone,
     )
     .await;
+    // Retail rides npcWork.hateType=4 with the death state (pcap kill
+    // sequences pack it with the hp=0 stateAtQuicklyForAll) — the
+    // corpse plate style. BattleNpcs only; players carry no npcWork.
+    // (Round-3 nameplate RCA, 2026-07-02.)
+    if matches!(
+        handle.kind,
+        crate::runtime::actor_registry::ActorKindTag::BattleNpc
+    ) {
+        let sub = crate::packets::send::actor::build_npc_hate_type_packet(
+            owner_actor_id,
+            crate::npc::HATE_TYPE_DEAD,
+        );
+        broadcast_around_actor(world, registry, zone, owner_actor_id, sub.to_bytes()).await;
+    }
     if let (Some(lua_ref), Some(db_ref)) = (lua, db) {
         for evt in status_outbox.drain() {
             dispatch_status_event(&evt, registry, world, db_ref, lua_ref.catalogs()).await;

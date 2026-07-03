@@ -48,6 +48,129 @@ pub struct GroupMember {
     pub name: String,
 }
 
+impl GroupMember {
+    /// Party-row encoding for an actor in the extended-temp group 10001
+    /// (0x2711) — the ONLY group the client's party HUD reads: decomp
+    /// `CharaBaseClass:getPlayerParty` is literally
+    /// `self:_getExtendedTemporaryGroup(10001)`, and the
+    /// PartyParameterWidget (bottom-right ally rows — DESIGNED for NPC
+    /// members, it renders `???` when `actor:isPlayer() == false`)
+    /// resolves each row's label from these fields:
+    ///
+    /// * PLAYER (non-empty display name): `localized_name = -1`
+    ///   ("custom name used", per the 0x017C wiki note) + the name
+    ///   string in the 0x20-byte slot field.
+    /// * NPC (empty display name, e.g. a `currentParty:AddMember`'d
+    ///   tutorial ally like Y'shtola): retail's 10001 X08 rows carry
+    ///   the NPC's LOCALIZED DISPLAY-NAME ID in `localized_name` with
+    ///   an empty name string — the client looks the label up in its
+    ///   own text sheets. Garlemald's emitters used to ship
+    ///   `{ localized_name: -1, name: "" }` for NPCs (their
+    ///   `display_name()` is empty), which the widget draws as nothing
+    ///   — the round-1 "party-adds don't render" break.
+    ///
+    /// `BaseActor::new` seeds `display_name_id = 0xFFFFFFFF`, so an NPC
+    /// without a real display-name id degrades to `-1` — the previous
+    /// (blank-row) behaviour, never garbage. (Garlemald-Server #46,
+    /// round 4.)
+    ///
+    /// `is_self`: retail sets the row flag byte (slot +0x0C, `flag1`)
+    /// to 1 on every NON-self row and 0 on the recipient's own row —
+    /// `ffxiv_traces/invite_join_party.pcapng` frame#92's 2-member
+    /// 0x017F carries `00 01` at +0x0C/+0x0D for the capturing player
+    /// (Wrenix Wrong) and `01 01` for the other member (Valentine
+    /// Bluefeather). With a single retail datapoint the bit is also
+    /// consistent with Meteor's "leader" reading of `flag1` (Valentine
+    /// was both non-self AND the inviter), but the tutorial parties we
+    /// emit are always viewed from the leader-player's client, so the
+    /// non-self reading is the one that reproduces the capture.
+    /// (Garlemald-Server #46, round 5.)
+    pub fn row_for_actor(
+        actor_id: u32,
+        display_name: &str,
+        display_name_id: u32,
+        is_self: bool,
+    ) -> Self {
+        if display_name.is_empty() {
+            Self {
+                actor_id,
+                localized_name: display_name_id as i32,
+                unknown2: 0,
+                flag1: !is_self,
+                is_online: true,
+                name: String::new(),
+            }
+        } else {
+            Self {
+                actor_id,
+                localized_name: -1,
+                unknown2: 0,
+                flag1: !is_self,
+                is_online: true,
+                name: display_name.to_string(),
+            }
+        }
+    }
+}
+
+/// 10001 (0x2711) — `Group::PlayerPartyGroup` per Meteor
+/// `World Server/DataObjects/Group/Group.cs`. The ONLY group the
+/// client's party HUD reads: decomp `CharaBaseClass:getPlayerParty` is
+/// literally `self:_getExtendedTemporaryGroup(10001)`. Used as the
+/// 0x017C `type_id`, the 0x018D map-marker `group_type`, and the
+/// discriminator for the retail multi-member header variant in
+/// [`build_group_header`].
+pub const GROUP_TYPE_PLAYER_PARTY: u32 = 10001;
+
+/// High bit retail sets on every party-band group id observed in the
+/// pcaps (`0x800000000077E9AC` party, `0x800000000077B150` invite
+/// relation — both `invite_join_party.pcapng`). Garlemald keeps the
+/// same band for its synthetic party ids.
+const PARTY_GROUP_ID_FLAG: u64 = 0x8000_0000_0000_0000;
+
+/// Party (10001) group-index allocation.
+///
+/// Wire finding (#46 round 5, garlemald vs retail
+/// `invite_join_party.pcapng`): the client registers a group id ONCE —
+/// re-sending a 0x017C trio under an id it already holds (garlemald
+/// reused the immutable login id `0x8000000000000001` for every
+/// composition) does NOT replace the roster, so `AddMember`'d allies
+/// never re-registered. Retail's fix-shape is a fresh id per
+/// composition change (its ids come from a server-side allocator —
+/// the captured `0x800000000077E9AC` band).
+///
+/// Garlemald's scheme:
+///   * solo (`member_count <= 1`): `0x8000_0000_0000_0000 | actor_id`
+///     — the existing login shape, unchanged (byte-stable across the
+///     login flows that already work).
+///   * multi-member: `0x8000_0000_0000_0000 | (leader_id << 16) |
+///     (composition_ordinal & 0xFFFF)` where the ordinal is the
+///     session's [`crate::data::Session::party_group_ordinal`], bumped
+///     on every `transient_party_members` change. Guarantees:
+///     - never equals the SAME leader's solo id (`leader_id << 16 >
+///       leader_id` for any `leader_id >= 1`);
+///     - never repeats across compositions in a session (ordinal is
+///       monotonic; 16-bit wrap needs 65k composition changes in one
+///       session);
+///     - can only collide with ANOTHER player's solo id if that
+///       player's actor id numerically equals `(leader_id << 16) |
+///       ordinal >= 0x10001` — player actor ids are `characters.id`
+///       row ids counting up from 1, so that needs a 65k-character
+///       deployment; accepted bound, documented here.
+pub fn party_group_index(
+    leader_actor_id: u32,
+    member_count: usize,
+    composition_ordinal: u32,
+) -> u64 {
+    if member_count <= 1 {
+        PARTY_GROUP_ID_FLAG | (leader_actor_id as u64)
+    } else {
+        PARTY_GROUP_ID_FLAG
+            | ((leader_actor_id as u64) << 16)
+            | ((composition_ordinal & 0xFFFF) as u64)
+    }
+}
+
 /// Fixed member-slot size in Meteor: u32+i32+u32+byte+byte+name[0x20] =
 /// 0x2E bytes written, slot is 0x30 with two trailing pad bytes.
 const GROUP_MEMBER_SLOT_BYTES: usize = 0x30;
@@ -79,6 +202,23 @@ fn encode_group_member_at(data: &mut [u8], slot_offset: usize, m: &GroupMember) 
 ///   0x6C  const               u32  = 0x6D
 ///   0x70  const               u32  = 0x6D
 ///   0x74  member_count        u32
+///
+/// RETAIL DIVERGENCE — multi-member PLAYER PARTY (type 10001) only.
+/// `ffxiv_traces/invite_join_party.pcapng` frame#92 (2-member party,
+/// group id 0x800000000077E9AC, decoded 2026-07-02) writes:
+///   0x10  const   u64 = 0        (Meteor writes 3)
+///   0x18  const   u64 = 0        (Meteor double-writes group_index)
+///   0x28  group_index u64        (single write, same as Meteor)
+///   0x64..0x74  4x u32 = 0x3F3E  (Meteor writes 0x6D)
+/// The shape is TYPE-specific, not count-specific: the same capture's
+/// 0xC351 invite-relation group keeps the +0x10=3 / double-write shape
+/// at BOTH count=1 (frame#17) and count=2 (frame#20), and pmeteor's
+/// content group (type 30006, count 7) is byte-verified in the Meteor
+/// shape against captures/pmeteor-quest/20260426-160210-gridania-
+/// manual3 (SEQ_005 kick-burst parity) — so only `type_id == 10001 &&
+/// member_count > 1` takes the retail party variant. Shipping the
+/// solo/Meteor shape for a multi-member 10001 roster is part of why
+/// the client never re-registered the party (#46 round 5).
 #[allow(clippy::too_many_arguments)]
 pub fn build_group_header(
     source_actor_id: u32,
@@ -90,13 +230,21 @@ pub fn build_group_header(
     group_name: &str,
     member_count: u32,
 ) -> SubPacket {
+    let is_multi_member_party = type_id == GROUP_TYPE_PLAYER_PARTY && member_count > 1;
     let mut data = body(0x98);
     {
         let mut c = Cursor::new(&mut data[..]);
         c.write_u64::<LittleEndian>(location_code).unwrap();
         c.write_u64::<LittleEndian>(sequence_id).unwrap();
-        c.write_u64::<LittleEndian>(3).unwrap();
-        c.write_u64::<LittleEndian>(group_index).unwrap();
+        if is_multi_member_party {
+            // Retail party variant: +0x10 and +0x18 stay zero; the
+            // group id appears only at +0x28.
+            c.write_u64::<LittleEndian>(0).unwrap();
+            c.write_u64::<LittleEndian>(0).unwrap();
+        } else {
+            c.write_u64::<LittleEndian>(3).unwrap();
+            c.write_u64::<LittleEndian>(group_index).unwrap();
+        }
         c.write_u64::<LittleEndian>(0).unwrap();
         c.write_u64::<LittleEndian>(group_index).unwrap();
         c.write_u32::<LittleEndian>(type_id).unwrap();
@@ -109,10 +257,10 @@ pub fn build_group_header(
         c.write_i32::<LittleEndian>(localized_name).unwrap();
         write_padded_ascii(&mut c, group_name, 0x20);
         c.set_position(0x64);
-        c.write_u32::<LittleEndian>(0x6D).unwrap();
-        c.write_u32::<LittleEndian>(0x6D).unwrap();
-        c.write_u32::<LittleEndian>(0x6D).unwrap();
-        c.write_u32::<LittleEndian>(0x6D).unwrap();
+        let quad: u32 = if is_multi_member_party { 0x3F3E } else { 0x6D };
+        for _ in 0..4 {
+            c.write_u32::<LittleEndian>(quad).unwrap();
+        }
         c.write_u32::<LittleEndian>(member_count).unwrap();
     }
     SubPacket::new(OP_GROUP_HEADER, source_actor_id, data)
@@ -561,9 +709,18 @@ pub fn build_synch_group_work_values_content_init(
 // record #1 of opcode 0x018D, decoded byte-by-byte):
 //
 //   body size = 0x298 (664 bytes)
-//   0x00  u64 player_group_id          — solo retail uses 0x80000000_0077E9AC,
-//                                         party uses Meteor's
-//                                         `((leader_id as u64) << 32) | 0xB36F92`
+//   0x00  u64 player_group_id          — the character's LIVE party group
+//                                         id: `invite_join_party.pcapng`
+//                                         carries the SAME id
+//                                         (0x80000000_0077E9AC) in the
+//                                         2-member 0x017C party trio
+//                                         (frame#92) and every 0x018D
+//                                         before AND after the join
+//                                         (frames #9..#96) — so this
+//                                         field must track whatever
+//                                         group_index the party trio
+//                                         used, not a solo sentinel
+//                                         (#46 round 5)
 //   0x08  u32 group_type               — 10001 (0x2711) = PlayerPartyGroup
 //   0x0C  u32 zero/padding
 //   0x10  marker[16] @ 40 bytes each   = 640 bytes
@@ -604,17 +761,6 @@ pub struct PartyMapMarker {
     pub z: f32,
     pub orientation: f32,
 }
-
-/// 0x10001 / 10001 — `Group::PlayerPartyGroup` per Meteor
-/// `World Server/DataObjects/Group/Group.cs`.
-pub const PARTY_MAP_MARKER_GROUP_TYPE_PLAYER_PARTY: u32 = 10001;
-
-/// playerGroupID retail uses for an unparty'd player. Magic constant
-/// captured from `ffxiv_traces/chat_say.pcapng`; the high 0x80000000
-/// bit looks like a "synthetic / solo group" flag, but we don't have
-/// enough datapoints to confirm. Use this verbatim for solo emissions
-/// until we capture another player's solo packet.
-pub const PARTY_MAP_MARKER_SOLO_GROUP_ID: u64 = 0x8000_0000_0077_E9AC;
 
 /// 0x018D PartyMapMarkerUpdate. Up to 16 markers per packet — extra
 /// markers in `markers` are silently truncated.
@@ -663,8 +809,11 @@ pub fn build_party_map_marker_update(
 //
 //   body size = 0x38 (56 bytes) — fixed
 //   0x00  u64 group_id              — same playerGroupID space as 0x018D;
-//                                     captured as 0x80000000_0077E9AC
-//                                     for the solo player
+//                                     captured as 0x80000000_0077E9AC —
+//                                     the character's live party group
+//                                     id (see the 0x018D note above),
+//                                     so pass the party trio's
+//                                     group_index here (#46 round 5)
 //   0x08  u32 actor_id              — actor being updated
 //   0x0C  u32 display_name_id       — 0xFFFFFFFF for player characters
 //                                     (and presumably custom names);
@@ -790,10 +939,19 @@ pub fn build_set_occupancy_group(
 mod tests {
     use super::*;
 
+    /// The party group id retail shipped for the captured character
+    /// (Wrenix Wrong, actor 0x029B2941) — NOT a solo sentinel: the same
+    /// id rides `chat_say.pcapng`'s 0x018D records AND
+    /// `invite_join_party.pcapng`'s 2-member 0x017C party trio
+    /// (frame#92) + every 0x018D before/after the join. Kept test-only
+    /// to reproduce capture bytes; production code passes the live
+    /// trio's `group_index` (see `party_group_index`). (#46 round 5.)
+    const RETAIL_CAPTURE_PARTY_GROUP_ID: u64 = 0x8000_0000_0077_E9AC;
+
     /// Reproduce the body bytes captured from
     /// `ffxiv_traces/chat_say.pcapng` record #1 of opcode 0x018D — solo
     /// player at `(1822.97, 149.47, 1728.025)`, orientation -2.354 rad,
-    /// actor id 0x029B2941, with the captured solo group id and the
+    /// actor id 0x029B2941, with the captured party group id and the
     /// per-marker `unknown` field 0x00C17909.
     #[test]
     fn party_map_marker_matches_retail_capture() {
@@ -807,8 +965,8 @@ mod tests {
         };
         let pkt = build_party_map_marker_update(
             0x029B_2941,
-            PARTY_MAP_MARKER_SOLO_GROUP_ID,
-            PARTY_MAP_MARKER_GROUP_TYPE_PLAYER_PARTY,
+            RETAIL_CAPTURE_PARTY_GROUP_ID,
+            GROUP_TYPE_PLAYER_PARTY,
             &[marker],
         );
         let body = &pkt.data;
@@ -840,6 +998,151 @@ mod tests {
 
         // numEntries u32 then 4 bytes trailing pad.
         assert_eq!(&body[0x290..0x298], &[0x01, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// A 3-member 10001 party trio (player leader + two NPC allies) must
+    /// round-trip with count=3, the NPC rows carrying
+    /// `localizedName = displayNameId` — the encoding the client's
+    /// PartyParameterWidget resolves NPC row labels from (see
+    /// `GroupMember::row_for_actor`; #46 round 4) — and the non-self
+    /// rows flagged `01` at slot +0x0C (retail
+    /// `invite_join_party.pcapng` frame#92; #46 round 5).
+    #[test]
+    fn party_x08_npc_rows_carry_display_name_id() {
+        const NPC_YSHTOLA_ID: u32 = 0x4534_0006;
+        const NPC_STHALMANN_ID: u32 = 0x4534_0007;
+        const YSHTOLA_DISPLAY_NAME_ID: u32 = 3_020_045;
+        const STHALMANN_DISPLAY_NAME_ID: u32 = 3_020_046;
+        let members = vec![
+            // Player: non-empty display name → custom-name row (self).
+            GroupMember::row_for_actor(0x0000_02AE, "Aert Zeverith", 0xFFFF_FFFF, true),
+            // NPC allies: empty display name → display-name-id row.
+            GroupMember::row_for_actor(NPC_YSHTOLA_ID, "", YSHTOLA_DISPLAY_NAME_ID, false),
+            GroupMember::row_for_actor(NPC_STHALMANN_ID, "", STHALMANN_DISPLAY_NAME_ID, false),
+        ];
+        let mut offset = 0usize;
+        let pkt = build_group_members_x08(0x0000_02AE, 0xA6, 0x01, &members, &mut offset);
+        assert_eq!(offset, 3);
+        // Count at body 0x10 + 0x30*8 = 0x190.
+        assert_eq!(&pkt.data[0x190..0x194], &[3, 0, 0, 0]);
+        // Slot 0 (player, body 0x10): localized_name = -1, name populated,
+        // self row flag pair `00 01` at slot +0x0C/+0x0D (body 0x1C).
+        assert_eq!(&pkt.data[0x14..0x18], &(-1i32).to_le_bytes());
+        assert_eq!(&pkt.data[0x1C..0x1E], &[0x00, 0x01]);
+        assert_eq!(&pkt.data[0x1E..0x22], b"Aert");
+        // Slot 1 (NPC, body 0x40): actor id + localized_name =
+        // display_name_id, non-self flag pair `01 01` (body 0x4C),
+        // name field all-zero.
+        assert_eq!(&pkt.data[0x40..0x44], &NPC_YSHTOLA_ID.to_le_bytes());
+        assert_eq!(
+            &pkt.data[0x44..0x48],
+            &(YSHTOLA_DISPLAY_NAME_ID as i32).to_le_bytes()
+        );
+        assert_eq!(&pkt.data[0x4C..0x4E], &[0x01, 0x01]);
+        assert!(pkt.data[0x4E..0x6E].iter().all(|b| *b == 0));
+        // Slot 2 (NPC, body 0x70): same shape.
+        assert_eq!(&pkt.data[0x70..0x74], &NPC_STHALMANN_ID.to_le_bytes());
+        assert_eq!(
+            &pkt.data[0x74..0x78],
+            &(STHALMANN_DISPLAY_NAME_ID as i32).to_le_bytes()
+        );
+        assert_eq!(&pkt.data[0x7C..0x7E], &[0x01, 0x01]);
+    }
+
+    /// Reproduce the 0x017C header body captured from
+    /// `ffxiv_traces/invite_join_party.pcapng` frame#92 — the 2-member
+    /// 10001 party trio (Wrenix Wrong + Valentine Bluefeather), zone
+    /// 0x9B, sequence 0x153795406A23, group id 0x800000000077E9AC.
+    /// Retail's multi-member party header zeroes +0x10/+0x18 (Meteor
+    /// writes 3 + a group-index double-write) and quads 0x3F3E at
+    /// +0x64 (Meteor writes 0x6D). (#46 round 5.)
+    #[test]
+    fn party_group_header_multi_member_matches_retail_capture() {
+        let pkt = build_group_header(
+            0x029B_2941,
+            0x9B,
+            0x0000_1537_9540_6A23,
+            RETAIL_CAPTURE_PARTY_GROUP_ID,
+            GROUP_TYPE_PLAYER_PARTY,
+            -1,
+            "",
+            2,
+        );
+        let body = &pkt.data;
+        assert_eq!(body.len(), 0x78);
+        #[rustfmt::skip]
+        let expected: [u8; 0x78] = [
+            0x9B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // locationCode
+            0x23, 0x6A, 0x40, 0x95, 0x37, 0x15, 0x00, 0x00, // sequenceId
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // +0x10 = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // +0x18 = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // +0x20 = 0
+            0xAC, 0xE9, 0x77, 0x00, 0x00, 0x00, 0x00, 0x80, // group_index
+            0x11, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // type 10001
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF,                         // localized -1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // name ""
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x3E, 0x3F, 0x00, 0x00, 0x3E, 0x3F, 0x00, 0x00, // 0x3F3E quad
+            0x3E, 0x3F, 0x00, 0x00, 0x3E, 0x3F, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,                         // count = 2
+        ];
+        assert_eq!(body, &expected[..]);
+    }
+
+    /// count == 1 (and every non-10001 type) must keep the Meteor
+    /// header shape: +0x10 = 3, group_index double-written at
+    /// +0x18/+0x28, 0x6D quad at +0x64. The solo shape is what every
+    /// working login flow already ships, and pmeteor's CONTENT group
+    /// (type 30006, count 7) is byte-verified in this shape (SEQ_005
+    /// kick-burst parity) — the retail multi-member variant is party-
+    /// type-scoped, mirroring retail itself: the 0xC351 invite-relation
+    /// group keeps this shape even at count=2 (frames #17/#20).
+    #[test]
+    fn group_header_meteor_shape_for_solo_party_and_multi_member_content() {
+        let group_index: u64 = 0x8000_0000_0000_0001;
+        // Solo 10001 party.
+        let solo = build_group_header(1, 0xA6, 0x01, group_index, 10001, -1, "", 1);
+        assert_eq!(&solo.data[0x10..0x18], &3u64.to_le_bytes());
+        assert_eq!(&solo.data[0x18..0x20], &group_index.to_le_bytes());
+        assert_eq!(&solo.data[0x28..0x30], &group_index.to_le_bytes());
+        assert_eq!(&solo.data[0x64..0x68], &0x6Du32.to_le_bytes());
+        // Multi-member CONTENT group (30006) — must NOT take the retail
+        // party variant.
+        let content_index: u64 = 0x3000_0000_0000_0001;
+        let content = build_group_header(1, 0xA6, 0x01, content_index, 30006, -1, "", 7);
+        assert_eq!(&content.data[0x10..0x18], &3u64.to_le_bytes());
+        assert_eq!(&content.data[0x18..0x20], &content_index.to_le_bytes());
+        assert_eq!(&content.data[0x64..0x68], &0x6Du32.to_le_bytes());
+        assert_eq!(&content.data[0x74..0x78], &7u32.to_le_bytes());
+    }
+
+    /// The fresh-per-composition group-index scheme: solo keeps the
+    /// login id; multi-member ids differ from every solo id of the same
+    /// leader and from each other across composition ordinals. (#46
+    /// round 5.)
+    #[test]
+    fn party_group_index_scheme_is_fresh_and_collision_free() {
+        let leader: u32 = 1;
+        let solo = party_group_index(leader, 1, 0);
+        assert_eq!(solo, 0x8000_0000_0000_0001);
+        // Solo id is ordinal-independent (composition changes don't
+        // re-key the solo group).
+        assert_eq!(party_group_index(leader, 1, 7), solo);
+        let multi_1 = party_group_index(leader, 3, 1);
+        let multi_2 = party_group_index(leader, 2, 2);
+        assert_eq!(multi_1, 0x8000_0000_0001_0001);
+        assert_eq!(multi_2, 0x8000_0000_0001_0002);
+        assert_ne!(multi_1, solo, "multi id must never reuse the solo id");
+        assert_ne!(multi_1, multi_2, "each composition gets a fresh id");
+        // Ordinal is masked to 16 bits so it can never bleed into the
+        // leader field.
+        assert_eq!(
+            party_group_index(leader, 2, 0x1_0003),
+            0x8000_0000_0001_0003
+        );
     }
 
     #[test]
@@ -912,7 +1215,7 @@ mod tests {
     fn set_group_layout_id_matches_retail_capture() {
         let pkt = build_set_group_layout_id(
             0x029B_2941,
-            PARTY_MAP_MARKER_SOLO_GROUP_ID,
+            RETAIL_CAPTURE_PARTY_GROUP_ID,
             0x029B_2941,
             SET_GROUP_LAYOUT_ID_PLAYER_DISPLAY_NAME,
             0x0131,
@@ -975,7 +1278,7 @@ mod tests {
             0x029B_2941,
             monster_group,
             SET_OCCUPANCY_GROUP_TYPE_MONSTER_PARTY,
-            PARTY_MAP_MARKER_SOLO_GROUP_ID,
+            RETAIL_CAPTURE_PARTY_GROUP_ID,
         );
         assert_eq!(
             &p2.data[..0x20],

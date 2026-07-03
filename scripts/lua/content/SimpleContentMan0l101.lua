@@ -14,28 +14,18 @@ require ("ally")
 -- machinery (SpawnBattleNpcById onCreate spawning, the 500 ms onUpdate
 -- driver, allyGlobal engagement, sendSignal → director coroutine).
 --
--- Escort shape (2010-09 recording FEI03OpK99o + era guides): Sisipu
--- walks the southbound road out of Zephyr Gate ("Oschon's Torch is due
--- south"), ankle-biter packs ambush along the way, and on arrival the
--- processEvent605 echo plays at the lighthouse. Coordinates are
--- DERIVED (no 1.x capture renders XYZ): a compressed road segment at
--- the gate's seeded height, with the remaining distance masked by the
--- arrival warp — see 056_man0l1_zephyr_escort.sql. The walk pauses
--- whenever live mobs are near Sisipu or she's engaged, and the
--- completion signal requires both arrival AND a cleared road.
+-- Runtime shape: the duty runs as a content instance in zone 129
+-- ('sea0Field02', Camp Skull Valley — see seed 066), warped into from the
+-- Zephyr Gate (man0l1.lua startMan0l1Content). onCreate spawns Sisipu +
+-- eight ankle biters clustered on the camp floor; onUpdate has Sisipu
+-- FOLLOW the player (who walks the real navmesh) and pull/hold on nearby
+-- live mobs. Completion is the kill count — once every ankle biter is dead
+-- the road is "clear" and we sendSignal("escortComplete"); the director
+-- then plays the processEvent605 arrival echo and warps to the lighthouse.
+-- (The old hardcoded southbound-waypoint walk was removed: it had no
+-- navmesh and walked Sisipu off the cliff — 2026-06-17.)
 
--- Sisipu's waypoints (escort beat order). The final entry is the
--- arrival point; ambush clusters from the 056 seed sit just past
--- waypoints 1-3.
-ESCORT_WAYPOINTS = {
-	{ x = -52.0, z = 210.0 },
-	{ x = -36.0, z = 255.0 },
-	{ x = -20.0, z = 300.0 },
-	{ x = -8.0,  z = 340.0 },
-};
-ESCORT_Y = 33.15;            -- gate road height (seed-anchored)
 WALK_STEP = 1.6;             -- units per 500 ms tick (escort walking pace)
-ARRIVE_EPSILON = 3.0;        -- "reached the waypoint" distance
 HOLD_RADIUS = 28.0;          -- live mob within this of Sisipu → hold the walk
 ENGAGE_RADIUS = 18.0;        -- mob pulls onto the escort inside this
 
@@ -45,7 +35,7 @@ ENGAGE_RADIUS = 18.0;        -- mob pulls onto the escort inside this
 escortState = {};
 
 function onCreate(starterPlayer, contentArea, director)
-	escortState[starterPlayer.actorId] = { wp = 1, signaled = false };
+	escortState[starterPlayer.actorId] = { signaled = false };
 
 	sisipu = GetWorldManager().SpawnBattleNpcById(16, contentArea);
 	local mobs = {};
@@ -130,37 +120,32 @@ function onUpdate(tick, area)
 		allyGlobal.EngageTarget(escort, mobs[1])
 	end
 
-	-- Hold the walk while the road ahead is contested.
+	-- Completion = the road is cleared (every ankle biter defeated). Sisipu
+	-- FOLLOWS the player (who walks the real navmesh) rather than leading a
+	-- hardcoded route. (Garlemald-Server #46 — pathing follow-up: a real
+	-- navmesh route to Oschon's Torch so she can lead like retail.)
+	if #mobs == 0 then
+		state.signaled = true
+		sendSignal("escortComplete")
+		return
+	end
+
+	-- Hold while contested; otherwise trail the player, staying ~3u behind so
+	-- she never outruns navigable ground (the player navigates valid terrain).
 	if nearLive > 0 or escort:IsEngaged() then
 		return
 	end
-
-	local wp = ESCORT_WAYPOINTS[state.wp]
-	if not wp then return end
-	local remaining = dist2d(escort.positionX, escort.positionZ, wp.x, wp.z)
-	if remaining <= ARRIVE_EPSILON then
-		if state.wp >= #ESCORT_WAYPOINTS then
-			if #mobs == 0 then
-				-- Arrived with a clear road — resume the director beat
-				-- (QuestDirectorMan0l101 parks on this right after the
-				-- opening cutscene).
-				state.signaled = true
-				sendSignal("escortComplete")
-			end
-			return
-		end
-		state.wp = state.wp + 1
-		return
+	local FOLLOW_GAP = 3.0
+	local d = dist2d(escort.positionX, escort.positionZ, owner.positionX, owner.positionZ)
+	if d > FOLLOW_GAP then
+		local step = math.min(WALK_STEP, d - FOLLOW_GAP)
+		local dx = (owner.positionX - escort.positionX) / d
+		local dz = (owner.positionZ - escort.positionZ) / d
+		escort:MoveTo(
+			escort.positionX + dx * step,
+			owner.positionY,
+			escort.positionZ + dz * step,
+			math.atan(dx, dz),
+			1)   -- moveState 1 = walk
 	end
-
-	-- One walking step toward the current waypoint, facing travel.
-	local step = math.min(WALK_STEP, remaining)
-	local dx = (wp.x - escort.positionX) / remaining
-	local dz = (wp.z - escort.positionZ) / remaining
-	escort:MoveTo(
-		escort.positionX + dx * step,
-		ESCORT_Y,
-		escort.positionZ + dz * step,
-		math.atan(dx, dz),
-		1)   -- moveState 1 = walk
 end

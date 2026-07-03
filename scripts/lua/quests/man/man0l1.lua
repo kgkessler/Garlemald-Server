@@ -125,6 +125,17 @@ CNTR_SEQ7_MSK		= 2;
 CNTR_SEQ40_FSH		= 3;
 CNTR_LS_MSG			= 4;
 
+-- Quest Flags
+-- Latched by the SEQ_007 ECHO_EXIT push chain right before its
+-- WarpToPublicArea. A save sitting at subseqMSK>=4 WITHOUT this flag
+-- relogged mid-chain (the pre-neutralizer processEvent060 veil hang
+-- forced exactly that kill-and-relog) and never got the exit warp —
+-- the onStateChange rescue below re-issues it once. Lua has no
+-- private-area probe (PlayerSnapshot carries zone_id only), so this
+-- flag is the "already exited the MSK Echo" signal instead.
+-- (Garlemald-Server #46.)
+FLAG_SEQ7_MSK_EXITED	= 0;
+
 -- Msg packs for the Npc LS
 NPCLS_MSGS = {
 	{339},
@@ -133,7 +144,22 @@ NPCLS_MSGS = {
 	{161, 162, 163, 164}
 };
 
-function onStart(player, quest)	
+-- Round 5 (Garlemald-Server #46): the round-2 stageAfterQuestWarpDirector
+-- helper and its per-warp kicks are gone. Wire-proven: the wipe +
+-- 0x00E2(0x10) warp recipe completes on its own — warp-END (RX 0x0007)
+-- arrives independent of any kick — so the Now-Loading veil never needed
+-- the noticeEvent round-trip. Worse, the kick actively broke the session:
+-- the client orders desktopWidgetMode(16) on EVERY event begin
+-- (_onPreEvent) and only _onPostEvent cancels it — a kick whose EndEvent
+-- lands mid-reload loses that teardown and leaves the session-global
+-- desktopWidget masked (the "tutorial mode" menu lock). pmeteor stages
+-- this director at exactly ONE site: the Baderon SEQ_000→SEQ_003 beat
+-- (seq000_onTalk below), whose kicked noticeEvent drives the
+-- processEventTu_001 tutorial hook — that one is retail's design and
+-- stays. onNotice keeps its else→EndEvent arm as a safety net for it
+-- (and any stray kick).
+
+function onStart(player, quest)
 	quest:StartSequence(SEQ_000);
 	
 	-- Immediately move to the Adventurer's Guild private area.
@@ -203,7 +229,26 @@ function onStateChange(player, quest, sequence)
 		quest:SetENpc(ADVENTURER1);
 		quest:SetENpc(ADVENTURER2);
 		quest:SetENpc(ADVENTURER3);
-		quest:SetENpc(ECHO_EXIT_TRIGGER, subseqMSK == 3 and QFLAG_PUSH or QFLAG_NONE, false, subseqMSK == 3);					
+		quest:SetENpc(ECHO_EXIT_TRIGGER, subseqMSK == 3 and QFLAG_PUSH or QFLAG_NONE, false, subseqMSK == 3);
+		-- Zone-in rescue (Garlemald-Server #46): a player who relogged
+		-- inside the MSK Echo (PrivateAreaMasterPast/3) after the counter
+		-- latched at 4 is trapped — the exit trigger above is QFLAG_NONE at
+		-- subseqMSK==4, so the doors are dead. Re-issue the exit warp the
+		-- dropped push-chain coroutine never got to. onStateChange re-runs
+		-- at login zone-in (the processor's relog re-arm) and after every
+		-- talk (quest:UpdateENPCs), so the rescue reaches the victim on the
+		-- next relog or Echo-NPC talk. One-shot and chain-safe by
+		-- construction: the flag is set BEFORE the warp here, the live
+		-- ECHO_EXIT push chain sets it before ITS warp (so this never
+		-- double-fires mid-chain), and at subseqMSK==3 (Echo still in
+		-- progress) or in the SEQ_050 escort content the sequence/counter
+		-- gates keep it dormant. A pre-flag save that already exited
+		-- cleanly eats one same-zone reload flicker on its next
+		-- onStateChange, then latches.
+		if (subseqMSK >= 4 and not data:GetFlag(FLAG_SEQ7_MSK_EXITED)) then
+			data:SetFlag(FLAG_SEQ7_MSK_EXITED);
+			GetWorldManager():WarpToPublicArea(player);
+		end
 	elseif (sequence == SEQ_035) then
 		quest:SetENpc(NNMULIKA, QFLAG_TALK);
 	elseif (sequence == SEQ_040) then
@@ -446,6 +491,18 @@ function seq007_onTalk(player, quest, npc, classId)
 		else
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent027_2");
 		end
+		-- Self-heal (Garlemald-Server #46): both guild errands latched
+		-- (CUL sale done, MSK Echo exited) but no linkshell chain pending
+		-- — the seq007_endSequence NewNpcLsMsg beat was lost (its coroutine
+		-- died in the pre-neutralizer processEvent060 veil hang), leaving
+		-- the save unable to reach onNpcLS/SEQ_035. Re-queue it: the Rust
+		-- NewNpcLsMsg apply (`set_npc_ls_from`, actor/quest.rs) resets
+		-- npc_ls_msg_step to 1, so the re-fired pack-2 chain starts at its
+		-- first message. GetNpcLsFrom()==0 guards re-fires while a chain
+		-- is already pending, so repeat Baderon talks can't spam the glow.
+		if (subseqCUL >= 1 and subseqMSK >= 4 and data:GetNpcLsFrom() == 0) then
+			quest:NewNpcLsMsg(1);
+		end
 	elseif (classId == CHARLYS) then
 		if (subseqCUL == 0) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent030");
@@ -466,7 +523,14 @@ function seq007_onTalk(player, quest, npc, classId)
 		if (subseqMSK == 2) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent050");
 			data:IncCounter(CNTR_SEQ7_MSK);
+			-- Close the talk event, THEN warp (0x0131 ahead of the 0x00E2
+			-- reload latch — see onStart). This branch used to fall through
+			-- to the shared EndEvent below, putting the teardown AFTER the
+			-- warp; the early return keeps that shared EndEvent serving the
+			-- other branches exactly once.
+			player:EndEvent();
 			GetWorldManager():WarpToPrivateArea(player, "PrivateAreaMasterPast", 3);
+			return;
 		elseif (subseqMSK == 0) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent035");
 			data:IncCounter(CNTR_SEQ7_MSK);
@@ -506,7 +570,16 @@ function seq007_onTalk(player, quest, npc, classId)
 end
 
 function seq007_endSequence(player, quest)
-	callClientFunction(player, "delegateEvent", player, quest, "processEvent033");
+	-- processEvent033 is just two worldMaster:say lines (decoded client
+	-- Man0l1.lua:596-610) — no player interaction. Wire-proven (round-3
+	-- ECHO_EXIT capture): the client answers processEvent060 and
+	-- processEvent604_3 but NEVER answers 033's EventUpdate, so the
+	-- coroutine parked here forever and the EndEvent/SetFlag/exit-warp
+	-- tail never ran. Deliver both lines server-side instead — text ids
+	-- 333/334 on the man0l1 QUEST sheet, same sheet as the working
+	-- 320/321 sends in onStart (wire-confirmed text_owner_id=2700193202).
+	player:SendGameMessage(quest, 333, 0x20);
+	player:SendGameMessage(quest, 334, 0x20);
 	quest:NewNpcLsMsg(1);
 end
 
@@ -545,10 +618,23 @@ function onPush(player, quest, npc)
 			GetWorldManager():DoZoneChange(player, 230, nil, 0, 15, -620.0, 29.476, -70.050, 0.791);
 		elseif (classId == ECHO_EXIT_TRIGGER) then
 			callClientFunction(player, "delegateEvent", player, quest, "processEvent060");
+			-- No processEvent604_3 neutralizer here anymore (round 4):
+			-- seq007_endSequence now delivers 033's two lines server-side
+			-- (SendGameMessage — see that function), so nothing needs to
+			-- play on a live screen between processEvent060 and the exit
+			-- warp. The startFadeInCutSceneAfterWarp veil armed by 060
+			-- (decoded Man0l1.lua:1135) stays up as the transition cover
+			-- and the warp's own warp-END (RX 0x0007) clears it
+			-- post-reload — no director kick (see the round-5 note above
+			-- onStart). (Garlemald-Server #46, r4/r5.)
 			data:IncCounter(CNTR_SEQ7_MSK);
 			if (data:GetCounter(CNTR_SEQ7_CUL) == 1) then
 				seq007_endSequence(player, quest);
 			end
+			-- Latch "exit warp issued" BEFORE quest:UpdateENPCs(): the
+			-- re-run onStateChange sees the fresh flag and keeps the
+			-- relog-rescue arm dormant on this (live) path.
+			data:SetFlag(FLAG_SEQ7_MSK_EXITED);
 			player:EndEvent();
 			quest:UpdateENPCs();
 			GetWorldManager():WarpToPublicArea(player);
@@ -582,8 +668,8 @@ function onPush(player, quest, npc)
 		end		
 	elseif (sequence == SEQ_085) then
 		if (classId == ECHO_EXIT_TRIGGER2) then
-			callClientFunction(player, "delegateEvent", player, quest, "processEvent635");			
-			player:EndEvent();			
+			callClientFunction(player, "delegateEvent", player, quest, "processEvent635");
+			player:EndEvent();
 			quest:NewNpcLsMsg(1);
 			quest:StartSequence(SEQ_090);
 			quest:UpdateENPCs();
@@ -677,7 +763,7 @@ function onEmote(player, quest, npc, eventName)
 			elseif (emoteTestStep == 6) then
 				if (eventName == "emoteDefault6") then
 					callClientFunction(player, "delegateEvent", player, quest, "processEvent602");
-					player:EndEvent();					
+					player:EndEvent();
 					GetWorldManager():WarpToPublicArea(player);
 					quest:StartSequence(SEQ_048);
 					return;
@@ -722,6 +808,16 @@ function onNotice(player, quest, target)
 		-- endTutorialMode → full unlock (mode 8, free movement).
 		-- (Garlemald-Server #46 — Baderon menu/softlock root cause.)
 		player:RunEventFunction("delegateEvent", player, quest, "processEventTu_001");
+		player:EndEvent();
+	else
+		-- Safety net (round 5: the only staged AfterQuestWarpDirector kick
+		-- left is the Baderon SEQ_000→SEQ_003 beat — see the note above
+		-- onStart). A kicked noticeEvent that lands after the sequence has
+		-- already advanced (or any stray kick, e.g. the escort content
+		-- director's) still routes here, and the client only needs the
+		-- EndEvent to close it. NO quest state is touched: leaving the
+		-- event open instead would event-lock the client (movement + menus
+		-- dead, see the SEQ_003 comment above). (Garlemald-Server #46.)
 		player:EndEvent();
 	end
 
@@ -779,54 +875,63 @@ end
 function startMan0l1Content(player, quest)
 	quest:StartSequence(SEQ_050);
 
-	-- Play the Sisipu entry cutscene NOW, before the warp. man0l604 is a
-	-- `startFadeInCutSceneAfterWarp` cut: it fades out, plays, then blocks on
-	-- `_waitForMapLoaded` (MapLayoutElement [+0xb9]) until the map "finishes
-	-- loading", then fades in. For a SAME-MAP duty the geometry is already
-	-- resident, so we must NOT schedule a reload (no 0x00E2 latch → [+0xb9]
-	-- stays 0) and we finish the zone-in instantly via spawnType 0x16 (the
-	-- client's instant zone-in-complete bypass — decompiled in
-	-- captures/issue28-rca, the only 0x00CE path that emits RX 0x0007
-	-- 0xFFFFFFFF without arming the order machine or touching [+0xb9]). With
-	-- [+0xb9]==0 the cut's _waitForMapLoaded unblocks and fades the player back
-	-- in. (Garlemald-Server #46.)
-	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
-	-- Close the contentsJoinAskInBasaClass push event. Without this the
-	-- pushDefault event stays open (the director only EndEvents the separate
-	-- noticeEvent kick), and the client keeps the player in event mode — menus,
-	-- targeting and actions stay locked even though movement is free, which is
-	-- why the escort NPCs can't be targeted. (This EndEvent was dropped earlier
-	-- while chasing the reload hang; the warp now completes via spawnType 0x16,
-	-- independent of the event system, so it is safe to close here.) The cut
-	-- still plays — the client renders processEvent604 before processing the
-	-- EndEvent (proven by the earlier "cutscene then hang" runs). (Garlemald #46.)
-	player:EndEvent();
-
-	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101");
-
+	-- ===== CUTSCENE → CROSS-MAP DUTY WARP (Garlemald-Server #46) =====
+	-- The man0l604 cutscene (processEvent604) ends with startFadeInCutSceneAfterWarp
+	-- == engine `_fadeInAfterWarp()`, which raises the "Now Loading" overlay. The
+	-- client tears that overlay down ONLY when a real off-disk map load COMPLETES
+	-- (warp-END handler / LuaActorImpl slot 42). The veil therefore REQUIRES the
+	-- cutscene to be followed by a warp into a GENUINELY DIFFERENT map resource:
+	--   * same zone / in-place reveal (0x16) / teleport respawn (7) -> no load -> hang
+	--   * same-map force-reload (128->128, or 141 'sea0Field01a' which aliases
+	--     128's 'sea0Field01') -> no DIFFERENT resource loads -> hang
+	-- (all three proven on 2026-06-17/18/19; captures/issue28-rca/04-decomp-unlock.md).
+	--
+	-- Fix: run the escort as a content instance whose zone is 129 (Western La
+	-- Noscea, 'sea0Field02') — the only different-map zone in region 101. The 6th
+	-- CreateContentArea arg pins the instance to 129, so the content NPCs spawn
+	-- there, active_content_script/onUpdate drive there, and DoZoneChangeContent
+	-- migrates the player 128->129. SetMap then carries 129 ('sea0Field02', a
+	-- DIFFERENT resource than 128's 'sea0Field01') and the 0x00E2(0x10) force-reload
+	-- latch (same-region 128->129 needs it) schedules the load -> it completes ->
+	-- warp-END fires -> (a) the cutscene veil resolves AND (b) the command-inhibit
+	-- latch clears (mode 0x10 != 0x16) -> menu/map/weaponskills live. This is the
+	-- cutscene -> Now Loading -> game-world chain (NOT a same-region DoZoneChange,
+	-- which would hit the 6 s deferral; the content path flushes immediately).
+	local contentArea = player.CurrentArea:CreateContentArea(player, "/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent", "Man0l101", "SimpleContentMan0l101", "Quest/QuestDirectorMan0l101", 129);
 	if (contentArea == nil) then
 		return;
 	end
-
 	local director = contentArea:GetContentDirector();
 	player:AddDirector(director);
 	director:StartDirector(false);
-
-	-- The KickEvent delivers the entry cutscene AFTER the warp completes: the
-	-- client echoes EventStart(noticeEvent) once the same-map reload finishes,
-	-- firing QuestDirectorMan0l101:onEventStarted, which plays processEvent604
-	-- (man0l604 is startFadeInCutSceneAfterWarp — it can ONLY fade in post-warp)
-	-- and then drives the escort. Mirrors the proven man0g0 SEQ_005 doContentArea.
 	player:KickEvent(director, "noticeEvent", true);
 	player:SetLoginDirector(director);
 
-	-- Same-map content warp. spawnType 0x16 (22) = the client's instant
-	-- zone-in-complete bypass: reposition the player + emit RX 0x0007
-	-- 0xFFFFFFFF immediately, NO order-machine reload (the map is already
-	-- resident — no "Now Loading"). Paired with the no-latch warp in
-	-- apply_do_zone_change_content so [+0xb9] stays 0 and the entry cut's
-	-- _waitForMapLoaded unblocks. (Garlemald-Server #46.)
-	GetWorldManager():DoZoneChangeContent(player, contentArea, -63.25, 33.15, 164.51, 0.8, 22);
+	-- 1. Cutscene IN PLACE at the gate. processEvent604 = fadeOut +
+	--    NQCutScene("man0l604") + startFadeInCutSceneAfterWarp (== engine
+	--    _fadeInAfterWarp(), which ARMS a Now-Loading veil that waits for a warp).
+	--    callClientFunction parks until the cut plays + arms the fade, then returns.
+	callClientFunction(player, "delegateEvent", player, quest, "processEvent604");
+
+	-- 2. NEUTRALISE the armed after-warp veil BEFORE warping. processEvent604_3 =
+	--    startFadeInCutSceneDefault (_waitForMapLoaded → _fadeIn(1) → _waitForFading):
+	--    the map is still the gate (loaded), so it fades the screen back in in place
+	--    and clears the _fadeInAfterWarp pending state. This is the load-bearing fix
+	--    (PROVEN root cause, packet-level + man0g0 contrast): the content warp itself
+	--    is byte-correct (0x0007 DeleteAllActors + 0x00E2(0x10) force-reload +
+	--    0x0005 SetMap + 0x00CE all delivered, client echoes RX 0x0007), and man0g0
+	--    does the IDENTICAL same-zone 0x10 warp successfully — the ONLY difference is
+	--    that man0g0 never arms an after-warp cutscene veil. With the veil cleared
+	--    here, the following warp is a clean man0g0-style warp whose warp-END resolves
+	--    normally → no stuck "Now Loading". (Garlemald-Server #46.)
+	callClientFunction(player, "delegateEvent", player, quest, "processEvent604_3");
+
+	-- 3. Duty warp into the zone-129 Skull Valley camp (escort NPCs seeded there —
+	--    seed/066). spawnType 16 (0x10) → apply_do_zone_change_content force-reload
+	--    branch (DeleteAllActors + 0x00E2(0x10) + zone-in bundle), same as man0g0.
+	GetWorldManager():DoZoneChangeContent(player, contentArea, -991.88, 61.71, -1120.79, 0.0, 16);
+
+	player:EndEvent();
 end
 
 function getJournalInformation(player, quest)

@@ -123,6 +123,18 @@ pub struct Session {
     /// added at broadcast time so the slot[0]=requester convention
     /// stays consistent. B2 of the SEQ_005 unblock plan.
     pub transient_party_members: Vec<u32>,
+    /// Party-composition ordinal — bumped every time
+    /// `transient_party_members` changes (member push in the
+    /// `PartyAddMember` appliers, roster clear in the
+    /// `ContentFinished` teardown). Feeds
+    /// `packets::send::groups::party_group_index`: the retail wire
+    /// finding (#46 round 5, vs `invite_join_party.pcapng`) is that
+    /// the 1.x client registers a party group id ONCE and ignores
+    /// roster changes re-sent under an id it already holds — so every
+    /// multi-member composition must ship the trio under a FRESH
+    /// group_index. Solo emissions ignore this and keep the immutable
+    /// login id.
+    pub party_group_ordinal: u32,
     /// Per-director transient roster, keyed by `director_actor_id`.
     /// Same idea as `transient_party_members` but for directors —
     /// accumulates as `director:AddMember(actor)` fires (combat
@@ -149,6 +161,42 @@ pub struct Session {
     /// Sisipu immediately, unlike SEQ_005 which waits for input). Reset to
     /// `false` when a new content warp dispatches. (Garlemald-Server #46.)
     pub content_warp_acked: bool,
+    /// `true` from the moment an IMMEDIATE wipe+0x10 reload recipe hits
+    /// the wire (`quest_apply::apply_do_zone_change`'s resident-geometry
+    /// branch / `processor::apply_do_zone_change_content`) until the
+    /// client echoes `RX 0x0007` zone-in-complete. While set, inbound
+    /// `0x00CA` position reports are dropped — the client keeps
+    /// reporting OLD-zone coordinates through the reload window, and
+    /// writing them (a) relocated the just-warped character back to the
+    /// origin coords and (b) pointed `send_instance_update`'s
+    /// partner-zone scan at the origin, streaming the old zone's NPC
+    /// set as "new" (wire 23:44:06: teleport 133→128 followed 8 ms
+    /// later by 34 phantom Drowning Wench NPCs in the camp view). The
+    /// DEFERRED warp path already had this guard via
+    /// `pending_zone_in`; this latch covers the immediate recipes.
+    /// Cleared by the `RX 0x0007` arm; a relog can't inherit a stale
+    /// latch because `handle_session_begin` upserts a fresh default
+    /// `Session`. (Garlemald-Server #46, round 4.)
+    pub reload_in_flight: bool,
+    /// `true` from `handle_session_begin` until the client's FIRST
+    /// `RX 0x0007` of the login. While set, `apply_do_zone_change`
+    /// parks any warp on `deferred_login_warp` instead of applying it:
+    /// the login arm re-runs quest `onStateChange` AFTER dispatching
+    /// zone-in bundle #1, and a rescue warp drained there (man0l1's
+    /// PrivateAreaMasterPast/3 relog arm) used to fire its wipe pair +
+    /// bundle #2 + kick 6-15 ms behind bundle #1 — the client's
+    /// UI/event layer never finished initializing and every menu/talk
+    /// was dead for the session (wire 00:09:23.876-.891). Cleared by
+    /// the `RX 0x0007` arm, which then applies the parked warp as a
+    /// normal in-session warp against a fully-loaded client.
+    /// (Garlemald-Server #46, round 4.)
+    pub defer_warps_until_zone_in_ack: bool,
+    /// Warp parked by `apply_do_zone_change` while
+    /// `defer_warps_until_zone_in_ack` is set. Last writer wins (the
+    /// final drained warp names the real destination). Applied — with
+    /// the full position/zone persistence a live warp performs — from
+    /// the `RX 0x0007` arm. (Garlemald-Server #46, round 4.)
+    pub deferred_login_warp: Option<DeferredWarp>,
     /// Secondary zone the player is currently *merged* with at a
     /// seamless boundary strip (C# `Player.zone2`). `Some(z)` while
     /// straddling the merge box of the `current_zone_id`↔`z` boundary;
@@ -283,6 +331,24 @@ pub struct PendingZoneIn {
     /// Emit the 34108 "instance" message after the bundle (pmeteor
     /// sends it when the destination is a PrivateArea).
     pub notify_private_area: bool,
+}
+
+/// Full argument set of a `quest_apply::apply_do_zone_change` call,
+/// parked on `Session::deferred_login_warp` while the login zone-in is
+/// still un-acked (see `Session::defer_warps_until_zone_in_ack`). The
+/// `RX 0x0007` arm replays it verbatim, so the deferred path applies
+/// exactly the persistence + wire recipe a live warp would have.
+#[derive(Debug, Clone)]
+pub struct DeferredWarp {
+    pub player_id: u32,
+    pub zone_id: u32,
+    pub private_area: Option<String>,
+    pub private_area_type: u32,
+    pub spawn_type: u8,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub rotation: f32,
 }
 
 impl Session {

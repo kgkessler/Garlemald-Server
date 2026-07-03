@@ -8860,6 +8860,317 @@ async fn apply_add_exp_level_up_emits_extra_state_for_all_bundle() {
 }
 
 // ---------------------------------------------------------------------------
+// Level-up auto-equip — #46 round 2 (pmeteor Player.LevelUp →
+// EquipAbilitiesAtLevel → EquipAbilityInFirstOpenSlot)
+// ---------------------------------------------------------------------------
+
+/// Shared scaffolding for the level-up auto-equip tests: tempdb with the
+/// character rows, the REAL seed battle-command catalog
+/// (`013_server_battle_commands.sql` — GLA (class 3) unlocks rampart
+/// 27142 at level 2 (recast 120 s) and phalanx 27158 at level 4), a
+/// registered ClientHandle, and a level-1 GLA character in the registry.
+async fn setup_level_up_equip_scene(
+    chara_id: u32,
+) -> (
+    Arc<WorldManager>,
+    Arc<ActorRegistry>,
+    Arc<crate::database::Database>,
+    Arc<crate::lua::LuaEngine>,
+    mpsc::Receiver<Vec<u8>>,
+) {
+    use common::db::ConnCallExt;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+    let (catalog, by_level) = db
+        .load_global_battle_command_list()
+        .await
+        .expect("battle command catalog");
+    assert!(catalog.contains_key(&27142), "rampart seeded (GLA lvl 2)");
+    assert!(catalog.contains_key(&27158), "phalanx seeded (GLA lvl 4)");
+    lua.catalogs()
+        .install_battle_commands_with_level_index(catalog, by_level);
+
+    db.conn_for_test()
+        .call_db(move |c| {
+            c.execute(
+                r"INSERT INTO characters (id, userId, slot, serverId, name, restBonus)
+                  VALUES (:cid, 0, 0, 0, 'SkillLearner', 0)",
+                rusqlite::named_params! { ":cid": chara_id },
+            )?;
+            c.execute(
+                r"INSERT INTO characters_class_levels (characterId) VALUES (:cid)",
+                rusqlite::named_params! { ":cid": chara_id },
+            )?;
+            c.execute(
+                r"INSERT INTO characters_class_exp (characterId) VALUES (:cid)",
+                rusqlite::named_params! { ":cid": chara_id },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(chara_id, ClientHandle::new(chara_id, tx))
+        .await;
+    let mut chara = Character::new(chara_id);
+    chara.chara.class = crate::gamedata::CLASSID_GLA as i16;
+    chara.chara.level = 1;
+    chara.battle_save.skill_level[crate::gamedata::CLASSID_GLA as usize] = 1;
+    registry
+        .insert(ActorHandle::new(
+            chara_id,
+            ActorKindTag::Player,
+            200,
+            chara_id,
+            chara,
+        ))
+        .await;
+
+    (world, registry, db, lua, rx)
+}
+
+/// Read one hotbar row `(commandId, recastTime)` straight from
+/// `characters_hotbar`, or `None` when the slot is empty.
+async fn hotbar_row(
+    db: &crate::database::Database,
+    chara_id: u32,
+    class_id: u8,
+    slot0: u16,
+) -> Option<(u32, u32)> {
+    use common::db::ConnCallExt;
+    db.conn_for_test()
+        .call_db(move |c| {
+            use rusqlite::OptionalExtension;
+            c.query_row(
+                r"SELECT commandId, recastTime FROM characters_hotbar
+                  WHERE characterId = :cid AND classId = :class AND hotbarSlot = :slot",
+                rusqlite::named_params! { ":cid": chara_id, ":class": class_id, ":slot": slot0 },
+                |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?)),
+            )
+            .optional()
+        })
+        .await
+        .unwrap()
+}
+
+/// A 1→2 crossing auto-equips the newly unlocked command (rampart
+/// 27142) into the NEXT FREE slot — slot 0 is pre-occupied by
+/// fast_blade so the equip must land in slot 1 — persists the
+/// job-mirror row (PLD = GLA + 13 = class 16, first free DB slot),
+/// starts the recast (pmeteor: new skills begin on cooldown), updates
+/// the in-memory mirror, and ships the `charaWork.command[33]` hotbar
+/// subpacket to the owning client (wire slot = 32 + slot0).
+#[tokio::test]
+async fn apply_add_exp_level_up_auto_equips_unlocked_command_into_hotbar() {
+    use common::db::ConnCallExt;
+
+    let (world, registry, db, lua, mut rx) = setup_level_up_equip_scene(1101).await;
+
+    // Occupy slot 0 (DB + in-memory mirror) so "next free" is slot 1.
+    db.conn_for_test()
+        .call_db(|c| {
+            c.execute(
+                r"INSERT INTO characters_hotbar (characterId, classId, hotbarSlot, commandId, recastTime)
+                  VALUES (1101, 3, 0, 27150, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    {
+        let handle = registry.get(1101).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.chara.hotbar.push(crate::gamedata::HotbarEntry {
+            hotbar_slot: 0,
+            command_id: 27150 | 0xA0F0_0000,
+            recast_time: 0,
+        });
+    }
+
+    let before_unix = common::utils::unix_timestamp();
+    // LEVEL_THRESHOLDS[0] = 570 — 600 crosses 1 → 2.
+    crate::runtime::quest_apply::apply_add_exp(
+        1101,
+        crate::gamedata::CLASSID_GLA,
+        600,
+        &registry,
+        &db,
+        Some(&world),
+        Some(&lua),
+    )
+    .await;
+
+    // (1) Class-bar row in the next free slot, recast started.
+    let (cmd, recast) = hotbar_row(&db, 1101, 3, 1)
+        .await
+        .expect("rampart should be equipped in class slot 1");
+    assert_eq!(cmd, 27142, "level-2 unlock is rampart");
+    assert!(
+        recast >= before_unix + 100,
+        "new skill starts on cooldown (rampart recast 120 s); got {recast} vs now {before_unix}",
+    );
+
+    // (1b) Job-mirror row — PLD (16), first free DB slot = 0.
+    let (job_cmd, _) = hotbar_row(&db, 1101, 16, 0)
+        .await
+        .expect("job mirror row should exist for PLD");
+    assert_eq!(job_cmd, 27142);
+
+    // In-memory mirror updated for the active class (masked shape).
+    {
+        let handle = registry.get(1101).await.unwrap();
+        let c = handle.character.read().await;
+        let entry = c
+            .chara
+            .hotbar
+            .iter()
+            .find(|e| e.hotbar_slot == 1)
+            .expect("mirror entry for slot 1");
+        assert_eq!(entry.command_id, 27142 | 0xA0F0_0000);
+    }
+
+    // (2) The client received the charaWork/command subpacket for the
+    // slot — wire slot 32 + 1 = 33. Property NAMES ride the wire as
+    // murmur2 ids (ActorPropertyPacketBuilder::add_int), so match the
+    // staged entry bytes: type 4 + id LE + masked command LE. The
+    // target path is the only raw string in the payload.
+    let subs = parse_all_subpackets(&mut rx);
+    assert!(
+        contains_target_path(&subs, b"charaWork/command"),
+        "client should receive a charaWork/command-targeted 0x0137",
+    );
+    let prop_id = common::utils::murmur_hash2("charaWork.command[33]", 0);
+    let mut entry = vec![4u8];
+    entry.extend_from_slice(&prop_id.to_le_bytes());
+    entry.extend_from_slice(&(27142u32 | 0xA0F0_0000).to_le_bytes());
+    assert!(
+        subs.iter()
+            .any(|s| s.data.windows(entry.len()).any(|w| w == entry)),
+        "client should receive charaWork.command[33] = masked rampart",
+    );
+}
+
+/// A full 30-slot bar skips the auto-equip (no class-bar DB row, no
+/// panic) but the 33926 "You learn" battle-log line still reaches the
+/// client — the player just slots the command by hand.
+#[tokio::test]
+async fn apply_add_exp_level_up_full_hotbar_skips_equip_keeps_learn_message() {
+    let (world, registry, db, lua, mut rx) = setup_level_up_equip_scene(1102).await;
+
+    // Fill every in-memory slot (the active-class search scans the
+    // mirror, matching pmeteor FindFirstCommandSlotById on
+    // charaWork.command).
+    {
+        let handle = registry.get(1102).await.unwrap();
+        let mut c = handle.character.write().await;
+        for slot0 in 0..crate::runtime::quest_apply::HOTBAR_SLOTS {
+            c.chara.hotbar.push(crate::gamedata::HotbarEntry {
+                hotbar_slot: slot0,
+                command_id: 27150 | 0xA0F0_0000,
+                recast_time: 0,
+            });
+        }
+    }
+
+    crate::runtime::quest_apply::apply_add_exp(
+        1102,
+        crate::gamedata::CLASSID_GLA,
+        600,
+        &registry,
+        &db,
+        Some(&world),
+        Some(&lua),
+    )
+    .await;
+
+    // No class-bar row landed anywhere for rampart.
+    use common::db::ConnCallExt;
+    let class_rows: i64 = db
+        .conn_for_test()
+        .call_db(|c| {
+            c.query_row(
+                r"SELECT COUNT(*) FROM characters_hotbar
+                  WHERE characterId = 1102 AND classId = 3 AND commandId = 27142",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(class_rows, 0, "full bar must skip the class-bar equip");
+
+    // Learn message still fires (emit_exp_property_updates owns it).
+    let learn_marker = 33926u16.to_le_bytes();
+    let mut saw_learn = false;
+    while let Ok(frame) = rx.try_recv() {
+        if frame.windows(2).any(|w| w == learn_marker) {
+            saw_learn = true;
+        }
+    }
+    assert!(
+        saw_learn,
+        "33926 'You learn X' should still be emitted when the bar is full",
+    );
+}
+
+/// A multi-level gain (1 → 4: rampart at 2, phalanx at 4) equips each
+/// level's commands into DISTINCT slots, oldest level first.
+#[tokio::test]
+async fn apply_add_exp_multi_level_gain_equips_each_level_into_distinct_slots() {
+    let (world, registry, db, lua, _rx) = setup_level_up_equip_scene(1103).await;
+
+    // 570 (1→2) + 700 (2→3) + 880 (3→4) = 2150; 2200 crosses to 4.
+    crate::runtime::quest_apply::apply_add_exp(
+        1103,
+        crate::gamedata::CLASSID_GLA,
+        2200,
+        &registry,
+        &db,
+        Some(&world),
+        Some(&lua),
+    )
+    .await;
+
+    let (slot0_cmd, _) = hotbar_row(&db, 1103, 3, 0)
+        .await
+        .expect("slot 0 should hold the level-2 unlock");
+    let (slot1_cmd, _) = hotbar_row(&db, 1103, 3, 1)
+        .await
+        .expect("slot 1 should hold the level-4 unlock");
+    assert_eq!(slot0_cmd, 27142, "rampart (lvl 2) equips first — slot 0");
+    assert_eq!(slot1_cmd, 27158, "phalanx (lvl 4) equips second — slot 1");
+
+    // Job mirror got both, also in distinct slots.
+    let (job0, _) = hotbar_row(&db, 1103, 16, 0).await.expect("PLD slot 0");
+    let (job1, _) = hotbar_row(&db, 1103, 16, 1).await.expect("PLD slot 1");
+    assert_eq!(job0, 27142);
+    assert_eq!(job1, 27158);
+
+    // In-memory mirror tracks both distinct slots for the active class.
+    let handle = registry.get(1103).await.unwrap();
+    let c = handle.character.read().await;
+    assert_eq!(
+        c.chara
+            .hotbar
+            .iter()
+            .filter(|e| matches!(e.command_id & 0xFFFF, 27142 | 27158))
+            .count(),
+        2,
+        "both unlocks mirrored in memory",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Event warp triggers — Tier 4 #18 (AfterQuestWarpDirector)
 // ---------------------------------------------------------------------------
 
@@ -15845,6 +16156,467 @@ async fn send_instance_update_streams_walked_in_npc() {
     assert!(
         session.actor_instance_list.contains(&0x4000_0010),
         "the streamed NPC must be recorded in actor_instance_list",
+    );
+}
+
+/// Garlemald-Server #46 / Drowning Wench late load-in —
+/// `send_instance_update` must also stream actors seeded in a seamless
+/// PARTNER zone, without a primary-zone flip. Limsa is two
+/// seamlessly-joined zones sharing one coordinate space: the player
+/// roams 230 (sea0Town01a) while the Drowning Wench population
+/// (Baderon et al.) is seeded in 133 (sea0Town01), and the boundary's
+/// flip/merge boxes sit at the west bridge/stairs and south stairs —
+/// never at the tavern's plaza entrance. pmeteor scans BOTH `zone` and
+/// `zone2` in `Player.SendInstanceUpdate` (Player.cs:2285-2288); this
+/// asserts the partner-derived scan does the same off the boundary
+/// table alone.
+#[tokio::test]
+async fn send_instance_update_streams_seamless_partner_zone_npc() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, SeamlessBoundary, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const PLAYER_ID: u32 = 1;
+    const PARTNER_NPC_ID: u32 = 0x4000_0020;
+    const PRIMARY_ZONE: u32 = 230;
+    const PARTNER_ZONE: u32 = 133;
+    const LIMSA_REGION: u16 = 101;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    for (zone_id, name) in [(PRIMARY_ZONE, "sea0Town01a"), (PARTNER_ZONE, "sea0Town01")] {
+        let zone = Zone::new(
+            zone_id,
+            name.to_string(),
+            LIMSA_REGION,
+            String::new(),
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        world.register_zone(zone).await;
+    }
+    // Boundary row pairing the two zones. All three boxes sit far from
+    // the player's position so no primary-zone flip / merge could fire —
+    // the stream must come from the boundary-derived partner scan alone.
+    world
+        .register_seamless_boundary(SeamlessBoundary {
+            id: 1,
+            region_id: LIMSA_REGION as u32,
+            zone_id_1: PARTNER_ZONE,
+            zone_id_2: PRIMARY_ZONE,
+            zone1_x1: -1000.0,
+            zone1_y1: -1000.0,
+            zone1_x2: -900.0,
+            zone1_y2: -900.0,
+            zone2_x1: 900.0,
+            zone2_y1: 900.0,
+            zone2_x2: 1000.0,
+            zone2_y2: 1000.0,
+            merge_x1: -500.0,
+            merge_y1: -500.0,
+            merge_x2: -400.0,
+            merge_y2: -400.0,
+        })
+        .await;
+
+    // Player in primary zone 230 at the origin.
+    let mut player = Character::new(PLAYER_ID);
+    player.base.zone_id = PRIMARY_ZONE;
+    registry
+        .insert(ActorHandle::new(
+            PLAYER_ID,
+            ActorKindTag::Player,
+            PRIMARY_ZONE,
+            1,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(PLAYER_ID, ClientHandle::new(PLAYER_ID, tx))
+        .await;
+    let mut session = MapSession::new(PLAYER_ID);
+    session.current_zone_id = PRIMARY_ZONE;
+    world.upsert_session(session).await;
+    {
+        let zone_arc = world.zone(PRIMARY_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: PLAYER_ID,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    // Tavern NPC seeded in PARTNER zone 133, within streaming range of
+    // the player's position (the pair shares one coordinate space).
+    let mut npc = Character::new(PARTNER_NPC_ID);
+    npc.base.zone_id = PARTNER_ZONE;
+    npc.chara.actor_class_id = 1_000_057;
+    npc.base.actor_name = "tavern_populace".to_string();
+    registry
+        .insert(ActorHandle::new(
+            PARTNER_NPC_ID,
+            ActorKindTag::Npc,
+            PARTNER_ZONE,
+            0,
+            npc,
+        ))
+        .await;
+    {
+        let zone_arc = world.zone(PARTNER_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: PARTNER_NPC_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(5.0, 0.0, 5.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world
+        .send_instance_update(&registry, None, PLAYER_ID, PLAYER_ID)
+        .await;
+
+    // The partner-zone NPC's AddActor reached the client.
+    let mut saw_partner_add_actor = false;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR
+                && sub.header.source_id == PARTNER_NPC_ID
+            {
+                saw_partner_add_actor = true;
+            }
+        }
+    }
+    assert!(
+        saw_partner_add_actor,
+        "send_instance_update must AddActor the partner-zone NPC without a zone flip",
+    );
+
+    let session = world.session(PLAYER_ID).await.unwrap();
+    assert_eq!(
+        session.current_zone_id, PRIMARY_ZONE,
+        "streaming the partner zone must NOT flip the primary zone",
+    );
+    assert!(
+        session.actor_instance_list.contains(&PARTNER_NPC_ID),
+        "the streamed partner-zone NPC must be recorded in actor_instance_list",
+    );
+}
+
+/// Garlemald-Server #46 round 4 (R4b) — the immediate wipe+0x10 reload
+/// recipe must latch `reload_in_flight` so a STALE 0x00CA (old-zone
+/// coords, sent by the client pre-Now-Loading) can't overwrite the
+/// warped position or point `send_instance_update`'s partner-zone scan
+/// back at the origin (wire 23:44:06: teleport 133→128, 34 phantom
+/// Drowning Wench NPCs streamed into the camp view 8 ms after the
+/// bundle). The client's RX 0x0007 zone-in-complete clears the latch
+/// and position streaming resumes.
+#[tokio::test]
+async fn reload_latch_holds_stale_position_updates_until_zone_in_ack() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, SeamlessBoundary, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const PLAYER_ID: u32 = 1;
+    const TOWN_NPC_ID: u32 = 0x4000_0031; // seeded in old zone 133
+    const CAMP_NPC_ID: u32 = 0x4000_0032; // seeded in new zone 128
+    const OLD_ZONE: u32 = 133; // sea0Town01
+    const NEW_ZONE: u32 = 128; // sea0Field01
+    const LIMSA_REGION: u16 = 101;
+    // Old-zone (town) coords the stale report carries; warped camp
+    // coords; a camp NPC two 50-unit grid cells out from the warp point
+    // (the stream scan is cell-based, ±1 cell) so only the post-ack
+    // walk to the adjacent cell streams it.
+    const TOWN_POS: (f32, f32, f32) = (0.0, 0.0, 0.0);
+    const CAMP_POS: (f32, f32, f32) = (500.0, 0.0, 500.0); // cell 10
+    const CAMP_NPC_POS: (f32, f32, f32) = (610.0, 0.0, 610.0); // cell 12
+    const POST_ACK_POS: (f32, f32, f32) = (555.0, 0.0, 555.0); // cell 11
+
+    fn position_report(x: f32, y: f32, z: f32) -> Vec<u8> {
+        // UpdatePlayerPositionPacket wire body: u64 timestamp +
+        // f32 x/y/z/rot + u16 move_state.
+        let mut v = Vec::with_capacity(26);
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&x.to_le_bytes());
+        v.extend_from_slice(&y.to_le_bytes());
+        v.extend_from_slice(&z.to_le_bytes());
+        v.extend_from_slice(&0f32.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v
+    }
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+
+    for (zone_id, name) in [(OLD_ZONE, "sea0Town01"), (NEW_ZONE, "sea0Field01")] {
+        let zone = Zone::new(
+            zone_id,
+            name.to_string(),
+            LIMSA_REGION,
+            String::new(),
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        world.register_zone(zone).await;
+    }
+    // 133/128 seam registered (makes the 133→128 warp classify as
+    // `merged_pair_public` → the immediate wipe+0x10 recipe). All three
+    // boxes sit far from every test position so no flip/merge fires.
+    world
+        .register_seamless_boundary(SeamlessBoundary {
+            id: 1,
+            region_id: LIMSA_REGION as u32,
+            zone_id_1: OLD_ZONE,
+            zone_id_2: NEW_ZONE,
+            zone1_x1: -1000.0,
+            zone1_y1: -1000.0,
+            zone1_x2: -900.0,
+            zone1_y2: -900.0,
+            zone2_x1: 900.0,
+            zone2_y1: 900.0,
+            zone2_x2: 1000.0,
+            zone2_y2: 1000.0,
+            merge_x1: -500.0,
+            merge_y1: -500.0,
+            merge_x2: -400.0,
+            merge_y2: -400.0,
+        })
+        .await;
+
+    // Player in town zone 133.
+    let mut player = Character::new(PLAYER_ID);
+    player.base.zone_id = OLD_ZONE;
+    registry
+        .insert(ActorHandle::new(
+            PLAYER_ID,
+            ActorKindTag::Player,
+            OLD_ZONE,
+            PLAYER_ID,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    world
+        .register_client(PLAYER_ID, ClientHandle::new(PLAYER_ID, tx))
+        .await;
+    let mut session = MapSession::new(PLAYER_ID);
+    session.current_zone_id = OLD_ZONE;
+    world.upsert_session(session).await;
+    {
+        let zone_arc = world.zone(OLD_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: PLAYER_ID,
+                kind: ActorKind::Player,
+                position: Vector3::new(TOWN_POS.0, TOWN_POS.1, TOWN_POS.2),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    // Town NPC in 133 near the OLD position — the phantom candidate the
+    // stale report would stream via the partner-zone scan.
+    let mut town_npc = Character::new(TOWN_NPC_ID);
+    town_npc.base.zone_id = OLD_ZONE;
+    town_npc.chara.actor_class_id = 1_000_057;
+    town_npc.base.actor_name = "tavern_populace".to_string();
+    registry
+        .insert(ActorHandle::new(
+            TOWN_NPC_ID,
+            ActorKindTag::Npc,
+            OLD_ZONE,
+            0,
+            town_npc,
+        ))
+        .await;
+    {
+        let zone_arc = world.zone(OLD_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: TOWN_NPC_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(3.0, 0.0, 3.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+    // Camp NPC in 128, outside the warp bundle's scan radius from the
+    // camp spawn — only the post-ack position report walks it into range.
+    let mut camp_npc = Character::new(CAMP_NPC_ID);
+    camp_npc.base.zone_id = NEW_ZONE;
+    camp_npc.chara.actor_class_id = 1_500_013;
+    camp_npc.base.actor_name = "battlewarden".to_string();
+    registry
+        .insert(ActorHandle::new(
+            CAMP_NPC_ID,
+            ActorKindTag::Npc,
+            NEW_ZONE,
+            0,
+            camp_npc,
+        ))
+        .await;
+    {
+        let zone_arc = world.zone(NEW_ZONE).await.unwrap();
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: CAMP_NPC_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(CAMP_NPC_POS.0, CAMP_NPC_POS.1, CAMP_NPC_POS.2),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+
+    // Wipe+0x10 warp 133→128 (seam pair, both public, same region →
+    // the resident-geometry recipe; latches `reload_in_flight`).
+    crate::runtime::quest_apply::apply_do_zone_change(
+        PLAYER_ID, NEW_ZONE, None, 0, 2, CAMP_POS.0, CAMP_POS.1, CAMP_POS.2, 0.0, &registry, &db,
+        &world, None,
+    )
+    .await;
+    assert!(
+        world.session(PLAYER_ID).await.unwrap().reload_in_flight,
+        "wipe+0x10 warp must latch reload_in_flight",
+    );
+    // Drain the warp bundle.
+    while rx.try_recv().is_ok() {}
+
+    // STALE 0x00CA — old-zone (town) coords arriving pre-Now-Loading.
+    processor
+        .handle_update_position(
+            PLAYER_ID,
+            &position_report(TOWN_POS.0, TOWN_POS.1, TOWN_POS.2),
+        )
+        .await
+        .unwrap();
+    let mut stale_streamed: Vec<u32> = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR {
+                stale_streamed.push(sub.header.source_id);
+            }
+        }
+    }
+    assert!(
+        stale_streamed.is_empty(),
+        "stale pre-ack 0x00CA must stream ZERO actors (got {stale_streamed:?})",
+    );
+    let pos = {
+        let handle = registry.get(PLAYER_ID).await.unwrap();
+        let c = handle.character.read().await;
+        c.base.position()
+    };
+    assert_eq!(
+        (pos.x, pos.y, pos.z),
+        CAMP_POS,
+        "stale pre-ack 0x00CA must not overwrite the warped position",
+    );
+
+    // RX 0x0007 zone-in-complete → latch clears, streaming resumes.
+    processor.handle_zone_in_complete(PLAYER_ID).await;
+    assert!(
+        !world.session(PLAYER_ID).await.unwrap().reload_in_flight,
+        "RX 0x0007 must clear reload_in_flight",
+    );
+    processor
+        .handle_update_position(
+            PLAYER_ID,
+            &position_report(POST_ACK_POS.0, POST_ACK_POS.1, POST_ACK_POS.2),
+        )
+        .await
+        .unwrap();
+    let mut post_ack_streamed: Vec<u32> = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.game_message.opcode == crate::packets::opcodes::OP_ADD_ACTOR {
+                post_ack_streamed.push(sub.header.source_id);
+            }
+        }
+    }
+    assert!(
+        post_ack_streamed.contains(&CAMP_NPC_ID),
+        "post-ack 0x00CA must resume streaming (camp NPC expected, got {post_ack_streamed:?})",
+    );
+    assert!(
+        !post_ack_streamed.contains(&TOWN_NPC_ID),
+        "the old zone's town NPC must never stream into the camp view",
     );
 }
 

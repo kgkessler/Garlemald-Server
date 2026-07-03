@@ -261,6 +261,19 @@ pub async fn apply_runtime_lua_command(
             apply_send_message(actor_id, message_type, &sender, &text, registry, world).await;
             true
         }
+        // `player:UnlockAetheryteNode(id)` — first-touch aetheryte
+        // attunement from AetheryteParent.lua / AetheryteChild.lua
+        // `onEventStarted` (Garlemald-Server #46, round 5). The
+        // aetheryte-touch event runs on this runtime drain, so this
+        // arm is the live path; the login applier carries a mirror
+        // arm for hook symmetry.
+        LC::UnlockAetheryte {
+            player_id,
+            aetheryte_id,
+        } => {
+            apply_unlock_aetheryte(player_id, aetheryte_id, registry, db, world).await;
+            true
+        }
         // `player:SendGameMessageLocalizedDisplayName(...)` — the NPC
         // linkshell narration line (0x0161 DispId-sender family).
         LC::SendGameMessageLocalizedDisplayName {
@@ -915,6 +928,55 @@ async fn apply_actor_engage(
             &zone_arc,
         )
         .await;
+        // Mirror the rest of the `BattleEvent::Engage` arm's hostile-mob
+        // packet pair (runtime/dispatcher.rs) — dispatching a real
+        // BattleEvent::Engage here instead would double-fire the State
+        // trio + hate seed above, so the two families are emitted inline:
+        //   * 0x0195 SetEnmityIndicator — locks the red hate gem onto the
+        //     engaged target (decoded from ffxiv_traces/combat_skills.pcapng;
+        //     pmeteor never emits this opcode).
+        //   * npcWork.hateType = 2 (HATE_TYPE_ENGAGED) — flips the nameplate
+        //     to the engaged ORANGE tint. NEVER 3: per the round-2 decomp of
+        //     `DepictionJudge:judgeNameplate()`, 3 renders RED only when the
+        //     mob's party is the player party's occupancy group (0x0187 Set
+        //     Occupancy Group claim wiring, which garlemald doesn't emit) —
+        //     without the claim the client falls through to the PURPLE
+        //     "claimed by another party" tint. 2 is party-independent (no
+        //     party deref in the judge's colour table). hateType drives
+        //     nameplate COLOR only — no value renders an overhead HP gauge
+        //     (`_setNameplateGauge` is a RET 0x8 stub in 1.23b); enemy HP
+        //     shows in the target parameter widget. See
+        //     `build_npc_hate_type_packet` for the full corrected table.
+        // Allies/players skip both, same gate as the dispatch arm —
+        // friendly nameplates stay passive. Without these the tutorial's
+        // script-engaged enemies fought with no hate gem / engaged tint.
+        if matches!(handle.kind, ActorKindTag::BattleNpc) {
+            let gem = crate::packets::send::actor_battle::build_set_enmity_indicator(
+                actor_id,
+                target_actor_id,
+                100,
+            );
+            crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                &zone_arc,
+                actor_id,
+                gem.to_bytes(),
+            )
+            .await;
+            let hate_type = crate::packets::send::actor::build_npc_hate_type_packet(
+                actor_id,
+                crate::npc::HATE_TYPE_ENGAGED,
+            );
+            crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                &zone_arc,
+                actor_id,
+                hate_type.to_bytes(),
+            )
+            .await;
+        }
     }
 }
 
@@ -1019,15 +1081,17 @@ async fn apply_director_add_member(
     );
 }
 
-/// `currentParty:AddMember(actor)` — appends `member_actor_id` to the
-/// leader's transient party roster (`session.transient_party_members`)
-/// and re-emits the GroupHeader / GroupMembersBegin / X08 / End trio to
-/// the leader's client so the in-game party panel shows the new member.
-/// Used by `SimpleContent30010.lua::onCreate` to add Yda + Papalymo
-/// (battle-NPC allies) to the player's party UI — without this they
-/// never appear in the party panel even though they spawn fine in the
-/// world.
-async fn apply_party_add_member(
+/// Roster half of `currentParty:AddMember(actor)` — appends
+/// `member_actor_id` to the leader's transient party roster
+/// (`session.transient_party_members`) and bumps the session's
+/// party-composition ordinal when the roster actually changed (the
+/// ordinal feeds `groups::party_group_index`'s fresh-per-composition
+/// group id — #46 round 5). No wire emission: callers pair this with
+/// [`emit_party_group_trio`], either immediately (single-command path)
+/// or once per drain batch (the retail shape — pmeteor/retail never
+/// ship the intermediate roster=2 trio when two allies join in one
+/// script pass).
+pub(crate) async fn apply_party_add_member_roster(
     leader_actor_id: u32,
     member_actor_id: u32,
     registry: &ActorRegistry,
@@ -1060,48 +1124,83 @@ async fn apply_party_add_member(
     };
     if !snap.transient_party_members.contains(&member_actor_id) {
         snap.transient_party_members.push(member_actor_id);
+        // Composition changed → the next trio must ship under a fresh
+        // group_index (the client ignores roster changes re-sent under
+        // an id it already registered — #46 round 5 wire finding).
+        snap.party_group_ordinal = snap.party_group_ordinal.wrapping_add(1);
     }
-    let roster_ids: Vec<u32> = snap.transient_party_members.clone();
     world.upsert_session(snap).await;
+}
+
+/// Emit the party GroupHeader / GroupMembersBegin / X08 / End trio for
+/// the leader's CURRENT transient roster to the leader's client — the
+/// wire half of `currentParty:AddMember`. Shared by the runtime drain
+/// (one emission per batch), the processor's content-area partition
+/// loop, and the single-command applier.
+pub(crate) async fn emit_party_group_trio(
+    leader_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(leader_handle) = registry.get(leader_actor_id).await else {
+        return;
+    };
+    let session_id = leader_handle.session_id;
+    let Some(snap) = world.session(session_id).await else {
+        return;
+    };
+    let roster_ids: Vec<u32> = snap.transient_party_members.clone();
+    let composition_ordinal = snap.party_group_ordinal;
 
     // Build the roster: leader first, then the transient members.
-    // Names come from each actor's `character.base.display_name()`.
+    // Encoding via `GroupMember::row_for_actor` — an NPC ally (empty
+    // display name) must carry its localized display-name id in
+    // `localized_name` or the client's PartyParameterWidget renders a
+    // blank row (Garlemald-Server #46, round 4; see the helper's doc).
+    // The leader is the recipient, so their row is the only `is_self`
+    // one (retail flags every non-self row — #46 round 5).
     let leader_name = {
         let c = leader_handle.character.read().await;
         c.base.display_name().to_string()
     };
     let mut members: Vec<crate::packets::send::groups::GroupMember> = Vec::new();
-    members.push(crate::packets::send::groups::GroupMember {
-        actor_id: leader_actor_id,
-        localized_name: -1,
-        unknown2: 0,
-        flag1: false,
-        is_online: true,
-        name: leader_name,
-    });
+    members.push(crate::packets::send::groups::GroupMember::row_for_actor(
+        leader_actor_id,
+        &leader_name,
+        0,
+        true,
+    ));
     for &mid in &roster_ids {
-        let name = if let Some(h) = registry.get(mid).await {
+        let member = if let Some(h) = registry.get(mid).await {
             let c = h.character.read().await;
-            c.base.display_name().to_string()
+            crate::packets::send::groups::GroupMember::row_for_actor(
+                mid,
+                c.base.display_name(),
+                c.base.display_name_id,
+                false,
+            )
         } else {
-            format!("bnpc_{mid:08X}")
+            crate::packets::send::groups::GroupMember::row_for_actor(
+                mid,
+                &format!("bnpc_{mid:08X}"),
+                0,
+                false,
+            )
         };
-        members.push(crate::packets::send::groups::GroupMember {
-            actor_id: mid,
-            localized_name: -1,
-            unknown2: 0,
-            flag1: false,
-            is_online: true,
-            name,
-        });
+        members.push(member);
     }
 
-    // Emit the trio. Mirrors the solo-party block in
-    // `world_manager.rs::send_zone_in_bundle` (lines ~1885-1942):
-    // group_index = SOLO_FLAG | leader_actor_id, GROUP_TYPE_PARTY=0x2711.
-    const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
-    const GROUP_TYPE_PARTY: u32 = 0x2711;
-    let group_index: u64 = PARTY_SOLO_SELF_FLAG | (leader_actor_id as u64);
+    // Emit the trio. Mirrors the party block in
+    // `world_manager.rs::send_zone_in_bundle`: group_index from the
+    // shared fresh-per-composition scheme (solo keeps the immutable
+    // login id; multi-member compositions get a NEW id keyed by the
+    // session ordinal — see `party_group_index`'s doc for the retail
+    // evidence).
+    let group_index = crate::packets::send::groups::party_group_index(
+        leader_actor_id,
+        members.len(),
+        composition_ordinal,
+    );
     let location_code = leader_handle.zone_id as u64;
     let sequence_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1115,7 +1214,7 @@ async fn apply_party_add_member(
             location_code,
             sequence_id,
             group_index,
-            GROUP_TYPE_PARTY,
+            crate::packets::send::groups::GROUP_TYPE_PLAYER_PARTY,
             -1,
             "",
             members.len() as u32,
@@ -1156,10 +1255,27 @@ async fn apply_party_add_member(
 
     tracing::debug!(
         leader = format!("0x{leader_actor_id:08X}"),
-        member = format!("0x{member_actor_id:08X}"),
         roster_size = members.len(),
-        "PartyAddMember applied (transient roster updated + party trio re-emitted)",
+        group_index = format!("0x{group_index:016X}"),
+        "party group trio emitted for current roster",
     );
+}
+
+/// `currentParty:AddMember(actor)` — single-command path: roster update
+/// then an immediate trio emission. Batched callers
+/// (`apply_runtime_lua_commands`, the processor's content-area
+/// partition loop) call the two halves directly so a multi-AddMember
+/// batch ships ONE trio for the final composition instead of one per
+/// call — the intermediate-roster trios have no retail analogue and
+/// each one churned the client's group registration (#46 round 5).
+async fn apply_party_add_member(
+    leader_actor_id: u32,
+    member_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    apply_party_add_member_roster(leader_actor_id, member_actor_id, registry, world).await;
+    emit_party_group_trio(leader_actor_id, registry, world).await;
 }
 
 /// `actor:PlayAnimation(animation_id)` — port of C#
@@ -1757,7 +1873,13 @@ pub(crate) async fn apply_content_finished(
     //    either — `RemoveDirector` drops it from `ownedDirectors`
     //    before any `SendZoneInPackets` runs.
     snap.transient_director_members.remove(&director_id);
-    snap.transient_party_members.clear();
+    if !snap.transient_party_members.is_empty() {
+        snap.transient_party_members.clear();
+        // Composition changed (back to solo) — keep the party-group
+        // ordinal in step so the NEXT multi-member composition ships
+        // under a fresh group_index (see `groups::party_group_index`).
+        snap.party_group_ordinal = snap.party_group_ordinal.wrapping_add(1);
+    }
     snap.active_content_script = None;
     if snap
         .login_director
@@ -1986,12 +2108,52 @@ pub(crate) async fn apply_do_zone_change(
         return;
     }
 
-    // Pre-move zone — feeds the same-region detection in step 5.
-    let old_zone_id = world
+    // LOGIN-WINDOW deferral — a warp drained while the client is still
+    // loading zone-in bundle #1 must NOT fire a second world-load. The
+    // login arm re-runs quest `onStateChange` AFTER dispatching the
+    // login bundle (processor.rs `handle_language_code`), and a rescue
+    // warp drained there (man0l1's PrivateAreaMasterPast/3 relog arm's
+    // `WarpToPublicArea`) used to apply immediately: wipe pair + bundle
+    // #2 + kick landed 6-15 ms behind bundle #1 and the client's
+    // UI/event layer never finished initializing — dead menus/talks for
+    // the whole session (wire 00:09:23.876-.891). Park the WHOLE warp
+    // (no session/character/DB mutation yet — the replay performs all
+    // of it) and let the `RX 0x0007` arm apply it against a
+    // fully-loaded client. Last writer wins if several warps drain in
+    // the window. (Garlemald-Server #46, round 4.)
+    if let Some(mut snap) = world.session(session_id).await
+        && snap.defer_warps_until_zone_in_ack
+    {
+        snap.deferred_login_warp = Some(crate::data::DeferredWarp {
+            player_id,
+            zone_id,
+            private_area: private_area.clone(),
+            private_area_type,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+        });
+        world.upsert_session(snap).await;
+        tracing::info!(
+            player = player_id,
+            zone = zone_id,
+            ?private_area,
+            "DoZoneChange parked until login zone-in ack (login-window warp deferral)",
+        );
+        return;
+    }
+
+    // Pre-move zone + private-area routing — feeds the transition
+    // classification in step 4 (same-seamless-family detection needs to
+    // know the ORIGIN was public; `do_zone_change_with_private_area`
+    // overwrites both fields, so snapshot before the migration).
+    let (old_zone_id, old_private_area_name) = world
         .session(session_id)
         .await
-        .map(|s| s.current_zone_id)
-        .unwrap_or(0);
+        .map(|s| (s.current_zone_id, s.current_private_area_name.clone()))
+        .unwrap_or((0, None));
 
     // 1. Migrate the actor between zones (no-op if zone_id is the
     //    same as the current zone). `do_zone_change_with_private_area`
@@ -2087,19 +2249,136 @@ pub(crate) async fn apply_do_zone_change(
         }
     }
 
-    // 3. Carry the requested spawn_type through to the zone-in
-    //    bundle so the client plays the right "you arrived" anim.
+    // 3. Classify the transition BEFORE emitting a single packet.
+    //
+    // Round-3 archaeology (2026-07-02, full packet-log sweep of every
+    // captured session): the 0x00E2(0x02) reload recipe is
+    // STATE-dependent. It completes whenever the destination forces a
+    // genuine map-resource load (cross-region 193→230; same-region
+    // different layout 230→133, 128→230 — all capture-proven), but a
+    // warp whose destination geometry is ALREADY resident — the same
+    // zone (public⇄private flips included: sea0Town01a on both sides),
+    // or the seamless partner the client has merged in (133⇄230 town
+    // pair) — schedules a reload the level streamer can never finish:
+    // no RX 0x0007, "Now Loading" forever. The round-2 spawnType-0x16
+    // "instant bypass" branch that used to live here never produced a
+    // single captured completion (its escort precedent bcfc0aa was
+    // itself abandoned for the cross-map 0x10 path in ebe7ecf).
+    //
+    // The capture-proven recipe for the resident-geometry family is
+    // the CONTENT-warp shape (processor.rs
+    // apply_do_zone_change_content — the man0l0/man0g0 tutorial
+    // reload): targeted DeleteAllActors wipe + 0x00E2 subcode 0x10
+    // (the in-place/content reload latch) + an IMMEDIATE full zone-in
+    // bundle with commit_keep_list = false. That shape completes a
+    // same-zone reload even with a cutscene's
+    // startFadeInCutSceneAfterWarp veil armed — RX 0x0007 in ≤3 s on
+    // four separate captured runs, including 2026-07-02T07:17:15 on
+    // this exact build: the forced teardown/re-commit fires a real
+    // warp-END that clears both the order machine and the veil.
+    //
+    // Scope: same zone (any private-area combination — the man0l1
+    // musketeer WarpToPrivateArea/WarpToPublicArea flips need this) or
+    // a directly-paired seamless partner with both endpoints public
+    // (the 133→230 aetheryte teleport). Cross-zone private flips like
+    // 230→133/PrivateAreaMasterPast keep the 0x02 reload recipe —
+    // capture-proven working there. (Garlemald-Server #46, round 3.)
+    let (old_region, new_region) = {
+        let old_region = match world.zone(old_zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => 0,
+        };
+        let new_region = match world.zone(zone_id).await {
+            Some(z) => z.read().await.core.region_id,
+            None => u16::MAX,
+        };
+        (old_region, new_region)
+    };
+    let same_region = old_region == new_region;
+    let same_zone = old_zone_id == zone_id;
+    let merged_pair_public = same_region
+        && !same_zone
+        && old_private_area_name.is_none()
+        && private_area.is_none()
+        && world
+            .seamless_partner_zones(new_region as u32, old_zone_id)
+            .await
+            .contains(&zone_id);
+    let use_wipe_reload_recipe = same_zone || merged_pair_public;
+
     if let Some(mut snap) = world.session(session_id).await {
         snap.destination_spawn_type = spawn_type;
+        // The immediate wipe+0x10 recipe never parks a `pending_zone_in`,
+        // so `handle_update_position`'s stale-report guard didn't cover
+        // it: a 0x00CA sent pre-Now-Loading (old-zone coords) landed
+        // AFTER the warp applied, overwrote the warped position, and
+        // pointed the partner-zone scan at the origin (34 phantom
+        // Drowning Wench NPCs streamed into the camp view 8 ms after
+        // the 23:44:06 133→128 bundle). Latch until the client's
+        // RX 0x0007 zone-in-complete. (Garlemald-Server #46, round 4.)
+        if use_wipe_reload_recipe {
+            snap.reload_in_flight = true;
+        }
         world.upsert_session(snap).await;
     }
 
-    // 4. Emit the zone-change packet trio — same order as
-    //    `apply_do_zone_change_content`.
+    // 4. Emit the zone-change packets.
     let Some(client) = world.client(session_id).await else {
         tracing::warn!(player = player_id, "DoZoneChange: no client");
         return;
     };
+    if use_wipe_reload_recipe {
+        // Resident-geometry warp — the content-reload shape (see the
+        // classification note above; mirrors processor.rs
+        // apply_do_zone_change_content, the capture-proven emitter).
+        // Both subpackets MUST be target_id-tagged or the world-server
+        // proxy drops them.
+        {
+            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            wipe.set_target_id(session_id);
+            client.send_bytes(wipe.to_bytes()).await;
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+            e2.set_target_id(session_id);
+            client.send_bytes(e2.to_bytes()).await;
+        }
+        // Immediate bundle, commit_keep_list = false: the bare wipe
+        // above is load-bearing for the in-place transition, so no
+        // trailing keep-list commit is added on top (the shape the
+        // tutorial content warp ships).
+        world
+            .send_zone_in_bundle(
+                registry,
+                db,
+                lua,
+                session_id,
+                spawn_type as u16,
+                /* commit_keep_list */ false,
+            )
+            .await;
+        if private_area.is_some() {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
+        tracing::info!(
+            player = player_id,
+            zone = zone_id,
+            old_zone = old_zone_id,
+            ?private_area,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+            "DoZoneChange applied (resident-geometry wipe+0x10 reload recipe)",
+        );
+        return;
+    }
     // Force-reload latch only. Retail warps NEVER wipe the old zone's
     // actors up front (`return_to_inn` / `teleport_to_gridania` /
     // `move_out_of_room` pcaps): the old-actor cleanup is the Mass
@@ -2141,28 +2420,20 @@ pub(crate) async fn apply_do_zone_change(
     //    34108 PrivateArea notice travels with whichever path
     //    dispatches the bundle (pmeteor: after it, WorldManager.cs:
     //    887-888).
-    let same_region = {
-        let old_region = match world.zone(old_zone_id).await {
-            Some(z) => z.read().await.core.region_id,
-            None => 0,
-        };
-        let new_region = match world.zone(zone_id).await {
-            Some(z) => z.read().await.core.region_id,
-            None => u16::MAX,
-        };
-        old_region == new_region
-    };
+    //
     // Defer ONLY for a genuine cross-zone change within the same region (the
-    // 230 → 133 Drowning Wench case the pacing was added for). A SAME-zone warp
-    // — entering/leaving a private-area instance (WarpToPrivate/PublicArea, both
-    // 230 → 230) or an in-zone reposition (the MSK "go downstairs") — must flush
-    // immediately, exactly like a cold login does. The 6 s deferral on a
-    // same-zone warp leaves the client interactive in a half-transitioned state
-    // for 6 s; any input during that window (man0l1 SEQ_040: the player talks to
-    // Sisipu again after the hand-signal cutscene) corrupts the instance-exit and
-    // the client hangs on "Now Loading" — it never sends the 0x0007 zone-in-
-    // complete. pmeteor never defers; the deferral is "retail parity, not a
-    // proven client requirement". (Garlemald-Server #46.)
+    // 230 → 133 Drowning Wench case the pacing was added for — note that
+    // seamless-family pairs like 230 → 133 now take the instant recipe above
+    // and never reach this arm). A SAME-zone warp — entering/leaving a
+    // private-area instance (WarpToPrivate/PublicArea, both 230 → 230) —
+    // must flush immediately, exactly like a cold login does. The 6 s
+    // deferral on a same-zone warp leaves the client interactive in a
+    // half-transitioned state for 6 s; any input during that window (man0l1
+    // SEQ_040: the player talks to Sisipu again after the hand-signal
+    // cutscene) corrupts the instance-exit and the client hangs on "Now
+    // Loading" — it never sends the 0x0007 zone-in-complete. pmeteor never
+    // defers; the deferral is "retail parity, not a proven client
+    // requirement". (Garlemald-Server #46.)
     let defer_same_region = same_region && old_zone_id != zone_id;
     if defer_same_region {
         const RETAIL_ZONE_CHANGE_GAP_MS: u64 = 6_000;
@@ -2234,6 +2505,91 @@ pub(crate) async fn apply_do_zone_change(
 /// parked on `waitForSignal(name)` (e.g. the combat tutorial director on
 /// "playerActive") and applies THEIR commands, recursively.
 /// (Garlemald-Server #28.)
+/// Player id of a warp-family command — one whose applier funnels into
+/// `apply_do_zone_change` / the content-warp machinery and therefore puts
+/// the `0x00E2` reload latch on the wire. `WarpToPosition` is deliberately
+/// absent (same-zone `SetActorPosition` snap, no reload latch), as is the
+/// consumer-less `LuaCommand::Warp` (no applier arm anywhere — it can't
+/// emit anything today).
+fn warp_family_player(cmd: &crate::lua::command::LuaCommand) -> Option<u32> {
+    use crate::lua::command::LuaCommand;
+    match cmd {
+        LuaCommand::DoZoneChange { player_id, .. }
+        | LuaCommand::DoZoneChangeContent { player_id, .. }
+        | LuaCommand::WarpToPublicArea { player_id, .. }
+        | LuaCommand::WarpToPrivateArea { player_id, .. } => Some(*player_id),
+        _ => None,
+    }
+}
+
+/// Stable-reorder a drained script batch so a player's `EndEvent` reaches
+/// the wire BEFORE that player's first warp-family command.
+///
+/// 0x0131 EndEvent ahead of the 0x00E2 reload latch is retail's invariant
+/// ordering on every captured transition (see the Hob → Musketeers'
+/// hand-off rationale in `scripts/lua/quests/man/man0l1.lua:149-153`) —
+/// with the event still open inside the Now-Loading window the client
+/// never completes zone-in. Scripts that order the two correctly are left
+/// byte-identical; only an `EndEvent` that appears AFTER the same player's
+/// first warp command is hoisted to just ahead of it (e.g.
+/// `TeleportCommand.lua`'s `DoZoneChange` → `player:EndEvent()` tail).
+/// Everything else keeps its relative order — per-command interleave is
+/// load-bearing on the wire (see `apply_event_script_commands`).
+pub(crate) fn hoist_end_events_before_warps(
+    batch: Vec<crate::lua::command::LuaCommand>,
+) -> Vec<crate::lua::command::LuaCommand> {
+    use std::collections::HashMap;
+
+    use crate::lua::command::LuaCommand;
+
+    // Index of each player's FIRST warp-family command.
+    let mut first_warp_idx: HashMap<u32, usize> = HashMap::new();
+    for (i, cmd) in batch.iter().enumerate() {
+        if let Some(player_id) = warp_family_player(cmd) {
+            first_warp_idx.entry(player_id).or_insert(i);
+        }
+    }
+    if first_warp_idx.is_empty() {
+        return batch;
+    }
+    // Misordered EndEvents: those that appear AFTER the same player's
+    // first warp. Keyed by the warp index they must be hoisted ahead of,
+    // in original relative order.
+    let mut hoisted_before: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut any_misordered = false;
+    for (i, cmd) in batch.iter().enumerate() {
+        if let LuaCommand::EndEvent { player_id, .. } = cmd
+            && let Some(&warp_idx) = first_warp_idx.get(player_id)
+            && i > warp_idx
+        {
+            hoisted_before.entry(warp_idx).or_default().push(i);
+            any_misordered = true;
+        }
+    }
+    if !any_misordered {
+        // Already ordered — return the batch untouched so correct scripts
+        // stay byte-identical on the wire.
+        return batch;
+    }
+    let mut slots: Vec<Option<LuaCommand>> = batch.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len());
+    for i in 0..slots.len() {
+        if let Some(end_event_idxs) = hoisted_before.get(&i) {
+            for &j in end_event_idxs {
+                // `j > i` always holds, so the hoisted EndEvent is still
+                // in its slot; the later pass over `j` then no-ops.
+                if let Some(end_event) = slots[j].take() {
+                    out.push(end_event);
+                }
+            }
+        }
+        if let Some(cmd) = slots[i].take() {
+            out.push(cmd);
+        }
+    }
+    out
+}
+
 pub(crate) async fn apply_event_script_commands(
     handle: &ActorHandle,
     commands: Vec<crate::lua::command::LuaCommand>,
@@ -2256,6 +2612,11 @@ pub(crate) async fn apply_event_script_commands(
             other => rest.push(other),
         }
     }
+    // Enforce the EndEvent-before-warp wire invariant across the whole
+    // drained batch — scripts that warp first and close the event after
+    // (TeleportCommand.lua) would otherwise ship 0x00E2 → 0x0131 and
+    // softlock the client at Now Loading.
+    let rest = hoist_end_events_before_warps(rest);
     if !rest.is_empty() {
         let event_session_snapshot = {
             let c = handle.character.read().await;
@@ -2324,7 +2685,27 @@ pub async fn apply_runtime_lua_commands(
     world: &WorldManager,
     lua: Option<&Arc<LuaEngine>>,
 ) {
+    // Party-trio coalescing (#46 round 5): a script pass that
+    // `currentParty:AddMember`s several allies used to emit one full
+    // GroupHeader/Begin/X08/End trio PER member — the intermediate
+    // roster trios have no retail analogue (retail ships exactly one
+    // trio per composition, under a fresh group id), and each header
+    // churned the client's group registration. Roster updates apply
+    // per-command below; the single trio per affected leader is
+    // emitted after the batch.
+    let mut party_trio_leaders: Vec<u32> = Vec::new();
     for cmd in cmds {
+        if let LuaCommandKind::PartyAddMember {
+            leader_actor_id,
+            member_actor_id,
+        } = cmd
+        {
+            apply_party_add_member_roster(leader_actor_id, member_actor_id, registry, world).await;
+            if !party_trio_leaders.contains(&leader_actor_id) {
+                party_trio_leaders.push(leader_actor_id);
+            }
+            continue;
+        }
         // Keep a copy for diagnostics only when DEBUG is enabled for this
         // target, so non-debug filters pay nothing. The drain is low-frequency
         // (quest-hook command batches), so the clone cost is negligible. We log
@@ -2341,6 +2722,11 @@ pub async fn apply_runtime_lua_commands(
                 "runtime lua command unhandled (login-scoped or unrecognised)",
             );
         }
+    }
+    // One trio per leader for the batch's final composition (see the
+    // coalescing note above the loop).
+    for leader_actor_id in party_trio_leaders {
+        emit_party_group_trio(leader_actor_id, registry, world).await;
     }
 }
 
@@ -2812,7 +3198,15 @@ pub async fn apply_add_exp(
     // Read-modify-write inside the write lock so a concurrent AddExp
     // doesn't lose a level-up crossing to a race. `new_exp` and
     // `new_level` are the post-rollover values.
-    let Some((effective_gain, new_exp, new_level, levels_gained, rested_before, rested_after)) = ({
+    let Some((
+        effective_gain,
+        new_exp,
+        new_level,
+        levels_gained,
+        rested_before,
+        rested_after,
+        is_active_class,
+    )) = ({
         let mut c = handle.character.write().await;
         if class_slot >= c.battle_save.skill_point.len() {
             tracing::warn!(class = class_id, "AddExp: class_id out of range");
@@ -2833,6 +3227,7 @@ pub async fn apply_add_exp(
             let (lvl, sp, gained) =
                 crate::battle::save::level_up_if_threshold_crossed(prior_level, combined);
             c.battle_save.skill_point[class_slot] = sp;
+            let is_active_class = c.chara.class as i32 == class_id as i32;
             if gained > 0 {
                 if let Some(slot) = c.battle_save.skill_level.get_mut(class_slot) {
                     *slot = lvl;
@@ -2841,13 +3236,22 @@ pub async fn apply_add_exp(
                 // top-level `chara.level` the stat pipeline reads. No
                 // other class gets reflected into `chara.level` — the
                 // player has one active class at a time.
-                if c.chara.class as i32 == class_id as i32 {
+                if is_active_class {
                     c.chara.level = lvl;
                 }
             }
-            Some((effective_gain, sp, lvl, gained, rested_before, rested_after))
+            Some((
+                effective_gain,
+                sp,
+                lvl,
+                gained,
+                rested_before,
+                rested_after,
+                is_active_class,
+            ))
         }
-    }) else {
+    })
+    else {
         return;
     };
 
@@ -2868,6 +3272,27 @@ pub async fn apply_add_exp(
                 "AddExp: set_level DB persist failed",
             );
         }
+        // pmeteor Player.cs:2965 parity — the level-up branch persists BOTH
+        // characters_class_levels (Database.SetLevel) and the char-select
+        // surface characters_parametersave.mainSkill/mainSkillLevel
+        // (Database.SavePlayerCurrentClass, Map Server/Database.cs:374). The
+        // lobby reads mainSkillLevel for the char-select level, so skipping
+        // this write froze every character at its creation-time level there.
+        // Active class only: garlemald's port takes an explicit (class,
+        // level) instead of reading the player's current class the way C#
+        // does, so a gain on a parked class must not clobber mainSkill.
+        if is_active_class
+            && let Err(e) = db
+                .save_player_current_class(actor_id, class_id, new_level)
+                .await
+        {
+            tracing::warn!(
+                actor = actor_id,
+                class = class_id,
+                err = %e,
+                "AddExp: save_player_current_class DB persist failed",
+            );
+        }
         tracing::info!(
             actor = actor_id,
             class = class_id,
@@ -2875,6 +3300,19 @@ pub async fn apply_add_exp(
             levels_gained,
             "AddExp: level up",
         );
+        // pmeteor `Player.LevelUp` tail (Player.cs:3013) — every crossed
+        // level auto-equips the commands it unlocks (class bar + job
+        // mirror + live hotbar push) so new skills are usable without a
+        // manual /eaction. Once per crossed level, oldest first — the
+        // same order the 33909 rows take in `emit_exp_property_updates`,
+        // which keeps ownership of the 33926 "You learn" text line;
+        // this arm owns only the DB / mirror / wire equip.
+        if let Some(lua) = lua {
+            for at_level in (new_level - levels_gained + 1)..=new_level {
+                equip_abilities_at_level(actor_id, class_id, at_level, registry, db, world, lua)
+                    .await;
+            }
+        }
     }
     if rested_after != rested_before
         && let Err(e) = db.set_rest_bonus_exp_rate(actor_id, rested_after).await
@@ -3199,6 +3637,253 @@ async fn emit_exp_property_updates(
                 bytes,
             )
             .await;
+        }
+    }
+}
+
+/// The 1.x action bar holds 30 command slots (0-based; wire slot =
+/// `charaWork.commandBorder` (32) + slot0). Shared by the slot-search
+/// helpers here and the processor's full-bar refresh loop.
+pub const HOTBAR_SLOTS: u16 = 30;
+
+/// First open 0-based slot on the 30-slot in-memory hotbar mirror —
+/// pmeteor `Player.FindFirstCommandSlotById(0)` scanning
+/// `charaWork.command` (Player.cs, used by `EquipAbilityInFirstOpenSlot`
+/// for the ACTIVE class). A slot is free when no mirror entry carries a
+/// real command there — an entry whose low word is 0 counts as free,
+/// matching the C# `charaWork.command[i] == 0` test. Returns
+/// `HOTBAR_SLOTS` when the bar is full (same "one past the end"
+/// convention as `db.find_first_command_slot`).
+fn first_free_hotbar_slot(hotbar: &[crate::gamedata::HotbarEntry]) -> u16 {
+    (0..HOTBAR_SLOTS)
+        .find(|s| {
+            !hotbar
+                .iter()
+                .any(|e| e.hotbar_slot == *s && e.command_id & 0xFFFF != 0)
+        })
+        .unwrap_or(HOTBAR_SLOTS)
+}
+
+/// Per-slot live hotbar push — pmeteor `Player.UpdateHotbar(slots)`
+/// (`UpdateHotbarCommands` + `UpdateRecastTimers`, Player.cs:2502-2543).
+/// Free-function twin shared by the processor's Equip/Unequip/Swap
+/// appliers (`processor.rs::send_hotbar_slot_update` delegates here)
+/// and the level-up auto-equip below. Reads the post-mutation
+/// `chara.hotbar` mirror; an absent entry emits the disable shape
+/// (command 0, category / compatibility 0). Self-only, every subpacket
+/// target-stamped (proxy rule — the fan-out drops `target_id == 0`
+/// frames). (#28 S3.1, hoisted for #46 round 2.)
+pub async fn send_hotbar_slot_update(
+    player_id: u32,
+    slot0: u16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let Some(client) = world.client(handle.session_id).await else {
+        return;
+    };
+    let (command_masked, recast_end) = {
+        let c = handle.character.read().await;
+        c.chara
+            .hotbar
+            .iter()
+            .find(|e| e.hotbar_slot == slot0)
+            .map(|e| (e.command_id | 0xA0F0_0000, e.recast_time))
+            .unwrap_or((0, 0))
+    };
+    let max_recast_s = lua
+        .and_then(|l| l.catalogs().battle_commands.read().ok())
+        .and_then(|m| {
+            m.get(&((command_masked & 0xFFFF) as u16))
+                .map(|c| c.max_recast_time_seconds as u16)
+        })
+        .unwrap_or(0);
+    for mut sub in crate::packets::send::actor::build_hotbar_slot_update(
+        player_id,
+        slot0,
+        command_masked,
+        max_recast_s,
+        recast_end,
+    ) {
+        sub.set_target_id(handle.session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+}
+
+/// pmeteor `Player.EquipAbilitiesAtLevel` (Map Server/Actors/Chara/
+/// Player/Player.cs:2980-2998; EchoGate identical) — auto-equip every
+/// battle command `class_id` unlocks at exactly `at_level`:
+///
+///   * class bar: first open slot 0..30 — the ACTIVE class scans the
+///     live in-memory `chara.hotbar` mirror (pmeteor
+///     `FindFirstCommandSlotById(0)` on `charaWork.command`); a parked
+///     class asks the DB (`db.find_first_command_slot`, pmeteor
+///     `Database.FindFirstCommandSlot`).
+///   * job mirror: `convert_class_id_to_job_id` — when the job id
+///     differs, the same command also lands in the JOB's first open DB
+///     slot, DB-only (Player.cs:2987-2989; the job bar isn't the live
+///     one here, so no mirror / wire writes).
+///   * new skills start ON COOLDOWN: `recast_end = now + maxRecastTime`
+///     (pmeteor `EquipAbility`, Player.cs:2568 — `recastEnd =
+///     UnixTimeStampUTC() + maxRecastTime`, 5 s fallback when the
+///     catalog misses the id).
+///   * a full bar warn-logs and SKIPS the equip — the 33926 "You
+///     learn" line (owned by `emit_exp_property_updates`) still fires;
+///     the player slots the command by hand.
+///   * active class only: the in-memory `chara.hotbar` mirror is
+///     updated (same shape as `processor.rs::apply_equip_ability`) and
+///     the slot's `charaWork/command` + `commandDetailForSelf` pair
+///     goes out self-only via `send_hotbar_slot_update` when a
+///     WorldManager is wired (`None` in DB-only tests).
+///
+/// Quiet no-op when nothing unlocks at this level (most levels).
+/// No 30603 "equipped" toast — pmeteor passes `printMessage = false`
+/// from this path (Player.cs:2986).
+pub async fn equip_abilities_at_level(
+    actor_id: u32,
+    class_id: u8,
+    at_level: i16,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: Option<&WorldManager>,
+    lua: &Arc<LuaEngine>,
+) {
+    let unlocked = lua.catalogs().commands_unlocked_at(class_id, at_level);
+    if unlocked.is_empty() {
+        return;
+    }
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let is_active_class = {
+        let c = handle.character.read().await;
+        c.chara.class as i32 == class_id as i32
+    };
+    let now_unix = common::utils::unix_timestamp();
+    let job_id = crate::actor::Player::convert_class_id_to_job_id(class_id);
+    for command_id in unlocked {
+        // pmeteor `EquipAbility`: `maxRecastTime = ability != null ?
+        // ability.maxRecastTimeSeconds : 5` — the fresh skill starts
+        // its recast the moment it's learned.
+        let max_recast_s: u32 = lua
+            .catalogs()
+            .battle_commands
+            .read()
+            .ok()
+            .and_then(|m| m.get(&command_id).map(|c| c.max_recast_time_seconds))
+            .unwrap_or(5);
+        let recast_end = now_unix.saturating_add(max_recast_s);
+
+        // --- class bar -------------------------------------------------
+        let slot = if is_active_class {
+            let c = handle.character.read().await;
+            first_free_hotbar_slot(&c.chara.hotbar)
+        } else {
+            match db.find_first_command_slot(actor_id, class_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        actor = actor_id, class = class_id, command_id,
+                        err = %e,
+                        "EquipAbilitiesAtLevel: find_first_command_slot failed",
+                    );
+                    continue;
+                }
+            }
+        };
+        if slot >= HOTBAR_SLOTS {
+            // Keep the learn message (emit_exp_property_updates owns it) —
+            // only the auto-equip is skipped.
+            tracing::warn!(
+                actor = actor_id,
+                class = class_id,
+                command_id,
+                "EquipAbilitiesAtLevel: hotbar full — learn message only, no auto-equip",
+            );
+        } else if let Err(e) = db
+            .equip_ability(actor_id, class_id, slot, u32::from(command_id), recast_end)
+            .await
+        {
+            tracing::warn!(
+                actor = actor_id, class = class_id, command_id, slot,
+                err = %e,
+                "EquipAbilitiesAtLevel: DB persist failed",
+            );
+        } else {
+            if is_active_class {
+                // Mirror the in-memory CharaState hotbar (same shape as
+                // `apply_equip_ability`) so PlayerSnapshot builds and
+                // subsequent slot searches see the equip immediately.
+                // C# wire mask: `0xA0F00000 | command_id`.
+                {
+                    let mut c = handle.character.write().await;
+                    let masked = u32::from(command_id) | 0xA0F0_0000;
+                    if let Some(entry) = c.chara.hotbar.iter_mut().find(|e| e.hotbar_slot == slot) {
+                        entry.command_id = masked;
+                        entry.recast_time = recast_end;
+                    } else {
+                        c.chara.hotbar.push(crate::gamedata::HotbarEntry {
+                            hotbar_slot: slot,
+                            command_id: masked,
+                            recast_time: recast_end,
+                        });
+                    }
+                }
+                if let Some(world) = world {
+                    send_hotbar_slot_update(actor_id, slot, registry, world, Some(lua)).await;
+                }
+            }
+            tracing::info!(
+                actor = actor_id,
+                class = class_id,
+                level = at_level,
+                command_id,
+                slot,
+                "EquipAbilitiesAtLevel: auto-equipped",
+            );
+        }
+
+        // --- job-bar mirror (DB-only) -----------------------------------
+        if job_id != class_id {
+            match db.find_first_command_slot(actor_id, job_id).await {
+                Ok(job_slot) if job_slot < HOTBAR_SLOTS => {
+                    if let Err(e) = db
+                        .equip_ability(
+                            actor_id,
+                            job_id,
+                            job_slot,
+                            u32::from(command_id),
+                            recast_end,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            actor = actor_id, job = job_id, command_id, slot = job_slot,
+                            err = %e,
+                            "EquipAbilitiesAtLevel: job-mirror DB persist failed",
+                        );
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        actor = actor_id,
+                        job = job_id,
+                        command_id,
+                        "EquipAbilitiesAtLevel: job hotbar full — mirror skipped",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        actor = actor_id, job = job_id, command_id,
+                        err = %e,
+                        "EquipAbilitiesAtLevel: job-mirror find_first_command_slot failed",
+                    );
+                }
+            }
         }
     }
 }
@@ -4865,6 +5550,68 @@ pub(crate) async fn apply_send_message(
         %sender,
         %text,
         "SendMessage emitted",
+    );
+}
+
+/// `player:UnlockAetheryteNode(id)` — first-touch aetheryte attunement
+/// (Garlemald-Server #46, round 5). Inserts into the registry-reachable
+/// `CharaState::unlocked_aetherytes` set (skips everything if already
+/// present — re-touching an attuned aetheryte is a no-op), persists via
+/// `characters_aetherytes` (migration 068, INSERT OR IGNORE), and toasts
+/// the attunement confirmation into the player's system log.
+///
+/// The toast is a literal-text `SendMessagePacket` (the same path
+/// `TeleportCommand.lua`'s "not attuned" denial uses) rather than a
+/// text-sheet id: pmeteor never implemented an attunement toast (its
+/// only "attune" hit is a GM-command comment) and the round-5
+/// investigation didn't surface the retail 1.x sheet id.
+/// TODO(#46 round 5): swap for the retail text-sheet emission
+/// (`build_text_sheet_no_source_auto`, 25xxx/33xxx system family —
+/// cf. the 25118 "linkpearl obtained" toast in
+/// [`apply_player_set_npc_ls`]) once the attunement text id is mapped.
+pub(crate) async fn apply_unlock_aetheryte(
+    player_id: u32,
+    aetheryte_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let newly_unlocked = {
+        let mut c = handle.character.write().await;
+        c.chara.unlocked_aetherytes.insert(aetheryte_id)
+    };
+    if !newly_unlocked {
+        tracing::debug!(
+            player = player_id,
+            aetheryte = aetheryte_id,
+            "UnlockAetheryte: already attuned, no-op",
+        );
+        return;
+    }
+    if let Err(e) = db.insert_character_aetheryte(player_id, aetheryte_id).await {
+        tracing::warn!(
+            player = player_id,
+            aetheryte = aetheryte_id,
+            err = %e,
+            "UnlockAetheryte: DB persist failed",
+        );
+    }
+    apply_send_message(
+        player_id,
+        crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+        "",
+        "You are now attuned to the aetheryte.",
+        registry,
+        world,
+    )
+    .await;
+    tracing::info!(
+        player = player_id,
+        aetheryte = aetheryte_id,
+        "UnlockAetheryte applied",
     );
 }
 
@@ -7242,5 +7989,137 @@ mod move_actor_grid_sync_tests {
             (500.0, 500.0),
             "authoritative position must match the grid",
         );
+    }
+}
+
+#[cfg(test)]
+mod end_event_before_warp_tests {
+    use super::hoist_end_events_before_warps;
+    use crate::lua::command::LuaCommand;
+
+    fn end_event(player_id: u32) -> LuaCommand {
+        LuaCommand::EndEvent {
+            player_id,
+            event_owner: 0x2200_0001,
+            event_name: "commandContent".to_string(),
+        }
+    }
+
+    fn do_zone_change(player_id: u32) -> LuaCommand {
+        LuaCommand::DoZoneChange {
+            player_id,
+            zone_id: 244,
+            private_area: None,
+            private_area_type: 0,
+            spawn_type: 15,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            rotation: 0.0,
+        }
+    }
+
+    fn warp_to_private_area(player_id: u32) -> LuaCommand {
+        LuaCommand::WarpToPrivateArea {
+            player_id,
+            area_class: "PrivateAreaMasterPast".to_string(),
+            area_index: 3,
+            target: None,
+        }
+    }
+
+    fn change_music(player_id: u32) -> LuaCommand {
+        LuaCommand::ChangeMusic {
+            player_id,
+            music_id: 7,
+        }
+    }
+
+    fn send_message(actor_id: u32) -> LuaCommand {
+        LuaCommand::SendMessage {
+            actor_id,
+            message_type: 0x20,
+            sender: "test".to_string(),
+            text: "hello".to_string(),
+        }
+    }
+
+    /// `LuaCommand` doesn't derive `PartialEq`; order assertions go
+    /// through variant tags instead.
+    fn tags(batch: &[LuaCommand]) -> Vec<&'static str> {
+        batch
+            .iter()
+            .map(|cmd| match cmd {
+                LuaCommand::EndEvent { .. } => "end_event",
+                LuaCommand::DoZoneChange { .. } => "do_zone_change",
+                LuaCommand::WarpToPrivateArea { .. } => "warp_to_private_area",
+                LuaCommand::ChangeMusic { .. } => "change_music",
+                LuaCommand::SendMessage { .. } => "send_message",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn already_ordered_batch_stays_identical() {
+        // man0l1 Hob hand-off shape: EndEvent already precedes the warp.
+        let batch = vec![end_event(13), do_zone_change(13), change_music(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "do_zone_change", "change_music"]);
+    }
+
+    #[test]
+    fn warp_then_end_event_becomes_end_event_then_warp() {
+        // TeleportCommand.lua shape: DoZoneChange fires before
+        // player:EndEvent() — the hoist must flip them.
+        let batch = vec![do_zone_change(13), end_event(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "do_zone_change"]);
+        // The hoisted command keeps its payload.
+        assert!(
+            matches!(&out[0], LuaCommand::EndEvent { player_id: 13, .. }),
+            "hoisted EndEvent must keep its player id",
+        );
+    }
+
+    #[test]
+    fn non_warp_commands_keep_relative_order() {
+        let batch = vec![
+            send_message(13),
+            do_zone_change(13),
+            change_music(13),
+            end_event(13),
+            send_message(13),
+        ];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(
+            tags(&out),
+            [
+                "send_message",
+                "end_event",
+                "do_zone_change",
+                "change_music",
+                "send_message",
+            ],
+        );
+    }
+
+    #[test]
+    fn warp_to_private_area_counts_as_warp_family() {
+        // man0l1 SEQ_007 Isandorel shape, but with the closes inverted.
+        let batch = vec![warp_to_private_area(13), end_event(13)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["end_event", "warp_to_private_area"]);
+    }
+
+    #[test]
+    fn end_event_for_a_different_player_is_not_moved() {
+        let batch = vec![do_zone_change(13), end_event(14)];
+        let out = hoist_end_events_before_warps(batch);
+        assert_eq!(tags(&out), ["do_zone_change", "end_event"]);
+        assert!(matches!(
+            &out[1],
+            LuaCommand::EndEvent { player_id: 14, .. }
+        ));
     }
 }

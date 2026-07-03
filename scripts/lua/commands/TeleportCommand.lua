@@ -52,6 +52,18 @@ teleportMenuToAetheryte = {
 	}
 }
 
+-- Round 5 (Garlemald-Server #46): the round-2 belt-and-braces
+-- stageAfterQuestWarpDirector kick is gone. Wire-proven: the wipe +
+-- 0x00E2(0x10) warp recipe completes on its own — warp-END (RX 0x0007)
+-- arrives independent of any kick — so the veil never needed the
+-- noticeEvent round-trip. Worse, the client orders desktopWidgetMode(16)
+-- on EVERY event begin (_onPreEvent) and only _onPostEvent cancels it — a
+-- kick whose EndEvent lands mid-reload loses that teardown and leaves the
+-- session-global desktopWidget masked (the "tutorial mode" menu lock).
+-- pmeteor stages the director at exactly ONE site (man0l1.lua's Baderon
+-- SEQ_000→SEQ_003 beat — see its round-5 note above onStart). The
+-- EndEvent-before-warp ordering below (round 1) is unchanged.
+
 function onEventStarted(player, actor, triggerName, isTeleport)
 
 	local worldMaster = GetWorldMaster();
@@ -66,23 +78,48 @@ function onEventStarted(player, actor, triggerName, isTeleport)
 				aetheryteChoice = callClientFunction(player, "delegateCommand", actor, "eventAetheryte", regionChoice, 2, 2, 2, 4, 4, 4);
 				
 				if (aetheryteChoice == nil) then break end
-				
-				player:PlayAnimation(0x4000FFA);
-				player:SendGameMessage(worldMaster, 34101, 0x20, 2, teleportMenuToAetheryte[regionChoice][aetheryteChoice], 100, 100);	
-				confirmChoice = callClientFunction(player, "delegateCommand", actor, "eventConfirm", false, false, 1, 138824, false);				
-				if (confirmChoice == 1) then
-					player:PlayAnimation(0x4000FFB);
-					player:SendGameMessage(worldMaster, 34105, 0x20);			
-					--Do teleport		
-					destination = aetheryteTeleportPositions[teleportMenuToAetheryte[regionChoice][aetheryteChoice]];			
-					if (destination ~= nil) then						
-						randoPos = getRandomPointInBand(destination[2], destination[4], 3, 5);
-						rotation = getAngleFacing(randoPos.x, randoPos.y, destination[2], destination[4]);
-						GetWorldManager():DoZoneChange(player, destination[1], nil, 0, 2, randoPos.x, destination[3], randoPos.y, rotation);
+
+				local destAetheryteId = teleportMenuToAetheryte[regionChoice][aetheryteChoice];
+				-- Server-authoritative attunement gate (Garlemald-Server
+				-- #46, round 5): the client's region menu lists every
+				-- aetheryte regardless of attunement, so an untouched
+				-- destination must be refused HERE. Attunement is granted
+				-- on first touch (AetheryteParent.lua onEventStarted →
+				-- UnlockAetheryteNode, persisted in characters_aetherytes,
+				-- seed 068). No world-master sheet id for the retail "You
+				-- are not attuned" line survives in the local dumps, so
+				-- send the plain-text refusal (same SendMessage mechanism
+				-- as AetheryteParent.lua's leve-error line) and loop back
+				-- to the aetheryte list. Return/inn/homepoint branches
+				-- below stay ungated.
+				if (player:HasAetheryteNodeUnlocked(destAetheryteId) == false) then
+					player:SendMessage(0x20, "", "You are not attuned to that aetheryte.");
+				else
+					player:PlayAnimation(0x4000FFA);
+					player:SendGameMessage(worldMaster, 34101, 0x20, 2, destAetheryteId, 100, 100);
+					confirmChoice = callClientFunction(player, "delegateCommand", actor, "eventConfirm", false, false, 1, 138824, false);
+					if (confirmChoice == 1) then
+						player:PlayAnimation(0x4000FFB);
+						player:SendGameMessage(worldMaster, 34105, 0x20);
+						--Do teleport
+						destination = aetheryteTeleportPositions[destAetheryteId];
+						if (destination ~= nil) then
+							randoPos = getRandomPointInBand(destination[2], destination[4], 3, 5);
+							rotation = getAngleFacing(randoPos.x, randoPos.y, destination[2], destination[4]);
+							-- Close the teleport menu event, THEN warp — 0x0131 ahead
+							-- of the 0x00E2 reload latch is retail's invariant ordering
+							-- on every captured transition (see man0l1.lua onStart).
+							-- EndEvent after the warp shipped the event teardown into
+							-- the client's Now-Loading gap and left the veil stuck.
+							-- (Garlemald-Server #46.)
+							player:EndEvent();
+							GetWorldManager():DoZoneChange(player, destination[1], nil, 0, 2, randoPos.x, destination[3], randoPos.y, rotation);
+							return;
+						end
 					end
+					player:EndEvent();
+					return;
 				end
-				player:EndEvent();
-				return;
 			end
 			
 		end
@@ -95,28 +132,44 @@ function onEventStarted(player, actor, triggerName, isTeleport)
 
 			--bandaid fix for returning while dead, missing things like weakness and the heal number
 			if (player:GetHP() == 0) then
-				player:SetHP(player.GetMaxHP());
+				-- `:GetMaxHP()` — the inherited `.GetMaxHP()` dot-call passed
+				-- no self to the mlua method and errored, killing the
+				-- coroutine before EndEvent/warp ever ran on a dead Return.
+				-- (Garlemald-Server #46, round 2 drive-by.)
+				player:SetHP(player:GetMaxHP());
 				player:ChangeState(0);
 				player:PlayAnimation(0x01000066);
 			end
 
+			-- Same 0x0131-before-0x00E2 ordering as the teleport branch
+			-- above: each warping path closes the event first and returns,
+			-- so the shared EndEvent at the bottom only serves the
+			-- non-warp exits (declined confirm, unset inn slot, unknown
+			-- homepoint). (Garlemald-Server #46.)
 			if (isInn) then
-				--Return to Inn		
+				--Return to Inn
 				if (player:GetHomePointInn() == 1) then
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, 244, nil, 0, 15, -160.048, 0, -165.737, 0);
+					return;
 				elseif (player:GetHomePointInn() == 2) then
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, 244, nil, 0, 15, 160.048, 0, 154.263, 0);
+					return;
 				elseif (player:GetHomePointInn() == 3) then
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, 244, nil, 0, 15, 0.048, 0, -5.737, 0);
-				end			
-			elseif (choice == 1 and isInn == nil) then			
+					return;
+				end
+			elseif (choice == 1 and isInn == nil) then
 				--Return to Homepoint
 				destination = aetheryteTeleportPositions[player:GetHomePoint()];
 				if (destination ~= nil) then
 					randoPos = getRandomPointInBand(destination[2], destination[4], 3, 5);
 					rotation = getAngleFacing(randoPos.x, randoPos.y, destination[2], destination[4]);
+					player:EndEvent();
 					GetWorldManager():DoZoneChange(player, destination[1], nil, 0, 2, randoPos.x, destination[3], randoPos.y, rotation);
-
+					return;
 				end
 			end
 		end
