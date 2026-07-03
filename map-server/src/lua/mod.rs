@@ -2738,14 +2738,12 @@ mod tests {
             snap
         };
 
-        // Round 7e — Sisipu PACES the player (no fixed waypoint route;
-        // the navmesh is a stub). Tick 1a SEEDS the player's last
-        // position (first tick has no movement delta, so no lead step
-        // yet). Tick 1b advances the player +12 in z (walking toward the
-        // goal) with the road clear (only the far third-cluster mob
-        // live), and Sisipu must lead a step in the player's movement
-        // direction — z increasing above her spawn 162 — at the PLAYER'S
-        // ground Y (36), never her interpolated spawn Y.
+        // Round 7f — Sisipu TRACES the player's recorded footsteps. From
+        // her seed spawn (-49, 36.43, 162) the nearest TRAIL breadcrumb
+        // is (-43.93, 37.11, 156.42) (the second recorded sample), so
+        // with the player in leash range and the road clear she must
+        // step toward it — x increasing above -49 — at the BREADCRUMB'S
+        // recorded ground Y (37.11), never an interpolated one.
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
         area.players.push(near_player((-52.0, 36.0, 158.0)));
@@ -2753,30 +2751,20 @@ mod tests {
             .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
         area.monsters
             .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
-        let seed = engine.call_content_on_update(&script_path, 1, area);
-        assert!(seed.error.is_none(), "tick1a: {:?}", seed.error);
-
-        let q = CommandQueue::new();
-        let mut area = sample_content_area(q.clone());
-        area.players.push(near_player((-52.0, 36.0, 170.0))); // walked +12 z
-        area.allies
-            .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
-        area.monsters
-            .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
-        let result = engine.call_content_on_update(&script_path, 2, area);
-        assert!(result.error.is_none(), "tick1b: {:?}", result.error);
+        let result = engine.call_content_on_update(&script_path, 1, area);
+        assert!(result.error.is_none(), "tick1: {:?}", result.error);
         let step = result.commands.iter().find_map(|c| match c {
             LuaCommand::MoveActorToPosition {
                 actor_id: 0x4008_0001,
+                x,
                 y,
-                z,
                 ..
-            } => Some((*y, *z)),
+            } => Some((*x, *y)),
             _ => None,
         });
         assert!(
-            step.is_some_and(|(y, z)| z > 162.0 && (y - 36.0).abs() < 0.01),
-            "player walking forward must lead Sisipu a step in that direction at the player's Y; got {:?}",
+            step.is_some_and(|(x, y)| x > -49.0 && (y - 37.11).abs() < 0.01),
+            "clear road + close player must step Sisipu toward the nearest trail breadcrumb at its recorded Y; got {:?}",
             result.commands,
         );
 
@@ -2808,16 +2796,15 @@ mod tests {
             result.commands,
         );
 
-        // Tick 3 — ARRIVAL: Sisipu and the player both inside the
-        // lighthouse-approach radius of the final waypoint
-        // (130.7, 59.5, 1280), the last cluster far behind:
-        // escortComplete must fire (waypoint arrival, NOT kill count —
-        // the far mob is still alive).
+        // Tick 3 — ARRIVAL: the PLAYER inside the lighthouse-approach
+        // radius of ARRIVAL_GOAL (137.44, 60.33, 1322), Sisipu at their
+        // side, the last cluster far behind: escortComplete must fire
+        // (goal arrival, NOT kill count — the far mob is still alive).
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
-        area.players.push(near_player((128.0, 59.0, 1276.0)));
+        area.players.push(near_player((135.0, 60.0, 1318.0)));
         area.allies
-            .push(escort_actor((130.7, 59.5, 1280.0), q.clone()));
+            .push(escort_actor((133.0, 60.2, 1320.0), q.clone()));
         area.monsters
             .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
         let result = engine.call_content_on_update(&script_path, 3, area);
