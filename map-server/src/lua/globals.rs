@@ -86,7 +86,11 @@ pub fn install_globals(
             if id.is_none() {
                 tracing::warn!(name, "GetStaticActor: unknown static actor (returning nil)");
             }
-            Ok(id)
+            // Userdata, NOT a bare integer: scripts feed the result into
+            // client delegates, and only userdata coerces to the ActorId
+            // wire type (0x06) in `value_to_command_arg` — an integer
+            // marshals as 0x00 and crashes the client (see LuaStaticActor).
+            Ok(id.map(|actor_id| crate::lua::userdata::LuaStaticActor { actor_id }))
         })?;
         globals.set("GetStaticActor", f)?;
     }
