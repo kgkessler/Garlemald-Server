@@ -83,6 +83,23 @@ pub struct Session {
     /// corresponding `KickEventPacket` as the final step so the client
     /// dispatches the event on the freshly-spawned director actor.
     pub pending_kick_event: Option<PendingKickEvent>,
+    /// Content-warp sibling of `pending_kick_event` — a director
+    /// `noticeEvent` kick parked because it would otherwise TX into an
+    /// unacked wipe+0x10 content-reload window. Wire-proven (man0l1
+    /// escort, session 53943): a `KickEvent (0x012F)` that rides the
+    /// content-warp flush AFTER `DeleteAllActors (0x0007)` is silently
+    /// dropped by the client (the owner actor was just wiped; decomp:
+    /// `KickClientOrderEventReceiver` gates on `actor[+0x5c] != 0`),
+    /// so the director's `onEventStarted` never runs and the duty can
+    /// never complete. Parked by the KickEvent appliers while
+    /// `reload_in_flight` is set (or the pre-ack content window is
+    /// open); released — TX'd as a normal 0x012F — by the client's
+    /// `RX 0x0007` zone-in-complete ack (`handle_zone_in_complete`),
+    /// at which point the director actor rode the zone-in bundle and
+    /// is client-known. Cleared defensively by the `ContentFinished`
+    /// teardown so a stale kick can't fire on a later ack.
+    /// (Garlemald-Server #46, escort leg.)
+    pub pending_content_kick_event: Option<PendingKickEvent>,
     /// Deferred zone-in bundle for SAME-REGION warps — retail pacing:
     /// retail leaves ~6 s between the 0x00E2 force-reload latch and
     /// the zone-in bundle (bundle-silent, never session-silent; pongs

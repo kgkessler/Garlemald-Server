@@ -595,6 +595,8 @@ async fn dispatch_npc_event_started(
                         is_engaged: false,
                         speed: 5.0,
                         target_actor_id: 0,
+                        hp: 0,
+                        max_hp: 0,
                     },
                     actor_class_id,
                     quest_graphic: 0,

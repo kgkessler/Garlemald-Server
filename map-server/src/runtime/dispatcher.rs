@@ -137,19 +137,25 @@ pub async fn dispatch_status_event(
             owner_actor_id,
             delta,
         } => {
-            apply_hp_delta(registry, *owner_actor_id, *delta).await;
+            if apply_hp_delta(registry, *owner_actor_id, *delta).await {
+                sync_pools_after_tick(registry, world, *owner_actor_id).await;
+            }
         }
         StatusEvent::MpTick {
             owner_actor_id,
             delta,
         } => {
-            apply_mp_delta(registry, *owner_actor_id, *delta).await;
+            if apply_mp_delta(registry, *owner_actor_id, *delta).await {
+                sync_pools_after_tick(registry, world, *owner_actor_id).await;
+            }
         }
         StatusEvent::TpTick {
             owner_actor_id,
             delta,
         } => {
-            apply_tp_delta(registry, *owner_actor_id, *delta).await;
+            if apply_tp_delta(registry, *owner_actor_id, *delta).await {
+                sync_pools_after_tick(registry, world, *owner_actor_id).await;
+            }
         }
         StatusEvent::RecalcStats { owner_actor_id } => {
             apply_recalc_stats(registry, world, catalogs, db, *owner_actor_id).await;
@@ -1624,25 +1630,53 @@ pub(crate) async fn broadcast_to_neighbours(
     broadcast_around_actor(world, registry, &zone, source_actor_id, packet_bytes).await;
 }
 
-async fn apply_hp_delta(registry: &ActorRegistry, actor_id: u32, delta: i32) {
-    if let Some(handle) = registry.get(actor_id).await {
-        let mut c = handle.character.write().await;
-        c.add_hp(delta);
-    }
+// The pool appliers report whether the value actually moved — clamping
+// at full HP / empty TP returns `false` so idle-at-rest actors produce
+// zero wire traffic from the regen tick.
+
+async fn apply_hp_delta(registry: &ActorRegistry, actor_id: u32, delta: i32) -> bool {
+    let Some(handle) = registry.get(actor_id).await else {
+        return false;
+    };
+    let mut c = handle.character.write().await;
+    let before = c.chara.hp;
+    c.add_hp(delta);
+    c.chara.hp != before
 }
 
-async fn apply_mp_delta(registry: &ActorRegistry, actor_id: u32, delta: i32) {
-    if let Some(handle) = registry.get(actor_id).await {
-        let mut c = handle.character.write().await;
-        c.add_mp(delta);
-    }
+async fn apply_mp_delta(registry: &ActorRegistry, actor_id: u32, delta: i32) -> bool {
+    let Some(handle) = registry.get(actor_id).await else {
+        return false;
+    };
+    let mut c = handle.character.write().await;
+    let before = c.chara.mp;
+    c.add_mp(delta);
+    c.chara.mp != before
 }
 
-async fn apply_tp_delta(registry: &ActorRegistry, actor_id: u32, delta: i32) {
-    if let Some(handle) = registry.get(actor_id).await {
-        let mut c = handle.character.write().await;
-        c.add_tp(delta);
-    }
+async fn apply_tp_delta(registry: &ActorRegistry, actor_id: u32, delta: i32) -> bool {
+    let Some(handle) = registry.get(actor_id).await else {
+        return false;
+    };
+    let mut c = handle.character.write().await;
+    let before = c.chara.tp;
+    c.add_tp(delta);
+    c.chara.tp != before
+}
+
+/// Pool-tick → client sync. The Hp/Mp/TpTick arms previously mutated
+/// memory only, leaving the client's gauges frozen until an unrelated
+/// pool broadcast fired. Resolve the owner's zone and ride the same
+/// `charaWork/stateAtQuicklyForAll` bundle the battle resolve fns use
+/// (pmeteor `Character.PostUpdate`'s HpTpMp update flag).
+async fn sync_pools_after_tick(registry: &ActorRegistry, world: &WorldManager, actor_id: u32) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let Some(zone) = world.zone(handle.zone_id).await else {
+        return;
+    };
+    broadcast_state_quickly(registry, world, &zone, actor_id).await;
 }
 
 /// Recompute HP/MP pools from the modifier map, then — for Players — run
@@ -1967,6 +2001,23 @@ pub(crate) async fn die_if_defender_fell(
     // `BattleUtils.cs:GetEXPReward` is the follow-up.
     award_grand_company_seals(&attacker_handle, mob_level, db_arc).await;
 
+    // Kill EXP — pmeteor pays it in the same death batch
+    // (`BattleNpc.cs:376` → `BattleUtils.AddBattleBonusEXP`), and it
+    // likewise fires before the quest-hook chain so `onKillBNpc` sees
+    // the post-award EXP state. Tutorial-content kills are gated off
+    // inside (their Lua already self-pays a fixed grant).
+    award_battle_exp(
+        &attacker_handle,
+        defender_actor_id,
+        mob_level,
+        registry,
+        world,
+        zone,
+        db_arc,
+        lua,
+    )
+    .await;
+
     let Some(lua) = lua else {
         return;
     };
@@ -2164,6 +2215,182 @@ async fn award_grand_company_seals(
             "GC seal reward applied",
         );
     }
+}
+
+/// Tutorial content scripts that pay fixed kill EXP from their own Lua
+/// `onUpdate` (`owner:AddExp(1000/3000, …)` — SimpleContent30010.lua:132,
+/// SimpleContent30002.lua:123, SimpleContent30079.lua:112). The generic
+/// death-path award skips kills made under these to avoid a double-pay;
+/// every other content script — notably the man0l1 escort
+/// (`SimpleContentMan0l101`), whose retail footage shows 601/625 EXP per
+/// ankle biter — defers to the generic path.
+const SELF_PAYING_CONTENT_SCRIPTS: [&str; 3] = [
+    "SimpleContent30010", // Gridania opener wolves
+    "SimpleContent30002", // Limsa opener aurelias
+    "SimpleContent30079", // Ul'dah opener goobbue
+];
+
+/// Kill-EXP award — port of pmeteor's death-path payout
+/// (`BattleNpc.cs:363-385` → `BattleUtils.cs:AddBattleBonusEXP`):
+///
+///   1. the 30108 "<attacker> defeats <target>." row (BattleNpc.cs:364),
+///   2. on a running EXP chain, the 33919 "EXP chain N!" row with the
+///      next window in seconds (BattleUtils.cs:1001),
+///   3. base EXP from [`crate::battle::exp::base_kill_exp`] with the
+///      chain bonus folded in like the Lua `AddExp` binding
+///      (`exp += ceil(exp*bonus/100)`), riding the shared
+///      `apply_add_exp` → `emit_exp_property_updates` pipeline which
+///      renders "You earn N experience points." / "You attain level N."
+///      and persists everything.
+///
+/// Chain state is the hidden EXPChain status (id 300004, seed
+/// 032_server_statuseffects.sql:209) whose `tier` counts qualifying
+/// kills; the refresh stores `tier + 1` with the *previous* tier's
+/// window as duration (BattleUtils.cs:995-1005). EXP goes to the
+/// killer's CURRENT class — pmeteor `attacker.GetClass()`. Link bonus
+/// stays 0 until LinkCount mob-mod plumbing lands; party distribution
+/// (0.667 modifier paid to every member) is deferred with real parties
+/// — the killer is paid solo.
+#[allow(clippy::too_many_arguments)]
+async fn award_battle_exp(
+    attacker_handle: &crate::runtime::actor_registry::ActorHandle,
+    defender_actor_id: u32,
+    mob_level: i16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    zone: &Arc<RwLock<Zone>>,
+    db: &Arc<crate::database::Database>,
+    lua: Option<&Arc<crate::lua::LuaEngine>>,
+) {
+    if attacker_handle.session_id != 0
+        && let Some(session) = world.session(attacker_handle.session_id).await
+        && let Some(active) = session.active_content_script.as_ref()
+        && SELF_PAYING_CONTENT_SCRIPTS.contains(&active.content_script.as_str())
+    {
+        tracing::debug!(
+            attacker = attacker_handle.actor_id,
+            script = %active.content_script,
+            "kill EXP skipped — tutorial content script self-pays",
+        );
+        return;
+    }
+    let (player_level, class_id) = {
+        let c = attacker_handle.character.read().await;
+        (c.chara.level, c.chara.class.clamp(0, u8::MAX as i16) as u8)
+    };
+    let base = crate::battle::exp::base_kill_exp(player_level, mob_level, 1) as i32;
+    if base == 0 {
+        // dlvl <= -20: no EXP and no message (BattleUtils.cs:876).
+        return;
+    }
+
+    // EXP chain — an existing (unexpired) EXPChain effect sets the
+    // chain number; the refresh below stores tier+1 with the previous
+    // tier's time window as the new duration.
+    let now_ms = (common::utils::unix_timestamp() as u64).saturating_mul(1000);
+    let now_s = (now_ms / 1000) as u32;
+    let mut status_outbox = crate::status::StatusOutbox::new();
+    let (chain_tier, chain_window_s) = {
+        let mut c = attacker_handle.character.write().await;
+        let tier = c
+            .status_effects
+            .get(crate::status::ids::STATUS_EXP_CHAIN)
+            // The ticker sweeps expired effects lazily — a stale entry
+            // is "no chain".
+            .filter(|e| e.end_time > now_s)
+            .map(|e| e.tier)
+            .unwrap_or(0);
+        let window_s = crate::battle::exp::chain_time_limit_s(tier) as u32;
+        let mut chain = crate::status::StatusEffect::new(
+            attacker_handle.actor_id,
+            crate::status::ids::STATUS_EXP_CHAIN,
+            0.0,
+            0,
+            window_s,
+            tier.saturating_add(1),
+            now_ms,
+        );
+        // Mirror the seed template row (032_server_statuseffects.sql:209
+        // — flags 273, overwrite Always, hidden, silent both ways): the
+        // chain marker is server-side bookkeeping, nothing rides the
+        // wire for it.
+        chain.name = "expchain".into();
+        chain.flags = crate::status::StatusEffectFlags::from(273);
+        chain.overwrite = crate::status::StatusEffectOverwrite::Always;
+        chain.hidden = true;
+        chain.silent_on_gain = true;
+        chain.silent_on_loss = true;
+        c.status_effects.add_status_effect(
+            chain,
+            attacker_handle.actor_id,
+            now_ms,
+            crate::status::DEFAULT_GAIN_TEXT_ID,
+            &mut status_outbox,
+        );
+        (tier, window_s)
+    };
+    let catalogs = lua
+        .map(|e| e.catalogs().clone())
+        .unwrap_or_else(|| std::sync::Arc::new(crate::lua::Catalogs::new()));
+    for event in status_outbox.drain() {
+        dispatch_status_event(&event, registry, world, db, &catalogs).await;
+    }
+
+    // pmeteor packs these rows into the killing blow's actionContainer
+    // (`CommandResultContainer.CombineLists`); garlemald resolves the
+    // death after the attack batch has shipped, so they ride their own
+    // X01/X10 container right behind it.
+    let mut rows = vec![tx::actor_battle::CommandResult {
+        target_id: defender_actor_id,
+        worldmaster_text_id: 30108, // "<attacker> defeats <target>."
+        hit_num: 1,
+        ..Default::default()
+    }];
+    if chain_tier > 0 {
+        rows.push(tx::actor_battle::CommandResult {
+            target_id: attacker_handle.actor_id,
+            worldmaster_text_id: 33919, // "EXP chain N!" — amount = tier
+            amount: chain_tier as u32,
+            param: chain_window_s, // window (s) for the next link
+            hit_num: 1,
+            ..Default::default()
+        });
+    }
+    let mut offset = 0usize;
+    while offset < rows.len() {
+        let remaining = rows.len() - offset;
+        let sub = if remaining == 1 {
+            let row = &rows[offset];
+            offset += 1;
+            tx::actor_battle::build_command_result_x01(attacker_handle.actor_id, 0, 0, row)
+        } else {
+            tx::actor_battle::build_command_result_x10(
+                attacker_handle.actor_id,
+                0,
+                0,
+                &rows,
+                &mut offset,
+            )
+        };
+        let bytes = sub.to_bytes();
+        send_to_self_if_player(registry, world, attacker_handle.actor_id, bytes.clone()).await;
+        broadcast_around_actor(world, registry, zone, attacker_handle.actor_id, bytes).await;
+    }
+
+    let total_bonus = (crate::battle::exp::link_bonus(0) as u32)
+        .saturating_add(crate::battle::exp::chain_bonus(chain_tier) as u32)
+        .min(u8::MAX as u32) as u8;
+    let total_exp = crate::battle::exp::with_bonus(base, total_bonus);
+    crate::runtime::quest_apply::apply_add_exp(
+        attacker_handle.actor_id,
+        class_id,
+        total_exp,
+        registry,
+        db,
+        Some(world),
+        lua,
+    )
+    .await;
 }
 
 /// Per-difficulty base seal payout for a completed guildleve. Retail's
@@ -2889,5 +3116,535 @@ mod home_point_revive_tests {
         // `/return` doesn't burst-heal).
         assert_eq!(c.chara.hp, 250);
         assert_eq!(c.base.zone_id, 175, "warped despite being alive");
+    }
+}
+
+#[cfg(test)]
+mod battle_exp_award_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::data::{ActiveContentScript, ClientHandle, Session};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::navmesh::StubNavmeshLoader;
+
+    const PLAYER_ID: u32 = 9;
+    const SESSION_ID: u32 = 77;
+    const ZONE_ID: u32 = 100;
+    const GLADIATOR: i16 = 3;
+
+    fn tempdb() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("garlemald-exp-award-{nanos}-{seq}.db"))
+    }
+
+    fn make_zone(zone_id: u32) -> Zone {
+        Zone::new(
+            zone_id,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        )
+    }
+
+    /// Zone 100 with a level-6 Gladiator (session 77, client rx attached)
+    /// and `mob_count` dead level-6 BattleNpcs (ids 2, 3, …) ready for
+    /// `die_if_defender_fell`.
+    async fn setup(
+        mob_count: u32,
+    ) -> (
+        Arc<WorldManager>,
+        Arc<ActorRegistry>,
+        Arc<RwLock<Zone>>,
+        Arc<crate::database::Database>,
+        ActorHandle,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        world.register_zone(make_zone(ZONE_ID)).await;
+        let zone_arc = world.zone(ZONE_ID).await.expect("zone registered");
+        {
+            let mut z = zone_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            z.core.add_actor(
+                crate::zone::area::StoredActor {
+                    actor_id: PLAYER_ID,
+                    kind: crate::zone::area::ActorKind::Player,
+                    position: common::Vector3::new(5.0, 0.0, 0.0),
+                    grid: (0, 0),
+                    is_alive: true,
+                },
+                &mut ob,
+            );
+            for mob_id in 2..2 + mob_count {
+                z.core.add_actor(
+                    crate::zone::area::StoredActor {
+                        actor_id: mob_id,
+                        kind: crate::zone::area::ActorKind::BattleNpc,
+                        position: common::Vector3::ZERO,
+                        grid: (0, 0),
+                        is_alive: true,
+                    },
+                    &mut ob,
+                );
+            }
+        }
+
+        let mut player = Character::new(PLAYER_ID);
+        player.chara.max_hp = 300;
+        player.chara.hp = 300;
+        player.chara.class = GLADIATOR;
+        player.chara.level = 6;
+        player.battle_save.skill_level[GLADIATOR as usize] = 6;
+        player.base.zone_id = ZONE_ID;
+        let player_handle =
+            ActorHandle::new(PLAYER_ID, ActorKindTag::Player, ZONE_ID, SESSION_ID, player);
+        registry.insert(player_handle.clone()).await;
+
+        for mob_id in 2..2 + mob_count {
+            let mut mob = Character::new(mob_id);
+            mob.chara.max_hp = 60;
+            mob.chara.hp = 0; // killing blow already settled
+            mob.chara.level = 6;
+            mob.base.zone_id = ZONE_ID;
+            registry
+                .insert(ActorHandle::new(
+                    mob_id,
+                    ActorKindTag::BattleNpc,
+                    ZONE_ID,
+                    0,
+                    mob,
+                ))
+                .await;
+        }
+
+        let (tx_ch, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        world
+            .register_client(SESSION_ID, ClientHandle::new(SESSION_ID, tx_ch))
+            .await;
+        let db = Arc::new(
+            crate::database::Database::open(tempdb())
+                .await
+                .expect("test db"),
+        );
+        (world, registry, zone_arc, db, player_handle, rx)
+    }
+
+    /// Drain every frame queued so far and collect the worldmaster text
+    /// ids from X01 (0x0139) and X10 (0x013A) CommandResult subpackets.
+    fn drain_text_ids(rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u16> {
+        let mut ids = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let mut off = 0usize;
+            while off + 0x20 <= frame.len() {
+                let size = u16::from_le_bytes([frame[off], frame[off + 1]]) as usize;
+                if size < 0x20 || off + size > frame.len() {
+                    break;
+                }
+                let opcode = u16::from_le_bytes([frame[off + 0x12], frame[off + 0x13]]);
+                let body = &frame[off + 0x20..off + size];
+                match opcode {
+                    // X01 row: worldMasterTextId at +0x2E of the body.
+                    0x0139 if body.len() >= 0x30 => {
+                        ids.push(u16::from_le_bytes([body[0x2E], body[0x2F]]));
+                    }
+                    // X10 rows: numActions at +0x20, text-id column at
+                    // +0x64 (CommandResultX10Packet.cs:54-81).
+                    0x013A if body.len() >= 0x78 => {
+                        let n = u32::from_le_bytes([body[0x20], body[0x21], body[0x22], body[0x23]])
+                            as usize;
+                        for i in 0..n.min(10) {
+                            let p = 0x64 + i * 2;
+                            ids.push(u16::from_le_bytes([body[p], body[p + 1]]));
+                        }
+                    }
+                    _ => {}
+                }
+                off += size;
+            }
+        }
+        ids
+    }
+
+    /// A player-killed BattleNpc pays the dlvl-0 base row (601 at level
+    /// 6 — the retail ankle-biter calibration point), emits the 30108
+    /// "defeats" line plus the 33935 Gladiator "You earn N experience
+    /// points." row, and arms the EXP-chain status at tier 1.
+    #[tokio::test]
+    async fn player_kill_awards_exp_and_emits_defeat_line() {
+        let (world, registry, zone_arc, db, player_handle, mut rx) = setup(1).await;
+
+        die_if_defender_fell(
+            2,
+            Some(PLAYER_ID),
+            &registry,
+            &world,
+            &zone_arc,
+            None,
+            Some(&db),
+        )
+        .await;
+
+        {
+            let c = player_handle.character.read().await;
+            assert_eq!(
+                c.battle_save.skill_point[GLADIATOR as usize], 601,
+                "level-6 kill at dlvl 0 pays the calibrated 601 base",
+            );
+            assert_eq!(c.chara.level, 6, "601 SP must not cross the 6→7 threshold");
+            let chain = c
+                .status_effects
+                .get(crate::status::ids::STATUS_EXP_CHAIN)
+                .expect("EXP-chain status armed by the kill");
+            assert_eq!(chain.tier, 1, "first kill arms the chain at tier 1");
+        }
+
+        let ids = drain_text_ids(&mut rx);
+        assert!(ids.contains(&30108), "\"defeats\" row shipped: {ids:?}");
+        assert!(
+            ids.contains(&33935),
+            "Gladiator \"You earn N experience points.\" row shipped: {ids:?}",
+        );
+        assert!(
+            !ids.contains(&33919),
+            "no chain line on the chain-opening kill: {ids:?}",
+        );
+    }
+
+    /// A second kill inside the chain window pays the tier-1 bonus
+    /// (601 + ceil(20%) = 722) and ships the 33919 chain line.
+    #[tokio::test]
+    async fn chained_kill_pays_chain_bonus_and_emits_chain_line() {
+        let (world, registry, zone_arc, db, player_handle, mut rx) = setup(2).await;
+
+        die_if_defender_fell(
+            2,
+            Some(PLAYER_ID),
+            &registry,
+            &world,
+            &zone_arc,
+            None,
+            Some(&db),
+        )
+        .await;
+        die_if_defender_fell(
+            3,
+            Some(PLAYER_ID),
+            &registry,
+            &world,
+            &zone_arc,
+            None,
+            Some(&db),
+        )
+        .await;
+
+        {
+            let c = player_handle.character.read().await;
+            assert_eq!(
+                c.battle_save.skill_point[GLADIATOR as usize],
+                601 + 722,
+                "second kill pays 601 + ceil(601*20/100) chain bonus",
+            );
+            let chain = c
+                .status_effects
+                .get(crate::status::ids::STATUS_EXP_CHAIN)
+                .expect("EXP-chain status still armed");
+            assert_eq!(chain.tier, 2, "chain advanced to tier 2");
+        }
+
+        let ids = drain_text_ids(&mut rx);
+        assert!(
+            ids.contains(&33919),
+            "\"EXP chain\" row shipped on the chained kill: {ids:?}",
+        );
+    }
+
+    fn content_session(script: &str) -> Session {
+        let mut session = Session::new(SESSION_ID);
+        session.current_zone_id = ZONE_ID;
+        session.active_content_script = Some(ActiveContentScript {
+            parent_zone_id: ZONE_ID,
+            area_name: "test".into(),
+            area_class_path: "/Area/PrivateArea/Test".into(),
+            director_name: "TestDirector".into(),
+            director_actor_id: 0x5FF8_0001,
+            content_area_actor_id: 0x5FF8_0002,
+            content_script: script.into(),
+            warp_complete: true,
+            spawned_actor_ids: Vec::new(),
+        });
+        session
+    }
+
+    /// Kills made under the three tutorial content scripts are skipped —
+    /// their Lua `onUpdate` already self-pays a fixed AddExp, so the
+    /// generic award double-paying was the hazard.
+    #[tokio::test]
+    async fn tutorial_content_kill_skips_generic_award() {
+        let (world, registry, zone_arc, db, player_handle, _rx) = setup(1).await;
+        world
+            .upsert_session(content_session("SimpleContent30010"))
+            .await;
+
+        die_if_defender_fell(
+            2,
+            Some(PLAYER_ID),
+            &registry,
+            &world,
+            &zone_arc,
+            None,
+            Some(&db),
+        )
+        .await;
+
+        let c = player_handle.character.read().await;
+        assert_eq!(
+            c.battle_save.skill_point[GLADIATOR as usize], 0,
+            "tutorial content self-pays via Lua — the generic award must skip",
+        );
+    }
+
+    /// The man0l1 escort runs under a content script too, but it does
+    /// NOT self-pay — retail screenshots show 601/625 EXP per ankle
+    /// biter during the duty, so the generic award must fire for it.
+    #[tokio::test]
+    async fn escort_content_kill_still_awards() {
+        let (world, registry, zone_arc, db, player_handle, _rx) = setup(1).await;
+        world
+            .upsert_session(content_session("SimpleContentMan0l101"))
+            .await;
+
+        die_if_defender_fell(
+            2,
+            Some(PLAYER_ID),
+            &registry,
+            &world,
+            &zone_arc,
+            None,
+            Some(&db),
+        )
+        .await;
+
+        let c = player_handle.character.read().await;
+        assert_eq!(
+            c.battle_save.skill_point[GLADIATOR as usize], 601,
+            "non-tutorial content (escort) defers to the generic award",
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_tick_sync_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::status::outbox::StatusEvent;
+    use crate::zone::navmesh::StubNavmeshLoader;
+
+    const PLAYER_ID: u32 = 5;
+    const SESSION_ID: u32 = 88;
+    const ZONE_ID: u32 = 100;
+
+    fn tempdb() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("garlemald-pool-tick-{nanos}-{seq}.db"))
+    }
+
+    /// Zone 100 with one Player (session + client channel attached),
+    /// pools at `hp`/`tp`, ready for a dispatched pool-tick event.
+    async fn setup(
+        hp: i16,
+        tp: u16,
+    ) -> (
+        Arc<WorldManager>,
+        Arc<ActorRegistry>,
+        Arc<crate::database::Database>,
+        ActorHandle,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let mut zone = Zone::new(
+            ZONE_ID,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone.core.add_actor(
+            crate::zone::area::StoredActor {
+                actor_id: PLAYER_ID,
+                kind: crate::zone::area::ActorKind::Player,
+                position: common::Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+
+        let mut player = Character::new(PLAYER_ID);
+        player.chara.max_hp = 1000;
+        player.chara.hp = hp;
+        player.chara.max_mp = 500;
+        player.chara.mp = 250;
+        player.chara.tp = tp;
+        player.base.zone_id = ZONE_ID;
+        let handle = ActorHandle::new(PLAYER_ID, ActorKindTag::Player, ZONE_ID, SESSION_ID, player);
+        registry.insert(handle.clone()).await;
+
+        let (tx_ch, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        world
+            .register_client(SESSION_ID, ClientHandle::new(SESSION_ID, tx_ch))
+            .await;
+        let db = Arc::new(
+            crate::database::Database::open(tempdb())
+                .await
+                .expect("test db"),
+        );
+        (world, registry, db, handle, rx)
+    }
+
+    /// True if any queued frame carries the `charaWork/stateAtQuicklyForAll`
+    /// target path (the pool-gauge bundle).
+    fn received_state_bundle(rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> bool {
+        let needle = b"charaWork/stateAtQuicklyForAll";
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.windows(needle.len()).any(|w| w == needle) {
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// A regen HpTick that moves the pool must ship the
+    /// `charaWork/stateAtQuicklyForAll` bundle — pre-change the tick arms
+    /// mutated memory only and the client gauge stayed frozen.
+    #[tokio::test]
+    async fn hp_tick_that_changes_pool_syncs_client() {
+        let (world, registry, db, handle, mut rx) = setup(500, 0).await;
+        let catalogs = std::sync::Arc::new(crate::lua::Catalogs::default());
+
+        dispatch_status_event(
+            &StatusEvent::HpTick {
+                owner_actor_id: PLAYER_ID,
+                delta: 20,
+            },
+            &registry,
+            &world,
+            &db,
+            &catalogs,
+        )
+        .await;
+
+        assert_eq!(handle.character.read().await.chara.hp, 520);
+        assert!(
+            received_state_bundle(&mut rx),
+            "HP tick must ride the stateAtQuicklyForAll sync",
+        );
+    }
+
+    /// A tick that clamps (full HP) produces zero wire traffic — the
+    /// idle-at-full case must stay silent.
+    #[tokio::test]
+    async fn hp_tick_clamped_at_full_emits_nothing() {
+        let (world, registry, db, handle, mut rx) = setup(1000, 0).await;
+        let catalogs = std::sync::Arc::new(crate::lua::Catalogs::default());
+
+        dispatch_status_event(
+            &StatusEvent::HpTick {
+                owner_actor_id: PLAYER_ID,
+                delta: 20,
+            },
+            &registry,
+            &world,
+            &db,
+            &catalogs,
+        )
+        .await;
+
+        assert_eq!(handle.character.read().await.chara.hp, 1000);
+        assert!(
+            !received_state_bundle(&mut rx),
+            "clamped tick must not emit a state bundle",
+        );
+    }
+
+    /// TP decay ticks sync the client too (the TP gauge empties visibly),
+    /// and a decay against an already-empty pool stays silent.
+    #[tokio::test]
+    async fn tp_tick_syncs_client_and_empty_pool_stays_silent() {
+        let (world, registry, db, handle, mut rx) = setup(1000, 200).await;
+        let catalogs = std::sync::Arc::new(crate::lua::Catalogs::default());
+
+        dispatch_status_event(
+            &StatusEvent::TpTick {
+                owner_actor_id: PLAYER_ID,
+                delta: -90,
+            },
+            &registry,
+            &world,
+            &db,
+            &catalogs,
+        )
+        .await;
+        assert_eq!(handle.character.read().await.chara.tp, 110);
+        assert!(
+            received_state_bundle(&mut rx),
+            "TP decay must ride the stateAtQuicklyForAll sync",
+        );
+
+        {
+            let mut c = handle.character.write().await;
+            c.chara.tp = 0;
+        }
+        dispatch_status_event(
+            &StatusEvent::TpTick {
+                owner_actor_id: PLAYER_ID,
+                delta: -90,
+            },
+            &registry,
+            &world,
+            &db,
+            &catalogs,
+        )
+        .await;
+        assert_eq!(handle.character.read().await.chara.tp, 0);
+        assert!(
+            !received_state_bundle(&mut rx),
+            "empty-TP decay must not emit a state bundle",
+        );
     }
 }

@@ -40,6 +40,22 @@ fn push(queue: &Arc<Mutex<CommandQueue>>, cmd: LuaCommand) {
     CommandQueue::push(queue, cmd);
 }
 
+/// Resolve a `player:CompleteQuest(...)` / `player:AbandonQuest(...)`
+/// argument to a raw quest id. Scripts pass either the LuaQuestHandle
+/// userdata delivered to the hook or a raw integer id — mirror of the
+/// AcceptQuest binding's userdata extraction and SendGameMessage's
+/// mixed-type owner resolver. `None` means the argument was neither
+/// shape; callers log-and-drop (a hard mlua error here is exactly the
+/// silent turn-in-repeat bug this replaced — Garlemald-Server #46).
+fn quest_arg_to_id(v: &Value) -> Option<u32> {
+    match v {
+        Value::Integer(i) => Some(*i as u32),
+        Value::Number(n) => Some(*n as u32),
+        Value::UserData(ud) => ud.borrow_scoped::<LuaQuestHandle, _>(|q| q.quest_id).ok(),
+        _ => None,
+    }
+}
+
 /// Extract an actor_id from a Lua-side argument. Accepts a
 /// LuaActor / LuaNpc / LuaPlayer userdata (returns `.actorId`) or a
 /// raw integer (returns the integer truncated to u32). Anything else
@@ -100,6 +116,15 @@ pub struct LuaActor {
     /// enough for `allyGlobal.EngageTarget`-style consumers to
     /// re-extract the id and forward it to combat commands.
     pub target_actor_id: u32,
+    /// #46 escort R4a — HP snapshot surfaced to content scripts via
+    /// `actor:GetHP()` / `actor:GetMaxHP()` (the man0l1 escort's
+    /// onUpdate monitors Sisipu's HP for the "Sisipu hurt" bark +
+    /// the fail-the-duty-on-death beat). Refreshed each 500 ms tick
+    /// by `build_content_rosters` from the live `Character`; 0 for
+    /// synthetic stub LuaActors with no backing live actor (same
+    /// convention as `is_engaged` / `speed`).
+    pub hp: i16,
+    pub max_hp: i16,
 }
 
 impl UserData for LuaActor {
@@ -117,6 +142,13 @@ impl UserData for LuaActor {
         methods.add_method("IsDead", |_, this, _: ()| {
             Ok(this.state == crate::actor::MAIN_STATE_DEAD)
         });
+        // `GetHP()` / `GetMaxHP()` — HP snapshot, refreshed each content
+        // tick by `build_content_rosters` (see the `hp` field doc). The
+        // escort content script reads Sisipu's HP in onUpdate to drive
+        // the hurt-bark / duty-failure beats. Mirrors the LuaPlayer
+        // bindings of the same names. (#46 escort R4a.)
+        methods.add_method("GetHP", |_, this, _: ()| Ok(this.hp));
+        methods.add_method("GetMaxHP", |_, this, _: ()| Ok(this.max_hp));
         methods.add_method("GetPos", |_, this, _: ()| {
             Ok((
                 this.pos.0,
@@ -365,6 +397,8 @@ impl UserData for LuaActor {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 return lua.create_userdata(target).map(Value::UserData);
             }
@@ -2067,22 +2101,47 @@ impl UserData for LuaPlayer {
                 Ok(())
             },
         );
-        methods.add_method("CompleteQuest", |_, this, id: u32| {
+        // `player:CompleteQuest(quest-or-id)` / `player:AbandonQuest(...)`.
+        // Quest scripts pass either a raw id or the LuaQuestHandle
+        // userdata delivered to the hook (`player:CompleteQuest(quest)` —
+        // man0l1.lua:491 and ~20 siblings across the man/wld/etc trees).
+        // The previous `u32`-typed binding failed mlua conversion on the
+        // userdata form, which killed the hook coroutine mid-arm while
+        // its already-queued commands (dialogue, rewards, EndEvent) still
+        // drained — so the quest never completed and the turn-in repeated
+        // forever, re-awarding gil/EXP each time. (Garlemald-Server #46.)
+        methods.add_method("CompleteQuest", |_, this, v: Value| {
+            let Some(quest_id) = quest_arg_to_id(&v) else {
+                tracing::warn!(
+                    player = this.snapshot.actor_id,
+                    arg = ?v,
+                    "CompleteQuest: unresolvable quest argument dropped",
+                );
+                return Ok(());
+            };
             push(
                 &this.queue,
                 LuaCommand::CompleteQuest {
                     player_id: this.snapshot.actor_id,
-                    quest_id: id,
+                    quest_id,
                 },
             );
             Ok(())
         });
-        methods.add_method("AbandonQuest", |_, this, id: u32| {
+        methods.add_method("AbandonQuest", |_, this, v: Value| {
+            let Some(quest_id) = quest_arg_to_id(&v) else {
+                tracing::warn!(
+                    player = this.snapshot.actor_id,
+                    arg = ?v,
+                    "AbandonQuest: unresolvable quest argument dropped",
+                );
+                return Ok(());
+            };
             push(
                 &this.queue,
                 LuaCommand::AbandonQuest {
                     player_id: this.snapshot.actor_id,
-                    quest_id: id,
+                    quest_id,
                 },
             );
             Ok(())
@@ -3235,6 +3294,8 @@ impl UserData for LuaPlayer {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 return lua.create_userdata(target).map(Value::UserData);
             }
@@ -3478,6 +3539,8 @@ impl UserData for LuaZone {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 lua.create_userdata(actor)
             },
@@ -3834,6 +3897,8 @@ impl UserData for LuaContentArea {
                     is_engaged: false,
                     speed: 0.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 lua.create_userdata(actor)
             },
@@ -4114,6 +4179,8 @@ impl UserData for LuaWorldManager {
                     is_engaged: false,
                     speed: 5.0,
                     target_actor_id: 0,
+                    hp: 0,
+                    max_hp: 0,
                 };
                 lua.create_userdata(actor)
             },

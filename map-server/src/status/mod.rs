@@ -250,6 +250,18 @@ impl StatusEffect {
 /// 3-second regen/refresh cadence, matching the C#.
 pub const REGEN_TICK_MS: u64 = 3_000;
 
+/// Base out-of-combat pool deltas the game loop feeds into the 3 s regen
+/// tick (computed per-actor in `runtime::ticker::compute_passive_regen`).
+/// Summed with the owner's Regen/Refresh/Regain modifiers inside
+/// [`StatusEffectContainer::regen_tick`] so passive regen and
+/// status-effect regen share one cadence.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PassiveRegen {
+    pub hp: i32,
+    pub mp: i32,
+    pub tp: i32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatusEffectContainer {
     owner_actor_id: u32,
@@ -319,9 +331,15 @@ impl StatusEffectContainer {
     ///   regain/DoT deltas read from the owner's modifier map.
     /// * For each effect, call `update(now_ms)`; if it returns `true` the
     ///   effect is removed with its standard loss text id.
-    pub fn update(&mut self, now_ms: u64, mods: &ModifierMap, outbox: &mut StatusOutbox) {
+    pub fn update(
+        &mut self,
+        now_ms: u64,
+        mods: &ModifierMap,
+        passive: PassiveRegen,
+        outbox: &mut StatusOutbox,
+    ) {
         if now_ms.saturating_sub(self.last_regen_ms) >= REGEN_TICK_MS {
-            self.regen_tick(mods, outbox);
+            self.regen_tick(mods, passive, outbox);
             self.last_regen_ms = now_ms;
         }
 
@@ -346,12 +364,18 @@ impl StatusEffectContainer {
     }
 
     /// The regen portion of the tick. Reads Modifier::Regen / Refresh /
-    /// Regain / RegenDown and emits `HpTick` / `MpTick` / `TpTick` events.
-    pub fn regen_tick(&mut self, mods: &ModifierMap, outbox: &mut StatusOutbox) {
+    /// Regain / RegenDown, folds in the caller-supplied out-of-combat
+    /// base deltas, and emits `HpTick` / `MpTick` / `TpTick` events.
+    pub fn regen_tick(
+        &mut self,
+        mods: &ModifierMap,
+        passive: PassiveRegen,
+        outbox: &mut StatusOutbox,
+    ) {
         let dot = mods.get(Modifier::RegenDown) as i32;
-        let regen = mods.get(Modifier::Regen) as i32;
-        let refresh = mods.get(Modifier::Refresh) as i32;
-        let regain = mods.get(Modifier::Regain) as i32;
+        let regen = mods.get(Modifier::Regen) as i32 + passive.hp;
+        let refresh = mods.get(Modifier::Refresh) as i32 + passive.mp;
+        let regain = mods.get(Modifier::Regain) as i32 + passive.tp;
 
         // DoTs tick before regen so the full damage shows even if partially
         // absorbed by regen downstream.
@@ -762,10 +786,10 @@ mod tests {
         ob.drain();
 
         let mods = ModifierMap::default();
-        c.update(/* t= */ 500, &mods, &mut ob);
+        c.update(/* t= */ 500, &mods, PassiveRegen::default(), &mut ob);
         assert!(c.has(STATUS_STUN));
 
-        c.update(/* t= */ 2_000, &mods, &mut ob);
+        c.update(/* t= */ 2_000, &mods, PassiveRegen::default(), &mut ob);
         assert!(!c.has(STATUS_STUN));
     }
 
@@ -779,7 +803,7 @@ mod tests {
         mods.set(Modifier::RegenDown, 4.0);
         mods.set(Modifier::Regain, 100.0);
 
-        c.update(REGEN_TICK_MS, &mods, &mut ob);
+        c.update(REGEN_TICK_MS, &mods, PassiveRegen::default(), &mut ob);
         let events = ob.drain();
         assert!(
             events
@@ -816,7 +840,7 @@ mod tests {
         );
         // Stance effects never expire through the update path.
         let mods = ModifierMap::default();
-        c.update(1_000_000_000, &mods, &mut ob);
+        c.update(1_000_000_000, &mods, PassiveRegen::default(), &mut ob);
         assert!(c.has(STATUS_RAMPART));
     }
 

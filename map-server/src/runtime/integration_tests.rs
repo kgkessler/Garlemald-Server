@@ -2045,6 +2045,14 @@ async fn auto_attack_that_kills_flips_defender_to_dead() {
         let mut c = handle.character.write().await;
         c.ai_container.internal_engage(2, 0, 2500);
     }
+    // The victim under attack is in combat too — without an AttackState
+    // of its own the passive out-of-combat HP regen (2% of max per 3 s
+    // tick) would climb it off the 1-HP ledge faster than swings land.
+    {
+        let handle = registry.get(2).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.ai_container.internal_engage(1, 0, 2500);
+    }
 
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     // Tick forward past the swing timer enough times to guarantee a hit.
@@ -14727,6 +14735,285 @@ async fn hotbar_press_executes_fast_blade_with_costs_and_recast() {
 }
 
 // ---------------------------------------------------------------------------
+// #46 — sheathed-weapon combat leaks
+// ---------------------------------------------------------------------------
+
+/// Zone 100 with a player (id 1, session 42) and a wolf BattleNpc (id 2,
+/// 3 y away), registered client + session — the minimal 0x00CD /
+/// sheathe-flush scene. Mirrors the fast-blade hotbar scene above minus
+/// the Lua engine + battle-command catalog (neither path needs them).
+struct SheatheScene {
+    world: Arc<WorldManager>,
+    registry: Arc<ActorRegistry>,
+    db: Arc<crate::database::Database>,
+    processor: crate::processor::PacketProcessor,
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+async fn sheathe_scene() -> SheatheScene {
+    use crate::data::Session as MapSession;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let mut zone = Zone::new(
+        100,
+        "test",
+        1,
+        "/Area/Zone/Test",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 1,
+            kind: ActorKind::Player,
+            position: Vector3::ZERO,
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 2,
+            kind: ActorKind::BattleNpc,
+            position: Vector3::new(3.0, 0.0, 0.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    world.register_zone(zone).await;
+
+    let mut player = Character::new(1);
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.level = 1;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
+        .await;
+    let mut wolf = Character::new(2);
+    wolf.chara.hp = 500;
+    wolf.chara.max_hp = 500;
+    wolf.base.position_x = 3.0;
+    registry
+        .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, wolf))
+        .await;
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(512);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+    world
+        .upsert_session(MapSession {
+            id: 42,
+            current_zone_id: 100,
+            ..MapSession::default()
+        })
+        .await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+    SheatheScene {
+        world,
+        registry,
+        db,
+        processor,
+        rx,
+    }
+}
+
+/// #46 — sheathing mid-combat must flush the ai_container: the
+/// ActivateCommand sheathe burst (`ChangeState{PASSIVE}` from
+/// `player.Disengage(0x0000)`) previously only flipped the pose, so the
+/// engaged AttackState kept resolving swings forever while sheathed
+/// (live log 2026-07-04 01:12:12 → 01:13:12). The pre-pass consumes the
+/// ChangeState, clears states + hate + soft target, and the dispatcher's
+/// Disengage arm emits exactly one PASSIVE state trio.
+#[tokio::test]
+async fn sheathe_mid_combat_flushes_battle_states_and_stops_auto_attack() {
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+
+    let mut scene = sheathe_scene().await;
+    let handle = scene.registry.get(1).await.expect("player handle");
+
+    // Draw + engage via the 0x00CD path (stance ACTIVE).
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+    }
+    scene.processor.apply_player_set_target(42, 2, true).await;
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.is_engaged(),
+            "active-mode 0x00CD must engage"
+        );
+    }
+    let _ = parse_all_subpackets(&mut scene.rx); // drain the engage-side wire
+
+    // Sheathe: the exact burst `ActivateCommand.lua::player.Disengage`
+    // queues (userdata.rs Disengage binding).
+    let burst = vec![crate::lua::LuaCommandKind::ChangeState {
+        actor_id: 1,
+        main_state: crate::actor::MAIN_STATE_PASSIVE,
+    }];
+    let kept = scene.processor.flush_battle_states_on_sheathe(burst).await;
+    assert!(
+        kept.is_empty(),
+        "engaged sheathe consumes the ChangeState — the Disengage arm owns the trio",
+    );
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.state_stack().is_empty(),
+            "sheathe must flush every battle state (pmeteor InternalDisengage)",
+        );
+        assert_eq!(
+            c.base.current_main_state,
+            crate::actor::MAIN_STATE_PASSIVE,
+            "Disengage arm flips the stance to PASSIVE",
+        );
+        assert_eq!(
+            c.chara.current_target,
+            crate::actor::INVALID_ACTORID,
+            "sheathe drops the soft target (pmeteor ChangeTarget(null))",
+        );
+        assert!(c.hate.is_empty(), "sheathe clears the hate container");
+    }
+    let subs = parse_all_subpackets(&mut scene.rx);
+    let trios = subs
+        .iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_SET_ACTOR_STATE)
+        .count();
+    assert_eq!(trios, 1, "exactly one PASSIVE state trio on the wire");
+
+    // Post-sheathe ticks: the swing loop is dead — nothing re-arms, no
+    // TP banks, no damage lands.
+    let ticker = GameTicker::new(
+        TickerConfig::default(),
+        scene.world.clone(),
+        scene.registry.clone(),
+        scene.db.clone(),
+    );
+    let base = crate::runtime::clock::server_now_ms();
+    for i in 1..=3u64 {
+        ticker.tick_once(base + i * 2_600).await;
+    }
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.state_stack().is_empty(),
+            "no state re-armed after the sheathe",
+        );
+        assert_eq!(c.chara.tp, 0, "no TP banked after the sheathe");
+    }
+    let wolf = scene.registry.get(2).await.expect("wolf handle");
+    {
+        let c = wolf.character.read().await;
+        assert_eq!(c.chara.hp, 500, "no post-sheathe swing damage");
+    }
+}
+
+/// #46 — the 0x00CD SetTarget auto-attack engage is stance-gated: while
+/// PASSIVE (weapon sheathed) the engage is a silent drop that keeps the
+/// soft target + reticle broadcast (pmeteor PacketProcessor.cs:266-295
+/// sends no error on this path); the same press engages once ACTIVE.
+#[tokio::test]
+async fn set_target_auto_attack_gated_on_active_mode() {
+    let mut scene = sheathe_scene().await;
+    let handle = scene.registry.get(1).await.expect("player handle");
+
+    // PASSIVE (default): no engage, soft target + reticle preserved.
+    scene.processor.apply_player_set_target(42, 2, true).await;
+    {
+        let c = handle.character.read().await;
+        assert!(
+            !c.ai_container.is_engaged(),
+            "sheathed 0x00CD must not engage the swing loop",
+        );
+        assert!(
+            c.ai_container.state_stack().is_empty(),
+            "sheathed 0x00CD must not push any battle state",
+        );
+        assert_eq!(c.chara.current_target, 2, "soft target survives the gate");
+    }
+    let subs = parse_all_subpackets(&mut scene.rx);
+    assert!(
+        subs.iter().any(|s| s.game_message.opcode
+            == crate::packets::opcodes::OP_SET_ACTOR_TARGET_ANIMATED),
+        "reticle broadcast still goes out on the sheathed press",
+    );
+
+    // ACTIVE: the same press engages.
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+    }
+    scene.processor.apply_player_set_target(42, 2, true).await;
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.is_engaged(),
+            "active-mode 0x00CD must engage"
+        );
+    }
+}
+
+/// #46 — script-driven engagement bypasses the 0x00CD stance gate:
+/// `ActorEngage` (SEQ_005 tutorial wolves / escort allies via
+/// `apply_actor_engage`) must keep engaging a PASSIVE actor.
+#[tokio::test]
+async fn script_actor_engage_bypasses_stance_gate() {
+    let scene = sheathe_scene().await;
+    let handle = scene.registry.get(1).await.expect("player handle");
+    {
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.base.current_main_state,
+            crate::actor::MAIN_STATE_PASSIVE,
+            "scene starts sheathed",
+        );
+    }
+    let handled = crate::runtime::quest_apply::apply_runtime_lua_command(
+        crate::lua::LuaCommandKind::ActorEngage {
+            actor_id: 1,
+            target_actor_id: 2,
+        },
+        &scene.registry,
+        &scene.db,
+        &scene.world,
+        None,
+    )
+    .await;
+    assert!(handled, "ActorEngage must be a recognised runtime command");
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.is_engaged(),
+            "script ActorEngage must not be stance-gated (SEQ_005 / escort)",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #28 Phase 4 — kill gate + director rewrite + teardown (S4.1–S4.3)
 // ---------------------------------------------------------------------------
 
@@ -16156,6 +16443,335 @@ async fn send_instance_update_streams_walked_in_npc() {
     assert!(
         session.actor_instance_list.contains(&0x4000_0010),
         "the streamed NPC must be recorded in actor_instance_list",
+    );
+}
+
+/// Garlemald-Server #46 escort rendering — `send_instance_update` must
+/// stream CONTENT-band actors by proximity inside a content instance
+/// (pmeteor `Session.UpdateInstance` parity). Before this arm existed
+/// the function early-returned for content sessions and the man0l1
+/// escort's 8 ankle biters never received an AddActor — they fought
+/// invisibly and Sisipu died to an unrendered mob. Base-zone populace
+/// shares the parent zone's `core` pool but must stay hidden from the
+/// instance view (the pmeteor per-Area-pool emulation), so a nearby
+/// non-content-band NPC must NEVER stream.
+#[tokio::test]
+async fn send_instance_update_streams_content_instance_battlenpc() {
+    use crate::actor::Character;
+    use crate::data::{ActiveContentScript, ClientHandle, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    // Content-band ankle biter: composite id 4<<28 | zone 128<<19 |
+    // actor_number 0x4001A — bit 18 (0x40000, SpawnBattleNpcById's band)
+    // set. The deck-hand populace NPC uses a small actor_number (3),
+    // band bit clear.
+    const MOB_ID: u32 = 0x4404_001A;
+    const POPULACE_ID: u32 = 0x4400_0003;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let zone = Zone::new(
+        128,
+        "sea0Field01".to_string(),
+        101,
+        String::new(),
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(128).await.unwrap();
+
+    // Player, mid-escort in a same-zone content instance, post-warp
+    // zone-in already echoed (content_warp_acked).
+    let mut player = Character::new(1);
+    player.base.zone_id = 128;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 128, 1, player))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    let mut session = MapSession::new(1);
+    session.current_zone_id = 128;
+    session.active_content_script = Some(ActiveContentScript {
+        parent_zone_id: 128,
+        area_name: "man0l101".to_string(),
+        area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+        director_name: "SimpleContentMan0l101".to_string(),
+        director_actor_id: 0x5FF8_0002,
+        content_area_actor_id: 0x5FF8_0001,
+        content_script: "SimpleContentMan0l101".to_string(),
+        warp_complete: true,
+        spawned_actor_ids: vec![MOB_ID],
+    });
+    session.content_warp_acked = true;
+    world.upsert_session(session).await;
+
+    // The escort mob spawns 200u down the road; the base-zone populace
+    // NPC sits 10u away (in range, but not content-band).
+    let mut mob = Character::new(MOB_ID);
+    mob.base.zone_id = 128;
+    mob.chara.actor_class_id = 2_205_603; // ankle biter
+    mob.base.actor_name = "anklebiter".to_string();
+    registry
+        .insert(ActorHandle::new(
+            MOB_ID,
+            ActorKindTag::BattleNpc,
+            128,
+            0,
+            mob,
+        ))
+        .await;
+    let mut populace = Character::new(POPULACE_ID);
+    populace.base.zone_id = 128;
+    populace.chara.actor_class_id = 1_500_013;
+    populace.base.actor_name = "deckhand".to_string();
+    registry
+        .insert(ActorHandle::new(
+            POPULACE_ID,
+            ActorKindTag::Npc,
+            128,
+            0,
+            populace,
+        ))
+        .await;
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: MOB_ID,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::new(200.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: POPULACE_ID,
+                kind: ActorKind::Npc,
+                position: Vector3::new(10.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    // Tick 1 — the mob is out of INSTANCE_STREAM_RADIUS and the populace
+    // NPC is band-filtered: nothing streams.
+    world.send_instance_update(&registry, None, 1, 1).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "first tick must stream nothing (mob out of range, populace band-filtered)",
+    );
+    {
+        let session = world.session(1).await.unwrap();
+        assert!(
+            session.actor_instance_list.is_empty(),
+            "no actor may be recorded before anything streamed",
+        );
+    }
+
+    // The escort walks the player up the road to 40u of the mob.
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core
+            .update_actor_position(1, Vector3::new(160.0, 0.0, 0.0), &mut out);
+    }
+
+    // Tick 2 — the mob streams: exactly one AddActor, with the state
+    // tail (SetActorState + the 0x00CC ActorInstantiate ScriptBind) that
+    // actually renders it. The populace NPC still never streams.
+    world.send_instance_update(&registry, None, 1, 1).await;
+    let mut mob_add_actor = 0usize;
+    let mut mob_state = 0usize;
+    let mut mob_instantiate = 0usize;
+    let mut populace_packets = 0usize;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            if sub.header.source_id == POPULACE_ID {
+                populace_packets += 1;
+            }
+            if sub.header.source_id != MOB_ID {
+                continue;
+            }
+            match sub.game_message.opcode {
+                crate::packets::opcodes::OP_ADD_ACTOR => mob_add_actor += 1,
+                crate::packets::opcodes::OP_SET_ACTOR_STATE => mob_state += 1,
+                crate::packets::opcodes::OP_ACTOR_INSTANTIATE => mob_instantiate += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        mob_add_actor, 1,
+        "the walked-up content mob must receive exactly one AddActor",
+    );
+    assert!(
+        mob_state >= 1,
+        "the mob's spawn bundle must carry the SetActorState tail",
+    );
+    assert!(
+        mob_instantiate >= 1,
+        "the mob's spawn bundle must carry the 0x00CC ActorInstantiate",
+    );
+    assert_eq!(
+        populace_packets, 0,
+        "base-zone populace must stay invisible inside the content instance",
+    );
+    let session = world.session(1).await.unwrap();
+    assert!(
+        session.actor_instance_list.contains(&MOB_ID),
+        "the streamed content mob must be recorded in actor_instance_list",
+    );
+    assert!(
+        !session.actor_instance_list.contains(&POPULACE_ID),
+        "the band-filtered populace NPC must never be recorded",
+    );
+}
+
+/// Garlemald-Server #46 escort rendering, pre-ack case — a content
+/// session whose client has NOT yet echoed its post-warp zone-in
+/// (`content_warp_acked == false`) must stream NOTHING, even with a
+/// content-band mob in range: firing actor packets at a still-loading
+/// client crashes it (same gate as the content onUpdate driver,
+/// runtime/ticker.rs:372).
+#[tokio::test]
+async fn send_instance_update_streams_nothing_before_content_warp_ack() {
+    use crate::actor::Character;
+    use crate::data::{ActiveContentScript, ClientHandle, Session as MapSession};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::zone::area::{ActorKind, StoredActor};
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const MOB_ID: u32 = 0x4404_001A;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let zone = Zone::new(
+        128,
+        "sea0Field01".to_string(),
+        101,
+        String::new(),
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(128).await.unwrap();
+
+    let mut player = Character::new(1);
+    player.base.zone_id = 128;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 128, 1, player))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    let mut session = MapSession::new(1);
+    session.current_zone_id = 128;
+    session.active_content_script = Some(ActiveContentScript {
+        parent_zone_id: 128,
+        area_name: "man0l101".to_string(),
+        area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+        director_name: "SimpleContentMan0l101".to_string(),
+        director_actor_id: 0x5FF8_0002,
+        content_area_actor_id: 0x5FF8_0001,
+        content_script: "SimpleContentMan0l101".to_string(),
+        warp_complete: true,
+        spawned_actor_ids: vec![MOB_ID],
+    });
+    session.content_warp_acked = false; // client still on "Now loading…"
+    world.upsert_session(session).await;
+
+    let mut mob = Character::new(MOB_ID);
+    mob.base.zone_id = 128;
+    mob.chara.actor_class_id = 2_205_603; // ankle biter
+    mob.base.actor_name = "anklebiter".to_string();
+    registry
+        .insert(ActorHandle::new(
+            MOB_ID,
+            ActorKindTag::BattleNpc,
+            128,
+            0,
+            mob,
+        ))
+        .await;
+    {
+        let mut z = zone_arc.write().await;
+        let mut out = AreaOutbox::new();
+        z.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::new(0.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+        z.core.add_actor(
+            StoredActor {
+                actor_id: MOB_ID,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::new(40.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut out,
+        );
+    }
+
+    world.send_instance_update(&registry, None, 1, 1).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing may stream before the client acks the content warp",
+    );
+    let session = world.session(1).await.unwrap();
+    assert!(
+        session.actor_instance_list.is_empty(),
+        "no actor may be recorded before the content warp ack",
     );
 }
 

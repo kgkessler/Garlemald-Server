@@ -83,6 +83,22 @@ pub const BNPC_DEFAULT_RESPAWN_SECS: u32 = 30;
 /// still nearby. pmeteor's DeathState despawn timer is 10s.
 pub const CORPSE_DESPAWN_SECS: u32 = 10;
 
+/// Out-of-combat TP decay per 3 s regen tick, toward 0. pmeteor
+/// Modifier.cs:178 (`Regain = 127, //TP regen, should be -90 out of
+/// combat`) is the only numeric era source; pmeteor never wires the
+/// base value, so the ticker supplies it here.
+pub const OUT_OF_COMBAT_TP_DECAY_PER_TICK: i32 = 90;
+/// Out-of-combat HP regen while the weapon is sheathed
+/// (`MAIN_STATE_PASSIVE`), as % of max HP per 3 s regen tick.
+/// UNATTESTED: no local 1.x source (wikis / Discord / pmeteor) records
+/// the passive rate — only that sheathed heals faster than drawn.
+/// Tunable; 2%/tick ≈ 2.5 min zero-to-full sheathed.
+pub const PASSIVE_MODE_HP_REGEN_PERCENT: i32 = 2;
+/// Out-of-combat HP regen with the weapon drawn but disengaged, as % of
+/// max HP per 3 s regen tick. Same unattested/tunable caveat as
+/// [`PASSIVE_MODE_HP_REGEN_PERCENT`].
+pub const ACTIVE_MODE_HP_REGEN_PERCENT: i32 = 1;
+
 /// Per-actor death-state tick decision. Returned from the read-lock
 /// scan inside `tick_zone` so the follow-up write lock + dispatcher
 /// call happens after the read lock is released.
@@ -783,6 +799,10 @@ pub(crate) async fn build_content_rosters(
                         .map(|s| s.target_actor_id)
                         .filter(|id| *id != 0)
                         .unwrap_or(0),
+                    // #46 escort R4a — live HP for `actor:GetHP()` /
+                    // `GetMaxHP()` (escort onUpdate monitors Sisipu).
+                    hp: c.chara.hp,
+                    max_hp: c.chara.max_hp,
                 };
                 // Ally if the registered kind says so OR the BattleNpc
                 // was spawned with allegiance==1 (we can't read that
@@ -931,7 +951,45 @@ fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
     // Clone the ModifierMap so we can hand it in without aliasing — the
     // underlying HashMap is small enough that this is essentially free.
     let mods_snapshot: ModifierMap = chara.chara.mods.clone();
-    chara.status_effects.update(now_ms, &mods_snapshot, outbox);
+    let passive = compute_passive_regen(chara);
+    chara
+        .status_effects
+        .update(now_ms, &mods_snapshot, passive, outbox);
+}
+
+/// Base out-of-combat pool deltas fed into the 3 s regen tick alongside
+/// the Regen/Refresh/Regain status modifiers. Era rules:
+///
+///   * HP auto-regens while disengaged; sheathed (`MAIN_STATE_PASSIVE`)
+///     heals faster than drawn — rates are the tunable
+///     `*_MODE_HP_REGEN_PERCENT` constants above (min 1 HP/tick).
+///   * MP has NO natural out-of-combat regen in 1.x — anima is the only
+///     documented passive regen in 1.0; MP came from aetherytes,
+///     abilities, and Refresh effects.
+///   * TP decays toward 0 out of combat (pmeteor Modifier.cs:178).
+///
+/// Corpses and engaged actors get nothing here — their pools move only
+/// through the status-effect modifiers `regen_tick` reads separately.
+fn compute_passive_regen(chara: &Character) -> crate::status::PassiveRegen {
+    if chara.base.current_main_state == crate::actor::MAIN_STATE_DEAD
+        || !chara.is_alive()
+        || chara.ai_container.is_engaged()
+    {
+        return crate::status::PassiveRegen::default();
+    }
+    let max_hp = chara.chara.max_hp as i32;
+    let pct = if chara.base.current_main_state == crate::actor::MAIN_STATE_PASSIVE {
+        PASSIVE_MODE_HP_REGEN_PERCENT
+    } else {
+        ACTIVE_MODE_HP_REGEN_PERCENT
+    };
+    let hp = if (chara.chara.hp as i32) < max_hp {
+        (max_hp * pct / 100).max(1)
+    } else {
+        0
+    };
+    let tp = -OUT_OF_COMBAT_TP_DECAY_PER_TICK.min(chara.chara.tp as i32);
+    crate::status::PassiveRegen { hp, mp: 0, tp }
 }
 
 pub(crate) fn build_owner_view(
@@ -1106,6 +1164,171 @@ mod tests {
         );
     }
 
+    /// Like `setup_one_zone_one_actor` but with no Regen modifier and
+    /// caller-set pools — isolates the passive out-of-combat leg from
+    /// the status-effect-modifier leg.
+    async fn setup_one_zone_plain_actor(hp: i16, max_hp: i16, tp: u16) -> GameTicker {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let db = Arc::new(Database::open(tempdb()).await.expect("database stub"));
+
+        let mut zone = Zone::new(
+            100,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+
+        let mut character = Character::new(1);
+        character.chara.hp = hp;
+        character.chara.max_hp = max_hp;
+        character.chara.tp = tp;
+        registry
+            .insert(ActorHandle::new(
+                1,
+                ActorKindTag::BattleNpc,
+                100,
+                0,
+                character,
+            ))
+            .await;
+
+        GameTicker::new(TickerConfig::default(), world, registry, db)
+    }
+
+    /// Out-of-combat TP decays `OUT_OF_COMBAT_TP_DECAY_PER_TICK` per 3 s
+    /// tick, lands on exactly 0, and never goes negative (pmeteor
+    /// Modifier.cs:178 — "should be -90 out of combat").
+    #[tokio::test]
+    async fn tp_decays_90_per_tick_to_zero_out_of_combat() {
+        let ticker = setup_one_zone_plain_actor(1000, 1000, 200).await;
+        let handle = ticker.registry.get(1).await.unwrap();
+
+        ticker.tick_once(3_000).await;
+        assert_eq!(handle.character.read().await.chara.tp, 110);
+
+        ticker.tick_once(6_000).await;
+        assert_eq!(handle.character.read().await.chara.tp, 20);
+
+        // The last partial step clamps to exactly 0…
+        ticker.tick_once(9_000).await;
+        assert_eq!(handle.character.read().await.chara.tp, 0);
+
+        // …and an empty pool stays put.
+        ticker.tick_once(12_000).await;
+        assert_eq!(handle.character.read().await.chara.tp, 0);
+    }
+
+    /// The SEQ_005 tutorial's `MinimumTpLock` floor holds under the
+    /// out-of-combat decay (`Character::add_tp` clamps at the lock).
+    #[tokio::test]
+    async fn minimum_tp_lock_floors_out_of_combat_decay() {
+        let ticker = setup_one_zone_plain_actor(1000, 1000, 1050).await;
+        let handle = ticker.registry.get(1).await.unwrap();
+        {
+            let mut c = handle.character.write().await;
+            c.chara
+                .mods
+                .set(crate::actor::modifier::Modifier::MinimumTpLock, 1000.0);
+        }
+
+        ticker.tick_once(3_000).await;
+        assert_eq!(handle.character.read().await.chara.tp, 1000);
+        ticker.tick_once(6_000).await;
+        assert_eq!(handle.character.read().await.chara.tp, 1000);
+    }
+
+    /// Out-of-combat HP fills at the stance-dependent tunable rates:
+    /// 2% of max sheathed (MAIN_STATE_PASSIVE), 1% drawn-but-disengaged.
+    #[tokio::test]
+    async fn hp_regens_at_stance_rate_out_of_combat() {
+        let ticker = setup_one_zone_plain_actor(500, 1000, 0).await;
+        let handle = ticker.registry.get(1).await.unwrap();
+
+        // Sheathed (Character::new defaults to MAIN_STATE_PASSIVE).
+        ticker.tick_once(3_000).await;
+        assert_eq!(handle.character.read().await.chara.hp, 520);
+
+        // Drawn but disengaged.
+        {
+            let mut c = handle.character.write().await;
+            c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+        }
+        ticker.tick_once(6_000).await;
+        assert_eq!(handle.character.read().await.chara.hp, 530);
+    }
+
+    /// 1.x has no natural out-of-combat MP regen — the pool must not
+    /// move across regen ticks without a Refresh effect.
+    #[tokio::test]
+    async fn mp_never_regens_out_of_combat() {
+        let ticker = setup_one_zone_plain_actor(1000, 1000, 0).await;
+        let handle = ticker.registry.get(1).await.unwrap();
+        {
+            let mut c = handle.character.write().await;
+            c.chara.max_mp = 500;
+            c.chara.mp = 100;
+        }
+
+        ticker.tick_once(3_000).await;
+        ticker.tick_once(6_000).await;
+        assert_eq!(handle.character.read().await.chara.mp, 100);
+    }
+
+    /// The passive-regen gates: engaged and dead actors get no base
+    /// deltas (their pools only move via status-effect modifiers).
+    #[test]
+    fn passive_regen_gates_engaged_and_dead() {
+        let mut c = Character::new(1);
+        c.chara.max_hp = 1000;
+        c.chara.hp = 1000;
+        c.chara.tp = 3000;
+
+        // Full HP: no HP delta, TP still decays.
+        let p = compute_passive_regen(&c);
+        assert_eq!((p.hp, p.mp, p.tp), (0, 0, -90));
+
+        // Damaged + disengaged + sheathed: 2% of max, MP untouched.
+        c.chara.hp = 500;
+        let p = compute_passive_regen(&c);
+        assert_eq!((p.hp, p.mp, p.tp), (20, 0, -90));
+
+        // Engaged: nothing at all.
+        c.ai_container.internal_engage(2, 0, 2500);
+        let p = compute_passive_regen(&c);
+        assert_eq!((p.hp, p.mp, p.tp), (0, 0, 0));
+
+        // Dead: nothing at all.
+        let mut dead = Character::new(2);
+        dead.chara.max_hp = 1000;
+        dead.chara.hp = 0;
+        dead.chara.tp = 500;
+        dead.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+        let p = compute_passive_regen(&dead);
+        assert_eq!((p.hp, p.mp, p.tp), (0, 0, 0));
+    }
+
     /// Set up one zone with one Player (id=1) and one passive BattleNpc
     /// (id=2). The NPC has no controller so it won't retaliate. Shared by
     /// the auto-attack / cast-resolution tests below.
@@ -1183,6 +1406,15 @@ mod tests {
             let handle = ticker.registry.get(1).await.unwrap();
             let mut chara = handle.character.write().await;
             chara.ai_container.internal_engage(2, 0, 2500);
+        }
+        // Engage the defender too: the harness NPC has no controller to
+        // engage itself, and a disengaged defender would passively regen
+        // between swings (compute_passive_regen), racing the damage this
+        // test asserts on.
+        {
+            let handle = ticker.registry.get(2).await.unwrap();
+            let mut chara = handle.character.write().await;
+            chara.ai_container.internal_engage(1, 0, 2500);
         }
 
         let npc_handle = ticker.registry.get(2).await.unwrap();
@@ -1583,6 +1815,16 @@ mod tests {
             ctrl.battle.is_caster = true;
             ctrl.battle.spell = Some(spell);
             ctrl.auto_attack_enabled = false;
+        }
+
+        // The player under attack is in combat — engage them on the
+        // caster (out of melee range at 10 y, so no swings back) so the
+        // passive out-of-combat HP regen (compute_passive_regen) doesn't
+        // heal the thunder damage back before the assertion below.
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let mut c = handle.character.write().await;
+            c.ai_container.internal_engage(2, 0, 2500);
         }
 
         let player_initial_hp = {

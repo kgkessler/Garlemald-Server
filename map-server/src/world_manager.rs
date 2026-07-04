@@ -494,6 +494,18 @@ pub fn build_retainer_spawn_bundle(
 /// neighbour scan uses the same figure.
 pub(crate) const INSTANCE_STREAM_RADIUS: f32 = 50.0;
 
+/// Actor-number bit that marks a content-script-spawned actor.
+/// Content spawn appliers set bit 18 in the composite actor id
+/// (`SpawnBattleNpcById` = 0x40000|id, `SpawnActor` = 0x60000|suffix)
+/// while base-zone populace use small actor-numbers (1, 2, 3, …).
+/// garlemald keeps ALL actors in the parent zone's single `core` pool
+/// (see the project_garlemald_seq005_b1 note — a separate pool empties
+/// the combat-AI arena), so this bit is how the wire-side fan-outs
+/// (`send_zone_in_bundle`'s keep-predicate, `send_instance_update`'s
+/// content arm) emulate pmeteor's per-Area actor pool: inside a content
+/// instance only content-band actors are streamed. (Garlemald #28/#46.)
+pub(crate) const CONTENT_ACTOR_BAND_BIT: u32 = 0x0004_0000;
+
 /// `0x00CE SetActorPosition` spawn_type that makes the 1.23b client
 /// complete zone-in INSTANTLY: a 0x00CE carrying 0x16 (with
 /// `isZoningPlayer = 0`) makes the client treat the arrival as
@@ -1711,90 +1723,6 @@ impl WorldManager {
         Ok(())
     }
 
-    /// Stream a set of already-spawned content NPCs into one player's view
-    /// via the proven `push_npc_spawn` path (the exact builder
-    /// `send_zone_in_bundle` uses for neighbours — full ActorInstantiate +
-    /// appearance/name/state tail that actually RENDERS), sent DIRECTLY to the
-    /// player's client (target-tagged), independent of the spatial grid.
-    ///
-    /// Used by the man0l1 escort's post-warp content reveal: the escort NPCs
-    /// (Sisipu + ankle biters) are kept out of the warp bundle and revealed
-    /// here once the client has zoned back in from the entry cutscene, so they
-    /// stream in AFTER the player (matching retail). Replaces
-    /// `spawn_bundle_fanout`, whose `build_add_actor(flag 0)` grid-broadcast
-    /// never rendered them. (Garlemald-Server #46.)
-    pub async fn reveal_content_npcs(
-        &self,
-        registry: &ActorRegistry,
-        lua: Option<&Arc<crate::lua::LuaEngine>>,
-        session_id: u32,
-        npc_ids: &[u32],
-    ) {
-        let Some(client) = self.client(session_id).await else {
-            return;
-        };
-        let Some(player_handle) = registry.by_session(session_id).await else {
-            return;
-        };
-        let zone_id = { player_handle.character.read().await.base.zone_id };
-        let Some(zone_arc) = self.zone(zone_id).await else {
-            return;
-        };
-        let zone_name = { zone_arc.read().await.core.zone_name.clone() };
-        // Quest-ENPC overlay snapshot — a revealed content NPC that is
-        // also a current quest ENPC must arrive with the quest's
-        // talk/emote/push enables + quest graphic, same as the zone-in
-        // and streaming spawn paths. (#46.)
-        let quest_overrides = quest_enpc_overrides(&*player_handle.character.read().await);
-        let mut revealed: Vec<u32> = Vec::new();
-        for &npc_id in npc_ids {
-            let Some(handle) = registry.get(npc_id).await else {
-                continue;
-            };
-            let mut npc_bundle = Vec::new();
-            {
-                let character = handle.character.read().await;
-                let enpc_override = quest_overrides.get(&character.chara.actor_class_id);
-                push_npc_spawn(
-                    &mut npc_bundle,
-                    &character,
-                    &zone_name,
-                    /* priv_level */ 0,
-                    /* in_private_area */ false,
-                    lua,
-                    Some(handle.kind),
-                    enpc_override.map(|e| e.is_push_enabled),
-                );
-                if let Some(enpc) = enpc_override {
-                    push_quest_enpc_overlay(
-                        &mut npc_bundle,
-                        npc_id,
-                        &character.base.event_conditions,
-                        enpc,
-                    );
-                }
-            }
-            for mut sub in npc_bundle {
-                sub.set_target_id(session_id);
-                client.send_bytes(sub.to_bytes()).await;
-            }
-            revealed.push(npc_id);
-        }
-        // Mark them present so the continuous `send_instance_update` streaming
-        // doesn't re-AddActor them on the first walk-tick.
-        if !revealed.is_empty() {
-            let mut sessions = self.sessions.write().await;
-            if let Some(s) = sessions.get_mut(&session_id) {
-                s.actor_instance_list.extend(revealed.iter().copied());
-            }
-        }
-        tracing::info!(
-            session = session_id,
-            count = revealed.len(),
-            "content NPCs revealed to player via push_npc_spawn (direct send)",
-        );
-    }
-
     /// Port of `Player.SendZoneInPackets(world, spawnType)`. This is the
     /// bundle the client waits on before leaving "Now loading…": zoning
     /// clear, music/weather/map, the player's self-spawn, an empty
@@ -2690,7 +2618,6 @@ impl WorldManager {
             .active_content_script
             .as_ref()
             .is_some_and(|active| session.current_zone_id == active.parent_zone_id);
-        const CONTENT_ACTOR_BAND_BIT: u32 = 0x0004_0000;
         // Third element: `Some(zone_name)` when the actor lives in a
         // seamless PARTNER zone (its generated actor name must embed the
         // partner's zone abbreviation, not the primary's); `None` for
@@ -2761,14 +2688,18 @@ impl WorldManager {
                         //    bundle must be the player's reload ONLY, because
                         //    bundling the content NPC spawns into the same
                         //    flush as the order-machine reload crashes the
-                        //    client. They're revealed in a separate flush on
-                        //    the client's post-warp zone-in echo (RX 0x0007 →
-                        //    `content_warp_acked`; see the handler's
-                        //    reveal_content_npcs). Every OTHER content warp
-                        //    (man0l0 deck tutorial, man0g0 SEQ_005 — spawnType
-                        //    0x10) does a real scene reload behind the 0x00E2
-                        //    latch and expects its content NPCs IN the bundle,
-                        //    the original pre-#46 behaviour.
+                        //    client. Mid-duty streaming is owned by
+                        //    `send_instance_update`'s content arm: once the
+                        //    client echoes its post-warp zone-in (RX 0x0007 →
+                        //    `content_warp_acked`) the continuous proximity
+                        //    scan AddActors each content NPC as the player
+                        //    closes within INSTANCE_STREAM_RADIUS (pmeteor
+                        //    Session.UpdateInstance parity). Every OTHER
+                        //    content warp (man0l0 deck tutorial, man0g0
+                        //    SEQ_005 — spawnType 0x10) does a real scene
+                        //    reload behind the 0x00E2 latch and expects its
+                        //    content NPCs IN the bundle, the original pre-#46
+                        //    behaviour.
                         //
                         // Players are always kept. (Garlemald #46.)
                         !in_content_instance
@@ -3744,9 +3675,16 @@ impl WorldManager {
     /// actors linger client-side, which is benign at 1.x zone scale.
     /// Despawn-on-distance is a follow-up.
     ///
-    /// Scoped to ROOT-zone walking: private-area instances get their
-    /// full population at zone-in (no radius scan) and content instances
-    /// are bounded + AI-managed, so both are skipped here.
+    /// Private-area instances get their full population at zone-in (no
+    /// radius scan) and are skipped here. Content instances DO stream:
+    /// they are the only path that renders content NPCs the warp bundle
+    /// deferred (the man0l1 0x16 escort keeps its bundle to the player's
+    /// reload only) — without it the escort's 8 ankle biters never
+    /// receive an AddActor and fight invisibly (wire-proven: Sisipu died
+    /// to an unrendered mob). Safe by construction: INSTANCE_STREAM_RADIUS
+    /// (50) exceeds the escort's ENGAGE_RADIUS (18) + PLAYER_LEASH (15)
+    /// and the controller's MAX_DETECT_DISTANCE (20), so a mob always
+    /// renders before it can reach or aggro the player. (#46.)
     pub async fn send_instance_update(
         &self,
         registry: &crate::runtime::actor_registry::ActorRegistry,
@@ -3757,16 +3695,20 @@ impl WorldManager {
         let Some(session) = self.session(session_id).await else {
             return;
         };
-        // Skip private-area + content-instance routing (full / bounded
-        // populations handled elsewhere).
+        // Skip private-area routing (full population shipped at zone-in).
         if session.current_private_area_name.is_some() {
             return;
         }
-        if session
+        // Content-instance sessions stream too — but only once the client
+        // has finished loading into the instance (it echoed its post-warp
+        // zone-in, RX 0x0007 → `content_warp_acked`). Same gate as the
+        // content onUpdate driver (runtime/ticker.rs:372): firing actor
+        // packets at a still-loading client crashes it. (#46.)
+        let in_content_instance = session
             .active_content_script
             .as_ref()
-            .is_some_and(|a| session.current_zone_id == a.parent_zone_id)
-        {
+            .is_some_and(|a| session.current_zone_id == a.parent_zone_id);
+        if in_content_instance && !session.content_warp_acked {
             return;
         }
         let Some(zone_arc) = self.zone(session.current_zone_id).await else {
@@ -3800,6 +3742,15 @@ impl WorldManager {
                             | crate::zone::area::ActorKind::Ally
                     )
                 })
+                // Inside a content instance stream ONLY content-band
+                // actors — the same pmeteor per-Area-pool emulation as
+                // `send_zone_in_bundle`'s keep-predicate (base-zone
+                // populace shares the zone `core` but must stay invisible
+                // to the instance view). The bundle's 0x16 /
+                // `content_warp_acked` deferral needs no mirroring here:
+                // this whole function is already gated on
+                // `content_warp_acked` above. (#46.)
+                .filter(|a| !in_content_instance || (a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0)
                 .map(|a| a.actor_id)
                 .filter(|id| !session.actor_instance_list.contains(id))
                 .collect();
@@ -3828,7 +3779,11 @@ impl WorldManager {
         // previously streamed only after a full primary-zone flip.
         // Deriving the partner set from the boundary table streams them
         // wherever the player stands. (#46 / Drowning Wench.)
-        if let Some(pos) = player_position {
+        // Root-zone walking only — a content instance hides base
+        // populace, so partner-zone actors (which are always base
+        // populace) must not leak in either; mirrors the bundle's
+        // seamless-scan guard. (#46.)
+        if !in_content_instance && let Some(pos) = player_position {
             for (partner_id, _kind, partner_zone_name) in self
                 .partner_zone_actors_around(region_id, session.current_zone_id, pos)
                 .await

@@ -1321,20 +1321,46 @@ impl PacketProcessor {
                     })
                     .collect();
                 if let Some(mut snap) = self.world.session(handle.session_id).await {
-                    snap.pending_kick_event = Some(crate::data::PendingKickEvent {
+                    let kick = crate::data::PendingKickEvent {
                         trigger_actor_id: player_id,
                         owner_actor_id: actor_id,
                         event_name: trigger.clone(),
                         args: lua_params,
-                    });
-                    self.world.upsert_session(snap).await;
+                    };
+                    // #46 escort R1 — a kick captured AFTER the content
+                    // warp already emitted its wipe pair in the same
+                    // login-scoped burst (`reload_in_flight` set, client
+                    // ack outstanding) has NO safe emitter left this
+                    // drain: the zone-in bundle already flushed, and a
+                    // bundle-end emission would ride AFTER
+                    // DeleteAllActors — the wire-proven client-side drop
+                    // (session 53943). Park it on the content slot; the
+                    // client's RX 0x0007 content-warp ack releases it
+                    // (`handle_zone_in_complete`). Kicks captured BEFORE
+                    // any warp in the burst (the Baderon SEQ_003 staging,
+                    // the SEQ_005 doExitDoor burst) see
+                    // `reload_in_flight == false` and keep the proven
+                    // `pending_kick_event` route unchanged.
+                    if snap.reload_in_flight {
+                        snap.pending_content_kick_event = Some(kick);
+                        self.world.upsert_session(snap).await;
+                        tracing::info!(
+                            player = player_id,
+                            target = actor_id,
+                            %trigger,
+                            "KickEvent parked until content-warp zone-in ack (RX 0x0007 — reload in flight)"
+                        );
+                    } else {
+                        snap.pending_kick_event = Some(kick);
+                        self.world.upsert_session(snap).await;
+                        tracing::info!(
+                            player = player_id,
+                            target = actor_id,
+                            %trigger,
+                            "KickEvent captured (will emit at end of zone-in bundle, after all spawns)"
+                        );
+                    }
                 }
-                tracing::info!(
-                    player = player_id,
-                    target = actor_id,
-                    %trigger,
-                    "KickEvent captured (will emit at end of zone-in bundle, after all spawns)"
-                );
             }
             LC::AddQuest {
                 player_id,
@@ -2278,6 +2304,17 @@ impl PacketProcessor {
                 // land; consumed by the ContentFinished teardown.
                 spawned_actor_ids: Vec::new(),
             });
+            // Re-arm the content-warp ack gate for THIS instance. The
+            // field doc always promised "reset to false when a new
+            // content warp dispatches" but no code performed it, so a
+            // RETRY entry (escort duty failed → SEQ_048 rollback →
+            // Zephyr push again) inherited the previous instance's
+            // `true`: the ticker's onUpdate driver ran during the
+            // pre-warp window (driving escort NPCs at a client
+            // mid-transition) and the pre-ack KickEvent park window
+            // never opened. First-time flows are unchanged (the flag
+            // is already false). (#46 escort R1.)
+            snap.content_warp_acked = false;
             self.world.upsert_session(snap).await;
         }
 
@@ -3369,6 +3406,32 @@ impl PacketProcessor {
         // pre-emit.
         if emitted_pre_warp_kick && let Some(mut snap) = self.world.session(session_id).await {
             snap.pending_kick_event = None;
+            self.world.upsert_session(snap).await;
+        }
+
+        // #46 escort R1 — any pending kick the pre-warp branch did NOT
+        // consume (owner ≠ this content director, or no active content
+        // script) must not fall through to `send_zone_in_bundle`'s
+        // end-of-bundle emission: on the CONTENT warp path that emission
+        // lands AFTER DeleteAllActors in the same flush, and the client
+        // silently drops a 0x012F whose owner it just wiped (wire-proven,
+        // session 53943 — the director's onEventStarted never ran and the
+        // escort duty could never complete). Move it to the post-ack slot;
+        // the client's RX 0x0007 zone-in-complete releases it, by which
+        // point the director actor rode the zone-in bundle and is
+        // client-known. Login/normal-warp bundles are NOT affected — this
+        // move happens only on the content-warp emitter.
+        if !emitted_pre_warp_kick
+            && let Some(mut snap) = self.world.session(session_id).await
+            && let Some(kick) = snap.pending_kick_event.take()
+        {
+            tracing::info!(
+                player = player_id,
+                owner = format!("0x{:08X}", kick.owner_actor_id),
+                event = %kick.event_name,
+                "DoZoneChangeContent: pending kick re-parked for post-ack emission (RX 0x0007)"
+            );
+            snap.pending_content_kick_event = Some(kick);
             self.world.upsert_session(snap).await;
         }
 
@@ -6901,12 +6964,33 @@ impl PacketProcessor {
     }
 
     /// `player:CompleteQuest(id)` — fire `onFinish(player, quest, true)`
-    /// first so the script sees the quest still in-journal, then remove
-    /// the scenario row and set the completion bit.
+    /// first so the script sees the quest still in-journal, then land
+    /// the shared completion core (journal/DB teardown, journal
+    /// wire-clear, 25086 toast, ENPC "!" clears) via
+    /// [`crate::runtime::quest_apply::finish_complete_quest`] — one body
+    /// for both drain paths so the login-scoped and live-talk turn-ins
+    /// can't drift. (Garlemald-Server #46.)
     async fn apply_complete_quest(&self, player_id: u32, quest_id: u32) {
         let Some(handle) = self.registry.get(player_id).await else {
             return;
         };
+        // Idempotence guard — pmeteor Player.cs:1804 `if (HasQuest(id))`:
+        // a completed quest's turn-in must never re-fire (double-click,
+        // replayed drain, script re-call after completion) — no second
+        // onFinish, no repeat toast / DB writes. (Garlemald-Server #46 —
+        // Treasures of the Main infinite gil/EXP turn-in.)
+        let in_journal = {
+            let c = handle.character.read().await;
+            c.quest_journal.has(quest_id)
+        };
+        if !in_journal {
+            tracing::debug!(
+                player = player_id,
+                quest = quest_id,
+                "CompleteQuest skipped — quest not in journal",
+            );
+            return;
+        }
         // Fire onFinish before we tear the quest down so the hook can still
         // read `quest:GetData()` counters / flags via its snapshot.
         self.fire_quest_hook(
@@ -6916,56 +7000,15 @@ impl PacketProcessor {
             vec![crate::lua::QuestHookArg::Bool(true)],
         )
         .await;
-
-        let removed_slot = {
-            let mut c = handle.character.write().await;
-            let slot = c.quest_journal.slot_of(quest_id);
-            c.quest_journal.complete(quest_id);
-            slot.map(|s| s as i32)
-        };
-        if let Some(slot) = removed_slot
-            && let Err(e) = self.db.remove_quest(player_id, quest_id).await
-        {
-            tracing::warn!(
-                error = %e,
-                player = player_id,
-                quest = quest_id,
-                slot,
-                "CompleteQuest: scenario-row delete failed",
-            );
-        }
-        if let Err(e) = self.db.complete_quest(player_id, quest_id).await {
-            tracing::warn!(
-                error = %e,
-                player = player_id,
-                quest = quest_id,
-                "CompleteQuest: bitstream save failed",
-            );
-        }
-        tracing::info!(
-            player = player_id,
-            quest = quest_id,
-            "CompleteQuest applied",
-        );
-
-        // Fan out the canonical "<Quest> complete!" toast.
-        // Mirror C# `Quest.OnComplete`'s
-        // `SendGameMessage(WorldMaster, 25086, 0x20, GetQuestId())`.
-        if let Some(client) = self.world.client(handle.session_id).await {
-            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                // Header source = WorldMaster (the client dispatches by
-                // header source; it must be an always-present static
-                // actor, never the player — Garlemald-Server #28 crash RCA).
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                /* text_id */ 25086,
-                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                &[common::luaparam::LuaParam::UInt32(quest_id)],
-                /* prefer_alt */ false,
-            );
-            pkt.set_target_id(handle.session_id);
-            client.send_bytes(pkt.to_bytes()).await;
-        }
+        crate::runtime::quest_apply::finish_complete_quest(
+            &handle,
+            player_id,
+            quest_id,
+            &self.registry,
+            &self.db,
+            &self.world,
+        )
+        .await;
     }
 
     /// `player:AbandonQuest(id)` / `player:RemoveQuest(id)` — drop the
@@ -7134,7 +7177,10 @@ impl PacketProcessor {
             }
         };
         if let Some(e) = result.error {
-            tracing::debug!(
+            // warn (not debug): an argument-shape mismatch killing a hook
+            // mid-arm while its queued commands still apply was invisible
+            // at debug level — the #46 infinite-turn-in root cause.
+            tracing::warn!(
                 error = %e,
                 quest = quest_id,
                 hook = hook_name,
@@ -7248,7 +7294,8 @@ impl PacketProcessor {
             }
         };
         if let Some(e) = result.error {
-            tracing::debug!(
+            // warn — same tripwire rationale as `fire_quest_hook` (#46).
+            tracing::warn!(
                 error = %e,
                 quest = quest_id,
                 hook = hook_name,
@@ -8231,6 +8278,18 @@ impl PacketProcessor {
         cmds: Vec<crate::lua::command::LuaCommand>,
     ) {
         if Self::is_login_scoped_burst(&cmds) {
+            // #46 escort R2 — enforce the EndEvent-before-warp wire
+            // invariant on THIS path too. The shared event-script drain
+            // below already hoists via `hoist_end_events_before_warps`,
+            // but login-scoped bursts bypassed it — so a script tail of
+            // `DoZoneChangeContent(...)` → `player:EndEvent()` (the
+            // startMan0l1Content escort shape, session 53943) shipped
+            // 0x00E2 → 0x0131 and the EndEvent landed inside the
+            // client's Now-Loading window, losing the `_onPostEvent`
+            // teardown (desktopWidgetMode-16 menu mask). The hoister's
+            // `warp_family_player` matcher includes `DoZoneChangeContent`,
+            // so the same reorder covers the content warp.
+            let cmds = crate::runtime::quest_apply::hoist_end_events_before_warps(cmds);
             for cmd in cmds {
                 Box::pin(self.apply_login_lua_command(handle, cmd)).await;
             }
@@ -8423,7 +8482,82 @@ impl PacketProcessor {
                 "command onEventStarted fired",
             );
         }
-        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+        let commands = self.flush_battle_states_on_sheathe(partial.commands).await;
+        Box::pin(self.apply_event_script_commands(handle, commands)).await;
+    }
+
+    /// Sheathe-side battle flush — pmeteor `AIContainer.InternalDisengage`
+    /// (AIContainer.cs:351-363). `commands/ActivateCommand.lua` sheathes
+    /// via `player.Disengage(0x0000)`, which only pushes
+    /// `ChangeState{PASSIVE}` — without this pre-pass the in-flight
+    /// AttackState plus any queued weapon-skill/cast survives the sheathe
+    /// and keeps resolving swings forever (live log 2026-07-04: sheathe at
+    /// 01:12:12, auto-attack still landing at 01:13:12). For every
+    /// ChangeState-to-PASSIVE in a command burst whose actor is mid-battle:
+    /// flush the ai_container, drop the soft target (pmeteor
+    /// `ChangeTarget(null)`), and route the resulting
+    /// `BattleEvent::Disengage` through the dispatcher — its arm already
+    /// emits the PASSIVE state trio + enmity-gem clear + hate clear +
+    /// ResetHead — then consume the ChangeState command (applying it too
+    /// would double-play the sheathe animation). Non-engaged stance flips
+    /// fall through to `quest_apply::apply_change_state` unchanged. (#46.)
+    pub(crate) async fn flush_battle_states_on_sheathe(
+        &self,
+        commands: Vec<crate::lua::command::LuaCommand>,
+    ) -> Vec<crate::lua::command::LuaCommand> {
+        use crate::lua::command::LuaCommand;
+        let mut kept = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            let actor_id = match &cmd {
+                LuaCommand::ChangeState {
+                    actor_id,
+                    main_state: crate::actor::MAIN_STATE_PASSIVE,
+                } => *actor_id,
+                _ => {
+                    kept.push(cmd);
+                    continue;
+                }
+            };
+            let Some(target_handle) = self.registry.get(actor_id).await else {
+                kept.push(cmd);
+                continue;
+            };
+            let Some(zone_arc) = self.world.zone(target_handle.zone_id).await else {
+                kept.push(cmd);
+                continue;
+            };
+            let mut battle_outbox = crate::battle::outbox::BattleOutbox::new();
+            let engaged = {
+                let mut c = target_handle.character.write().await;
+                if c.ai_container.state_stack().is_empty() {
+                    false
+                } else {
+                    c.ai_container.internal_disengage(&mut battle_outbox);
+                    c.chara.current_target = crate::actor::INVALID_ACTORID;
+                    true
+                }
+            };
+            if !engaged {
+                kept.push(cmd);
+                continue;
+            }
+            tracing::debug!(
+                actor = format!("0x{actor_id:08X}"),
+                "sheathe flushed engaged battle states (InternalDisengage)",
+            );
+            for ev in battle_outbox.drain() {
+                crate::runtime::dispatcher::dispatch_battle_event(
+                    &ev,
+                    &self.registry,
+                    &self.world,
+                    &zone_arc,
+                    self.lua.as_ref(),
+                    Some(&self.db),
+                )
+                .await;
+            }
+        }
+        kept
     }
 
     /// One X01 error row — pmeteor `WeaponSkillState.errorResult` shape
@@ -8661,7 +8795,7 @@ impl PacketProcessor {
     /// target + pushing the player's `AttackState` is the keystone that drives
     /// the whole loop: player swings → wolf takes damage → wolf gains hate →
     /// wolf retaliates. (Garlemald-Server #28.)
-    async fn apply_player_set_target(
+    pub(crate) async fn apply_player_set_target(
         &self,
         session_id: u32,
         selected_target: u32,
@@ -8671,6 +8805,25 @@ impl PacketProcessor {
             return;
         };
         let actor_id = handle.actor_id;
+
+        // Round 7h: the basic attack must not accept FRIENDLY targets —
+        // players could soft-target THEMSELVES or an escort Ally (Sisipu)
+        // and auto-attack them down. Mirrors ValidTarget::ENEMY for the
+        // basic attack (battle/target_find.rs can_target is only applied
+        // to AOE fan-out, never the primary target). Resolved before the
+        // player write lock to avoid holding two actor locks.
+        let target_friendly = if selected_target != 0 && selected_target != Self::SET_TARGET_NONE {
+            match self.registry.get(selected_target).await {
+                Some(t) => matches!(
+                    t.kind,
+                    crate::runtime::actor_registry::ActorKindTag::Player
+                        | crate::runtime::actor_registry::ActorKindTag::Ally
+                ),
+                None => false,
+            }
+        } else {
+            false
+        };
 
         {
             let mut c = handle.character.write().await;
@@ -8685,10 +8838,19 @@ impl PacketProcessor {
                 selected_target
             };
 
+            // #46 sheathed-combat leak: the basic attack must not engage
+            // while the weapon is sheathed. The retail client only sets
+            // attackTarget when drawn, so a sheathed 0x00CD is a silent
+            // drop (pmeteor PacketProcessor.cs:266-295 trusts the client
+            // and sends no error on this path) — keep the soft target and
+            // the reticle broadcast below.
+            let in_active_mode = c.base.current_main_state == crate::actor::MAIN_STATE_ACTIVE;
             let valid_combat_target = auto_attack
                 && !cleared
+                && !target_friendly
                 && selected_target != actor_id
-                && selected_target != crate::actor::INVALID_ACTORID;
+                && selected_target != crate::actor::INVALID_ACTORID
+                && in_active_mode;
 
             if valid_combat_target {
                 // Shared battle-clock anchor — same fix as
@@ -8721,6 +8883,12 @@ impl PacketProcessor {
                 // Auto-attack toggled off (attackTarget == 0xE0000000) — stop
                 // swinging but keep the soft target so the reticle stays.
                 c.ai_container.clear_states();
+            } else if !in_active_mode {
+                tracing::debug!(
+                    player = format!("0x{actor_id:08X}"),
+                    target = format!("0x{selected_target:08X}"),
+                    "auto-attack engage rejected — not in active mode (0x00CD)",
+                );
             }
         }
 
@@ -9332,20 +9500,63 @@ impl PacketProcessor {
     /// `pub(crate)` so integration tests can simulate the client's
     /// zone-in echo directly.
     pub(crate) async fn handle_zone_in_complete(&self, session_id: u32) {
-        let deferred_warp = if let Some(mut snap) = self.world.session(session_id).await {
-            snap.reload_in_flight = false;
-            snap.defer_warps_until_zone_in_ack = false;
-            let deferred = snap.deferred_login_warp.take();
-            self.world.upsert_session(snap).await;
-            deferred
-        } else {
-            None
-        };
+        let (deferred_warp, parked_kick) =
+            if let Some(mut snap) = self.world.session(session_id).await {
+                snap.reload_in_flight = false;
+                snap.defer_warps_until_zone_in_ack = false;
+                let deferred = snap.deferred_login_warp.take();
+                // #46 escort R1 — release the content-director kick parked by
+                // the KickEvent appliers (a 0x012F that would have ridden the
+                // content-warp flush AFTER DeleteAllActors is dropped
+                // client-side; wire-proven, session 53943). This ack means the
+                // client finished loading the instance and the director actor
+                // (which rode the zone-in bundle) is client-known, so the kick
+                // lands and the director's onEventStarted runs. If a deferred
+                // login warp is about to replay (another full reload), KEEP the
+                // kick parked — it would be wiped again; the replayed warp's
+                // own RX 0x0007 releases it.
+                let kick = if deferred.is_none() {
+                    snap.pending_content_kick_event.take()
+                } else {
+                    None
+                };
+                self.world.upsert_session(snap).await;
+                (deferred, kick)
+            } else {
+                (None, None)
+            };
         tracing::debug!(
             session = session_id,
             deferred_warp = deferred_warp.is_some(),
+            released_content_kick = parked_kick.is_some(),
             "RX 0x0007 zone-in-complete — reload/login latches cleared",
         );
+        if let Some(kick) = parked_kick {
+            if let Some(client) = self.world.client(session_id).await {
+                let mut sub = crate::packets::send::events::build_kick_event(
+                    kick.trigger_actor_id,
+                    kick.owner_actor_id,
+                    &kick.event_name,
+                    5,
+                    &kick.args,
+                );
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+                tracing::info!(
+                    session = session_id,
+                    trigger = format!("0x{:08X}", kick.trigger_actor_id),
+                    owner = format!("0x{:08X}", kick.owner_actor_id),
+                    event = %kick.event_name,
+                    "parked content KickEvent released on content-warp zone-in ack",
+                );
+            } else {
+                tracing::warn!(
+                    session = session_id,
+                    event = %kick.event_name,
+                    "parked content KickEvent dropped — no client handle at release",
+                );
+            }
+        }
         if let Some(w) = deferred_warp {
             tracing::info!(
                 session = session_id,
