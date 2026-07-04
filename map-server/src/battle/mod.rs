@@ -28,6 +28,7 @@ pub mod ai_container;
 pub mod command;
 pub mod controller;
 pub mod effects;
+pub mod exp;
 pub mod hate;
 pub mod outbox;
 pub mod path_find;

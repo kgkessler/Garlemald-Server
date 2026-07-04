@@ -6964,12 +6964,33 @@ impl PacketProcessor {
     }
 
     /// `player:CompleteQuest(id)` — fire `onFinish(player, quest, true)`
-    /// first so the script sees the quest still in-journal, then remove
-    /// the scenario row and set the completion bit.
+    /// first so the script sees the quest still in-journal, then land
+    /// the shared completion core (journal/DB teardown, journal
+    /// wire-clear, 25086 toast, ENPC "!" clears) via
+    /// [`crate::runtime::quest_apply::finish_complete_quest`] — one body
+    /// for both drain paths so the login-scoped and live-talk turn-ins
+    /// can't drift. (Garlemald-Server #46.)
     async fn apply_complete_quest(&self, player_id: u32, quest_id: u32) {
         let Some(handle) = self.registry.get(player_id).await else {
             return;
         };
+        // Idempotence guard — pmeteor Player.cs:1804 `if (HasQuest(id))`:
+        // a completed quest's turn-in must never re-fire (double-click,
+        // replayed drain, script re-call after completion) — no second
+        // onFinish, no repeat toast / DB writes. (Garlemald-Server #46 —
+        // Treasures of the Main infinite gil/EXP turn-in.)
+        let in_journal = {
+            let c = handle.character.read().await;
+            c.quest_journal.has(quest_id)
+        };
+        if !in_journal {
+            tracing::debug!(
+                player = player_id,
+                quest = quest_id,
+                "CompleteQuest skipped — quest not in journal",
+            );
+            return;
+        }
         // Fire onFinish before we tear the quest down so the hook can still
         // read `quest:GetData()` counters / flags via its snapshot.
         self.fire_quest_hook(
@@ -6979,56 +7000,15 @@ impl PacketProcessor {
             vec![crate::lua::QuestHookArg::Bool(true)],
         )
         .await;
-
-        let removed_slot = {
-            let mut c = handle.character.write().await;
-            let slot = c.quest_journal.slot_of(quest_id);
-            c.quest_journal.complete(quest_id);
-            slot.map(|s| s as i32)
-        };
-        if let Some(slot) = removed_slot
-            && let Err(e) = self.db.remove_quest(player_id, quest_id).await
-        {
-            tracing::warn!(
-                error = %e,
-                player = player_id,
-                quest = quest_id,
-                slot,
-                "CompleteQuest: scenario-row delete failed",
-            );
-        }
-        if let Err(e) = self.db.complete_quest(player_id, quest_id).await {
-            tracing::warn!(
-                error = %e,
-                player = player_id,
-                quest = quest_id,
-                "CompleteQuest: bitstream save failed",
-            );
-        }
-        tracing::info!(
-            player = player_id,
-            quest = quest_id,
-            "CompleteQuest applied",
-        );
-
-        // Fan out the canonical "<Quest> complete!" toast.
-        // Mirror C# `Quest.OnComplete`'s
-        // `SendGameMessage(WorldMaster, 25086, 0x20, GetQuestId())`.
-        if let Some(client) = self.world.client(handle.session_id).await {
-            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                // Header source = WorldMaster (the client dispatches by
-                // header source; it must be an always-present static
-                // actor, never the player — Garlemald-Server #28 crash RCA).
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                /* text_id */ 25086,
-                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                &[common::luaparam::LuaParam::UInt32(quest_id)],
-                /* prefer_alt */ false,
-            );
-            pkt.set_target_id(handle.session_id);
-            client.send_bytes(pkt.to_bytes()).await;
-        }
+        crate::runtime::quest_apply::finish_complete_quest(
+            &handle,
+            player_id,
+            quest_id,
+            &self.registry,
+            &self.db,
+            &self.world,
+        )
+        .await;
     }
 
     /// `player:AbandonQuest(id)` / `player:RemoveQuest(id)` — drop the
@@ -7197,7 +7177,10 @@ impl PacketProcessor {
             }
         };
         if let Some(e) = result.error {
-            tracing::debug!(
+            // warn (not debug): an argument-shape mismatch killing a hook
+            // mid-arm while its queued commands still apply was invisible
+            // at debug level — the #46 infinite-turn-in root cause.
+            tracing::warn!(
                 error = %e,
                 quest = quest_id,
                 hook = hook_name,
@@ -7311,7 +7294,8 @@ impl PacketProcessor {
             }
         };
         if let Some(e) = result.error {
-            tracing::debug!(
+            // warn — same tripwire rationale as `fire_quest_hook` (#46).
+            tracing::warn!(
                 error = %e,
                 quest = quest_id,
                 hook = hook_name,
@@ -8498,7 +8482,82 @@ impl PacketProcessor {
                 "command onEventStarted fired",
             );
         }
-        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+        let commands = self.flush_battle_states_on_sheathe(partial.commands).await;
+        Box::pin(self.apply_event_script_commands(handle, commands)).await;
+    }
+
+    /// Sheathe-side battle flush — pmeteor `AIContainer.InternalDisengage`
+    /// (AIContainer.cs:351-363). `commands/ActivateCommand.lua` sheathes
+    /// via `player.Disengage(0x0000)`, which only pushes
+    /// `ChangeState{PASSIVE}` — without this pre-pass the in-flight
+    /// AttackState plus any queued weapon-skill/cast survives the sheathe
+    /// and keeps resolving swings forever (live log 2026-07-04: sheathe at
+    /// 01:12:12, auto-attack still landing at 01:13:12). For every
+    /// ChangeState-to-PASSIVE in a command burst whose actor is mid-battle:
+    /// flush the ai_container, drop the soft target (pmeteor
+    /// `ChangeTarget(null)`), and route the resulting
+    /// `BattleEvent::Disengage` through the dispatcher — its arm already
+    /// emits the PASSIVE state trio + enmity-gem clear + hate clear +
+    /// ResetHead — then consume the ChangeState command (applying it too
+    /// would double-play the sheathe animation). Non-engaged stance flips
+    /// fall through to `quest_apply::apply_change_state` unchanged. (#46.)
+    pub(crate) async fn flush_battle_states_on_sheathe(
+        &self,
+        commands: Vec<crate::lua::command::LuaCommand>,
+    ) -> Vec<crate::lua::command::LuaCommand> {
+        use crate::lua::command::LuaCommand;
+        let mut kept = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            let actor_id = match &cmd {
+                LuaCommand::ChangeState {
+                    actor_id,
+                    main_state: crate::actor::MAIN_STATE_PASSIVE,
+                } => *actor_id,
+                _ => {
+                    kept.push(cmd);
+                    continue;
+                }
+            };
+            let Some(target_handle) = self.registry.get(actor_id).await else {
+                kept.push(cmd);
+                continue;
+            };
+            let Some(zone_arc) = self.world.zone(target_handle.zone_id).await else {
+                kept.push(cmd);
+                continue;
+            };
+            let mut battle_outbox = crate::battle::outbox::BattleOutbox::new();
+            let engaged = {
+                let mut c = target_handle.character.write().await;
+                if c.ai_container.state_stack().is_empty() {
+                    false
+                } else {
+                    c.ai_container.internal_disengage(&mut battle_outbox);
+                    c.chara.current_target = crate::actor::INVALID_ACTORID;
+                    true
+                }
+            };
+            if !engaged {
+                kept.push(cmd);
+                continue;
+            }
+            tracing::debug!(
+                actor = format!("0x{actor_id:08X}"),
+                "sheathe flushed engaged battle states (InternalDisengage)",
+            );
+            for ev in battle_outbox.drain() {
+                crate::runtime::dispatcher::dispatch_battle_event(
+                    &ev,
+                    &self.registry,
+                    &self.world,
+                    &zone_arc,
+                    self.lua.as_ref(),
+                    Some(&self.db),
+                )
+                .await;
+            }
+        }
+        kept
     }
 
     /// One X01 error row — pmeteor `WeaponSkillState.errorResult` shape
@@ -8736,7 +8795,7 @@ impl PacketProcessor {
     /// target + pushing the player's `AttackState` is the keystone that drives
     /// the whole loop: player swings → wolf takes damage → wolf gains hate →
     /// wolf retaliates. (Garlemald-Server #28.)
-    async fn apply_player_set_target(
+    pub(crate) async fn apply_player_set_target(
         &self,
         session_id: u32,
         selected_target: u32,
@@ -8779,11 +8838,19 @@ impl PacketProcessor {
                 selected_target
             };
 
+            // #46 sheathed-combat leak: the basic attack must not engage
+            // while the weapon is sheathed. The retail client only sets
+            // attackTarget when drawn, so a sheathed 0x00CD is a silent
+            // drop (pmeteor PacketProcessor.cs:266-295 trusts the client
+            // and sends no error on this path) — keep the soft target and
+            // the reticle broadcast below.
+            let in_active_mode = c.base.current_main_state == crate::actor::MAIN_STATE_ACTIVE;
             let valid_combat_target = auto_attack
                 && !cleared
                 && !target_friendly
                 && selected_target != actor_id
-                && selected_target != crate::actor::INVALID_ACTORID;
+                && selected_target != crate::actor::INVALID_ACTORID
+                && in_active_mode;
 
             if valid_combat_target {
                 // Shared battle-clock anchor — same fix as
@@ -8816,6 +8883,12 @@ impl PacketProcessor {
                 // Auto-attack toggled off (attackTarget == 0xE0000000) — stop
                 // swinging but keep the soft target so the reticle stays.
                 c.ai_container.clear_states();
+            } else if !in_active_mode {
+                tracing::debug!(
+                    player = format!("0x{actor_id:08X}"),
+                    target = format!("0x{selected_target:08X}"),
+                    "auto-attack engage rejected — not in active mode (0x00CD)",
+                );
             }
         }
 

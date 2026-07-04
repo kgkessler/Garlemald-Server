@@ -2045,6 +2045,14 @@ async fn auto_attack_that_kills_flips_defender_to_dead() {
         let mut c = handle.character.write().await;
         c.ai_container.internal_engage(2, 0, 2500);
     }
+    // The victim under attack is in combat too — without an AttackState
+    // of its own the passive out-of-combat HP regen (2% of max per 3 s
+    // tick) would climb it off the 1-HP ledge faster than swings land.
+    {
+        let handle = registry.get(2).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.ai_container.internal_engage(1, 0, 2500);
+    }
 
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     // Tick forward past the swing timer enough times to guarantee a hit.
@@ -14724,6 +14732,285 @@ async fn hotbar_press_executes_fast_blade_with_costs_and_recast() {
         contains_target_path(&subs, b"charaWork/stateAtQuicklyForAll"),
         "TP changes must ride the stateAtQuicklyForAll sync",
     );
+}
+
+// ---------------------------------------------------------------------------
+// #46 — sheathed-weapon combat leaks
+// ---------------------------------------------------------------------------
+
+/// Zone 100 with a player (id 1, session 42) and a wolf BattleNpc (id 2,
+/// 3 y away), registered client + session — the minimal 0x00CD /
+/// sheathe-flush scene. Mirrors the fast-blade hotbar scene above minus
+/// the Lua engine + battle-command catalog (neither path needs them).
+struct SheatheScene {
+    world: Arc<WorldManager>,
+    registry: Arc<ActorRegistry>,
+    db: Arc<crate::database::Database>,
+    processor: crate::processor::PacketProcessor,
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+async fn sheathe_scene() -> SheatheScene {
+    use crate::data::Session as MapSession;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let mut zone = Zone::new(
+        100,
+        "test",
+        1,
+        "/Area/Zone/Test",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 1,
+            kind: ActorKind::Player,
+            position: Vector3::ZERO,
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 2,
+            kind: ActorKind::BattleNpc,
+            position: Vector3::new(3.0, 0.0, 0.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    world.register_zone(zone).await;
+
+    let mut player = Character::new(1);
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.level = 1;
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
+        .await;
+    let mut wolf = Character::new(2);
+    wolf.chara.hp = 500;
+    wolf.chara.max_hp = 500;
+    wolf.base.position_x = 3.0;
+    registry
+        .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, wolf))
+        .await;
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(512);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+    world
+        .upsert_session(MapSession {
+            id: 42,
+            current_zone_id: 100,
+            ..MapSession::default()
+        })
+        .await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+    SheatheScene {
+        world,
+        registry,
+        db,
+        processor,
+        rx,
+    }
+}
+
+/// #46 — sheathing mid-combat must flush the ai_container: the
+/// ActivateCommand sheathe burst (`ChangeState{PASSIVE}` from
+/// `player.Disengage(0x0000)`) previously only flipped the pose, so the
+/// engaged AttackState kept resolving swings forever while sheathed
+/// (live log 2026-07-04 01:12:12 → 01:13:12). The pre-pass consumes the
+/// ChangeState, clears states + hate + soft target, and the dispatcher's
+/// Disengage arm emits exactly one PASSIVE state trio.
+#[tokio::test]
+async fn sheathe_mid_combat_flushes_battle_states_and_stops_auto_attack() {
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+
+    let mut scene = sheathe_scene().await;
+    let handle = scene.registry.get(1).await.expect("player handle");
+
+    // Draw + engage via the 0x00CD path (stance ACTIVE).
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+    }
+    scene.processor.apply_player_set_target(42, 2, true).await;
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.is_engaged(),
+            "active-mode 0x00CD must engage"
+        );
+    }
+    let _ = parse_all_subpackets(&mut scene.rx); // drain the engage-side wire
+
+    // Sheathe: the exact burst `ActivateCommand.lua::player.Disengage`
+    // queues (userdata.rs Disengage binding).
+    let burst = vec![crate::lua::LuaCommandKind::ChangeState {
+        actor_id: 1,
+        main_state: crate::actor::MAIN_STATE_PASSIVE,
+    }];
+    let kept = scene.processor.flush_battle_states_on_sheathe(burst).await;
+    assert!(
+        kept.is_empty(),
+        "engaged sheathe consumes the ChangeState — the Disengage arm owns the trio",
+    );
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.state_stack().is_empty(),
+            "sheathe must flush every battle state (pmeteor InternalDisengage)",
+        );
+        assert_eq!(
+            c.base.current_main_state,
+            crate::actor::MAIN_STATE_PASSIVE,
+            "Disengage arm flips the stance to PASSIVE",
+        );
+        assert_eq!(
+            c.chara.current_target,
+            crate::actor::INVALID_ACTORID,
+            "sheathe drops the soft target (pmeteor ChangeTarget(null))",
+        );
+        assert!(c.hate.is_empty(), "sheathe clears the hate container");
+    }
+    let subs = parse_all_subpackets(&mut scene.rx);
+    let trios = subs
+        .iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_SET_ACTOR_STATE)
+        .count();
+    assert_eq!(trios, 1, "exactly one PASSIVE state trio on the wire");
+
+    // Post-sheathe ticks: the swing loop is dead — nothing re-arms, no
+    // TP banks, no damage lands.
+    let ticker = GameTicker::new(
+        TickerConfig::default(),
+        scene.world.clone(),
+        scene.registry.clone(),
+        scene.db.clone(),
+    );
+    let base = crate::runtime::clock::server_now_ms();
+    for i in 1..=3u64 {
+        ticker.tick_once(base + i * 2_600).await;
+    }
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.state_stack().is_empty(),
+            "no state re-armed after the sheathe",
+        );
+        assert_eq!(c.chara.tp, 0, "no TP banked after the sheathe");
+    }
+    let wolf = scene.registry.get(2).await.expect("wolf handle");
+    {
+        let c = wolf.character.read().await;
+        assert_eq!(c.chara.hp, 500, "no post-sheathe swing damage");
+    }
+}
+
+/// #46 — the 0x00CD SetTarget auto-attack engage is stance-gated: while
+/// PASSIVE (weapon sheathed) the engage is a silent drop that keeps the
+/// soft target + reticle broadcast (pmeteor PacketProcessor.cs:266-295
+/// sends no error on this path); the same press engages once ACTIVE.
+#[tokio::test]
+async fn set_target_auto_attack_gated_on_active_mode() {
+    let mut scene = sheathe_scene().await;
+    let handle = scene.registry.get(1).await.expect("player handle");
+
+    // PASSIVE (default): no engage, soft target + reticle preserved.
+    scene.processor.apply_player_set_target(42, 2, true).await;
+    {
+        let c = handle.character.read().await;
+        assert!(
+            !c.ai_container.is_engaged(),
+            "sheathed 0x00CD must not engage the swing loop",
+        );
+        assert!(
+            c.ai_container.state_stack().is_empty(),
+            "sheathed 0x00CD must not push any battle state",
+        );
+        assert_eq!(c.chara.current_target, 2, "soft target survives the gate");
+    }
+    let subs = parse_all_subpackets(&mut scene.rx);
+    assert!(
+        subs.iter().any(|s| s.game_message.opcode
+            == crate::packets::opcodes::OP_SET_ACTOR_TARGET_ANIMATED),
+        "reticle broadcast still goes out on the sheathed press",
+    );
+
+    // ACTIVE: the same press engages.
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+    }
+    scene.processor.apply_player_set_target(42, 2, true).await;
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.is_engaged(),
+            "active-mode 0x00CD must engage"
+        );
+    }
+}
+
+/// #46 — script-driven engagement bypasses the 0x00CD stance gate:
+/// `ActorEngage` (SEQ_005 tutorial wolves / escort allies via
+/// `apply_actor_engage`) must keep engaging a PASSIVE actor.
+#[tokio::test]
+async fn script_actor_engage_bypasses_stance_gate() {
+    let scene = sheathe_scene().await;
+    let handle = scene.registry.get(1).await.expect("player handle");
+    {
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.base.current_main_state,
+            crate::actor::MAIN_STATE_PASSIVE,
+            "scene starts sheathed",
+        );
+    }
+    let handled = crate::runtime::quest_apply::apply_runtime_lua_command(
+        crate::lua::LuaCommandKind::ActorEngage {
+            actor_id: 1,
+            target_actor_id: 2,
+        },
+        &scene.registry,
+        &scene.db,
+        &scene.world,
+        None,
+    )
+    .await;
+    assert!(handled, "ActorEngage must be a recognised runtime command");
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.ai_container.is_engaged(),
+            "script ActorEngage must not be stance-gated (SEQ_005 / escort)",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,22 @@ fn push(queue: &Arc<Mutex<CommandQueue>>, cmd: LuaCommand) {
     CommandQueue::push(queue, cmd);
 }
 
+/// Resolve a `player:CompleteQuest(...)` / `player:AbandonQuest(...)`
+/// argument to a raw quest id. Scripts pass either the LuaQuestHandle
+/// userdata delivered to the hook or a raw integer id — mirror of the
+/// AcceptQuest binding's userdata extraction and SendGameMessage's
+/// mixed-type owner resolver. `None` means the argument was neither
+/// shape; callers log-and-drop (a hard mlua error here is exactly the
+/// silent turn-in-repeat bug this replaced — Garlemald-Server #46).
+fn quest_arg_to_id(v: &Value) -> Option<u32> {
+    match v {
+        Value::Integer(i) => Some(*i as u32),
+        Value::Number(n) => Some(*n as u32),
+        Value::UserData(ud) => ud.borrow_scoped::<LuaQuestHandle, _>(|q| q.quest_id).ok(),
+        _ => None,
+    }
+}
+
 /// Extract an actor_id from a Lua-side argument. Accepts a
 /// LuaActor / LuaNpc / LuaPlayer userdata (returns `.actorId`) or a
 /// raw integer (returns the integer truncated to u32). Anything else
@@ -2085,22 +2101,47 @@ impl UserData for LuaPlayer {
                 Ok(())
             },
         );
-        methods.add_method("CompleteQuest", |_, this, id: u32| {
+        // `player:CompleteQuest(quest-or-id)` / `player:AbandonQuest(...)`.
+        // Quest scripts pass either a raw id or the LuaQuestHandle
+        // userdata delivered to the hook (`player:CompleteQuest(quest)` —
+        // man0l1.lua:491 and ~20 siblings across the man/wld/etc trees).
+        // The previous `u32`-typed binding failed mlua conversion on the
+        // userdata form, which killed the hook coroutine mid-arm while
+        // its already-queued commands (dialogue, rewards, EndEvent) still
+        // drained — so the quest never completed and the turn-in repeated
+        // forever, re-awarding gil/EXP each time. (Garlemald-Server #46.)
+        methods.add_method("CompleteQuest", |_, this, v: Value| {
+            let Some(quest_id) = quest_arg_to_id(&v) else {
+                tracing::warn!(
+                    player = this.snapshot.actor_id,
+                    arg = ?v,
+                    "CompleteQuest: unresolvable quest argument dropped",
+                );
+                return Ok(());
+            };
             push(
                 &this.queue,
                 LuaCommand::CompleteQuest {
                     player_id: this.snapshot.actor_id,
-                    quest_id: id,
+                    quest_id,
                 },
             );
             Ok(())
         });
-        methods.add_method("AbandonQuest", |_, this, id: u32| {
+        methods.add_method("AbandonQuest", |_, this, v: Value| {
+            let Some(quest_id) = quest_arg_to_id(&v) else {
+                tracing::warn!(
+                    player = this.snapshot.actor_id,
+                    arg = ?v,
+                    "AbandonQuest: unresolvable quest argument dropped",
+                );
+                return Ok(());
+            };
             push(
                 &this.queue,
                 LuaCommand::AbandonQuest {
                     player_id: this.snapshot.actor_id,
-                    quest_id: id,
+                    quest_id,
                 },
             );
             Ok(())

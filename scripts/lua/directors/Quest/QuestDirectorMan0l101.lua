@@ -85,20 +85,20 @@ function onEventStarted(player, actor, triggerName)
 	--     TtrBlkNml001 → the endTutorialMode exit) once the leg is
 	--     playable end-to-end. (Garlemald-Server #46, round 7b.)
 
-	-- (c) NO entry text here (round 7d). The round-7 candidate ids
-	--     34109/34110/34112 turned out to be the instance-BOUNDARY
-	--     message family, not the duty family — live 20:50 they rendered
-	--     "You are about to leave the instance." / "You have left the
-	--     instance." / "Enter this instance?" (alarming and wrong). The
-	--     real ids for "Protect Sisipu from harm." (a quest OBJECTIVE,
-	--     likely on the man0l1 QUEST sheet 2700193202, not worldMaster) /
-	--     "You are now bound by duty." / "There are N minutes remaining."
-	--     are still unresolved — omitted until an in-client probe or a
-	--     retail-pcap grep pins them. 34108 "You have entered an
-	--     instance." (correct) still rides the Rust content-warp path.
-	--     Known boundary family: 34108 entered / 34109 about-to-leave /
-	--     34110 left / 34112 enter-this-instance? (Garlemald-Server #46,
-	--     round 7d.)
+	-- (c) NO entry text here (rounds 7d/9). The duty banners
+	--     ("Protect Sisipu from harm." 51005 / "You are now bound by
+	--     duty." 50011 / "There are 30 minutes remaining." 25018 —
+	--     sheet-decoded worldMaster ids, see man0l1.lua TEXT_*) ride
+	--     the CONTENT script's first-sighting latch instead
+	--     (SimpleContentMan0l101.lua onUpdate): 51005 resolves
+	--     "<displayName>" from an actor-id param and only the content
+	--     tick has a handle on Sisipu — this director never does.
+	--     34108 "You have entered an instance." (correct) still rides
+	--     the Rust content-warp path. The round-7 candidates
+	--     34109-34112 were the instance-BOUNDARY family (about-to-
+	--     leave / left / not-attuned / "Enter this instance?") — live
+	--     20:50 they rendered alarming and wrong. (Garlemald-Server
+	--     #46, rounds 7d/9.)
 
 	-- (d) Close the kick — post-load, like the tutorials (their
 	--     noticeEvent EndEvent goes out well after the reload).
@@ -132,8 +132,9 @@ function onEventStarted(player, actor, triggerName)
 	-- script never sends it. The unbind line goes out BEFORE the
 	-- EndEvent + warp — a 0x0157 game message queued after the warp
 	-- ships into the client's Now-Loading gap (the man0l0 Hob-crash
-	-- shape; see man0l1.lua onStart) — its id is an UNVERIFIED
-	-- candidate pending an in-client probe (man0l1.lua TEXT_*).
+	-- shape; see man0l1.lua onStart). Id 50012 "You are no longer bound
+	-- by duty." is sheet-decoded (worldMaster duty block — man0l1.lua
+	-- TEXT_*).
 	man0l1Quest:StartSequence(SEQ_055);
 	player:SendGameMessage(GetWorldMaster(), TEXT_UNBOUND_FROM_DUTY, 0x20);
 	-- EndEvent BEFORE the warp — an EndEvent landing mid-reload loses

@@ -80,7 +80,7 @@ pub async fn apply_runtime_lua_command(
             player_id,
             quest_id,
         } => {
-            apply_complete_quest(player_id, quest_id, registry, db, lua).await;
+            apply_complete_quest(player_id, quest_id, registry, db, world, lua).await;
             true
         }
         LC::AbandonQuest {
@@ -2933,11 +2933,29 @@ pub async fn apply_complete_quest(
     quest_id: u32,
     registry: &ActorRegistry,
     db: &Database,
+    world: &WorldManager,
     lua: Option<&Arc<LuaEngine>>,
 ) {
     let Some(handle) = registry.get(player_id).await else {
         return;
     };
+    // Idempotence guard — pmeteor Player.cs:1804 `if (HasQuest(id))`: a
+    // completed quest's turn-in must never re-fire (double-click, replayed
+    // drain, script re-call after completion) — no second onFinish, no
+    // repeat toast / DB writes. (Garlemald-Server #46 — Treasures of the
+    // Main infinite gil/EXP turn-in.)
+    let in_journal = {
+        let c = handle.character.read().await;
+        c.quest_journal.has(quest_id)
+    };
+    if !in_journal {
+        tracing::debug!(
+            player = player_id,
+            quest = quest_id,
+            "CompleteQuest skipped — quest not in journal",
+        );
+        return;
+    }
     if let Some(lua_engine) = lua {
         fire_quest_hook(
             &handle,
@@ -2947,15 +2965,55 @@ pub async fn apply_complete_quest(
             lua_engine,
             registry,
             db,
-            None,
+            Some(world),
         )
         .await;
     }
-    let removed_slot = {
+    finish_complete_quest(&handle, player_id, quest_id, registry, db, world).await;
+}
+
+/// Completion core shared by BOTH `CompleteQuest` drain paths — the
+/// processor's login-scoped arm (`PacketProcessor::apply_complete_quest`)
+/// and the runtime arm above — so the two can't drift. Mirrors pmeteor
+/// Player.cs:1804-1849 `CompleteQuest`:
+///  1. journal-slot removal + completion bit (scenario-row delete +
+///     `characters_quest_completed` bitstream persist),
+///  2. `playerWork.questScenario[slot] = 0` journal wire-clear — the
+///     Rust mirror of `SendQuestClientUpdate` (Player.cs:2028),
+///  3. the 25086 "<Quest> complete!" toast (C# `Quest.OnComplete`),
+///  4. event-status + quest-graphic clears for every ENPC the quest
+///     still had registered, so the "!" dies immediately and the next
+///     talk falls through to the NPC's populace default script
+///     (dispatcher.rs `owner_claimed_by_current_quest` returns false
+///     once the journal slot is gone).
+pub(crate) async fn finish_complete_quest(
+    handle: &ActorHandle,
+    player_id: u32,
+    quest_id: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    // Snapshot the registered ENPCs BEFORE the journal removal drops the
+    // quest state. Merge both diff halves (a turn-in can land mid
+    // sequence-swap); `current` wins on a shared class id.
+    let (removed_slot, enpcs) = {
         let mut c = handle.character.write().await;
         let slot = c.quest_journal.slot_of(quest_id);
+        let enpcs: Vec<QuestEnpc> = c
+            .quest_journal
+            .get(quest_id)
+            .map(|q| {
+                let mut merged: std::collections::HashMap<u32, QuestEnpc> =
+                    std::collections::HashMap::new();
+                for e in q.state.old.values().chain(q.state.current.values()) {
+                    merged.insert(e.actor_class_id, *e);
+                }
+                merged.into_values().collect()
+            })
+            .unwrap_or_default();
         c.quest_journal.complete(quest_id);
-        slot.map(|s| s as i32)
+        (slot.map(|s| s as i32), enpcs)
     };
     if let Some(slot) = removed_slot
         && let Err(e) = db.remove_quest(player_id, quest_id).await
@@ -2981,6 +3039,46 @@ pub async fn apply_complete_quest(
         quest = quest_id,
         "CompleteQuest applied",
     );
+
+    let session_id = handle.session_id;
+    if session_id != 0
+        && let Some(client) = world.client(session_id).await
+    {
+        // `playerWork.questScenario[slot] = 0` — pmeteor Player.cs:2028
+        // `SendQuestClientUpdate(slot)`. Without it the client's journal
+        // keeps the turned-in quest until the next re-zone.
+        if let Some(slot) = removed_slot {
+            for mut sub in crate::packets::send::actor::build_player_journal_property(
+                handle.actor_id,
+                &[(slot as u32, 0)],
+            ) {
+                sub.set_target_id(session_id);
+                client.send_bytes(sub.to_bytes()).await;
+            }
+        }
+        // Fan out the canonical "<Quest> complete!" toast. Mirror C#
+        // `Quest.OnComplete`'s
+        // `SendGameMessage(WorldMaster, 25086, 0x20, GetQuestId())`.
+        let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            // Header source = WorldMaster (the client dispatches by
+            // header source; it must be an always-present static
+            // actor, never the player — Garlemald-Server #28 crash RCA).
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            /* text_id */ 25086,
+            crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+            &[common::luaparam::LuaParam::UInt32(quest_id)],
+            /* prefer_alt */ false,
+        );
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+    // Kill the "!" (and the talk/push event-status overrides) on every
+    // NPC the quest still had registered — otherwise the marker lingers
+    // until a re-zone even though the journal slot is already clear.
+    for enpc in enpcs {
+        broadcast_quest_enpc_clear(player_id, enpc, registry, world).await;
+    }
 }
 
 pub async fn apply_abandon_quest(
@@ -6347,7 +6445,8 @@ pub async fn apply_quest_on_notice(
         }
     };
     if let Some(e) = result.error {
-        tracing::debug!(
+        // warn — same tripwire rationale as the onTalk site (#46).
+        tracing::warn!(
             error = %e,
             quest = quest_id,
             "quest:OnNotice errored",
@@ -6937,7 +7036,8 @@ async fn fire_quest_npc_hook_via_command(
         }
     };
     if let Some(e) = result.error {
-        tracing::debug!(error = %e, quest = quest_id, hook = hook_name, "errored");
+        // warn — same tripwire rationale as the onTalk site (#46).
+        tracing::warn!(error = %e, quest = quest_id, hook = hook_name, "errored");
     }
     if result.commands.is_empty() {
         return;
@@ -7125,7 +7225,10 @@ pub async fn fire_quest_on_talk_via_command(
         }
     };
     if let Some(e) = result.error {
-        tracing::debug!(error = %e, quest = quest_id, "onTalk errored");
+        // warn (not debug): an argument-shape mismatch killing a hook
+        // mid-arm while its queued commands still apply was invisible at
+        // debug level for weeks — the #46 infinite-turn-in root cause.
+        tracing::warn!(error = %e, quest = quest_id, "onTalk errored");
     }
 
     if result.commands.is_empty() {
@@ -7333,7 +7436,8 @@ async fn fire_quest_hook(
         }
     };
     if let Some(e) = result.error {
-        tracing::debug!(error = %e, quest = quest_id, hook = hook_name, "hook errored");
+        // warn — same tripwire rationale as the onTalk site (#46).
+        tracing::warn!(error = %e, quest = quest_id, hook = hook_name, "hook errored");
     }
 
     // Drain emitted commands. When the caller has a `WorldManager`,
@@ -7349,10 +7453,11 @@ async fn fire_quest_hook(
     // the man0g0 opening cinematic does nothing because her pushDefault
     // and talkDefault triggers were just disabled.
     //
-    // Callers without a `world` (apply_complete_quest /
-    // apply_abandon_quest's onFinish, plus the apply_add_quest onStart
-    // path which today is reached via the processor's login pipeline)
-    // pass `None` and the legacy log-and-drop behaviour is preserved.
+    // Callers without a `world` (apply_abandon_quest's onFinish, plus
+    // the apply_add_quest onStart path which today is reached via the
+    // processor's login pipeline) pass `None` and the legacy
+    // log-and-drop behaviour is preserved. apply_complete_quest passes
+    // `Some(world)` so its onFinish drains like the processor copy's.
     // Box::pin handles the recursive future size since hooks can emit
     // AddQuest which re-enters fire_quest_hook.
     if !result.commands.is_empty() {
@@ -7389,7 +7494,7 @@ mod tests {
     use crate::actor::quest::{Quest, quest_actor_id};
     use crate::runtime::actor_registry::ActorKindTag;
 
-    fn tmpdir() -> std::path::PathBuf {
+    pub(crate) fn tmpdir() -> std::path::PathBuf {
         // Two parallel tests landing on the same nanosecond tick would
         // share this dir and clobber each other's scripts; the atomic
         // counter guarantees uniqueness.
@@ -7405,7 +7510,7 @@ mod tests {
         dir
     }
 
-    fn tempdb() -> std::path::PathBuf {
+    pub(crate) fn tempdb() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
@@ -8203,5 +8308,302 @@ mod end_event_before_warp_tests {
             &out[1],
             LuaCommand::EndEvent { player_id: 14, .. }
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Garlemald-Server #46 — idempotent quest turn-in (infinite gil/EXP).
+// man0l1.lua (and ~20 siblings) call `player:CompleteQuest(quest)` with
+// the LuaQuestHandle userdata; the old `u32`-typed binding failed mlua
+// conversion, killed the onTalk coroutine mid-arm, and the rewards
+// queued before the error still drained — while the quest never left
+// the journal, so the turn-in repeated forever.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod complete_quest_turn_in_tests {
+    use super::tests::{tempdb, tmpdir};
+    use super::*;
+    use crate::actor::Character;
+    use crate::actor::quest::{Quest, quest_actor_id};
+    use crate::runtime::actor_registry::ActorKindTag;
+
+    /// RED case on the old binding: the userdata form raised a runtime
+    /// error and `LuaCommand::CompleteQuest` was never enqueued.
+    #[tokio::test]
+    async fn complete_quest_binding_accepts_userdata_and_integer() {
+        use crate::lua::command::{CommandQueue, LuaCommand};
+        use crate::lua::userdata::{LuaQuestHandle, PlayerSnapshot};
+
+        let root = tmpdir();
+        let script = root.join("quests/man/man0l1.lua");
+        std::fs::write(
+            &script,
+            r#"
+                function onTalk(player, quest, npc)
+                    player:CompleteQuest(quest)
+                    player:CompleteQuest(110003)
+                    player:AbandonQuest(quest)
+                end
+            "#,
+        )
+        .unwrap();
+        let lua = LuaEngine::new(&root);
+
+        const PLAYER_ID: u32 = 0x0246_0001;
+        let snapshot = PlayerSnapshot {
+            actor_id: PLAYER_ID,
+            active_quests: vec![110_002],
+            ..Default::default()
+        };
+        let quest_handle = LuaQuestHandle {
+            player_id: PLAYER_ID,
+            quest_id: 110_002,
+            has_quest: true,
+            sequence: 92,
+            flags: 0,
+            counters: [0; 4],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+            queue: CommandQueue::new(),
+        };
+        let result = lua.call_quest_hook(&script, "onTalk", snapshot, quest_handle, Vec::new());
+        assert!(result.error.is_none(), "onTalk errored: {:?}", result.error);
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::CompleteQuest {
+                    quest_id: 110_002,
+                    ..
+                }
+            )),
+            "userdata form must resolve to the handle's quest id; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::CompleteQuest {
+                    quest_id: 110_003,
+                    ..
+                }
+            )),
+            "integer form must pass through unchanged; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::AbandonQuest {
+                    quest_id: 110_002,
+                    ..
+                }
+            )),
+            "AbandonQuest must accept the userdata form too; got {:?}",
+            result.commands,
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Completion must clear the journal slot (questScenario wire-clear),
+    /// write the durable completion record, and clear the ENPC "!"
+    /// quest-graphic so the next talk falls through to the default script.
+    #[tokio::test]
+    async fn complete_quest_clears_slot_record_and_enpc_icon() {
+        use crate::data::ClientHandle;
+        use common::db::ConnCallExt;
+
+        const PLAYER_ID: u32 = 61;
+        const SESSION_ID: u32 = 42;
+        const QUEST_ID: u32 = 110_002;
+        const NPC_CLASS_ID: u32 = 1_000_154;
+        const NPC_ACTOR_ID: u32 = 0x46B0_0001;
+
+        let db = crate::database::Database::open(tempdb()).await.unwrap();
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (61, 0, 0, 0, 'TurnIn')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let registry = ActorRegistry::new();
+        let mut character = Character::new(PLAYER_ID);
+        let mut quest = Quest::new(quest_actor_id(QUEST_ID), "Man0l1".to_string());
+        // Register a turn-in ENPC (Baderon shape) so completion has an
+        // icon to clear.
+        let _ = quest.state.add_enpc(crate::actor::quest::QuestEnpc::new(
+            NPC_CLASS_ID,
+            2,
+            true,
+            true,
+            false,
+            false,
+        ));
+        quest.clear_dirty();
+        character.quest_journal.add(quest);
+        let handle = ActorHandle::new(PLAYER_ID, ActorKindTag::Player, 100, SESSION_ID, character);
+        registry.insert(handle.clone()).await;
+
+        // Live NPC in the player's zone under the quest's class id.
+        let mut npc = Character::new(NPC_ACTOR_ID);
+        npc.chara.actor_class_id = NPC_CLASS_ID;
+        registry
+            .insert(ActorHandle::new(
+                NPC_ACTOR_ID,
+                ActorKindTag::Npc,
+                100,
+                0,
+                npc,
+            ))
+            .await;
+
+        let world = WorldManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        world
+            .register_client(SESSION_ID, ClientHandle::new(SESSION_ID, tx))
+            .await;
+
+        apply_complete_quest(PLAYER_ID, QUEST_ID, &registry, &db, &world, None).await;
+
+        // Journal slot gone + completion bit set + durable record written.
+        {
+            let c = handle.character.read().await;
+            assert!(
+                c.quest_journal.get(QUEST_ID).is_none(),
+                "journal slot must be cleared",
+            );
+            assert!(c.quest_journal.is_completed(QUEST_ID));
+        }
+        assert!(db.is_quest_completed(PLAYER_ID, QUEST_ID).await.unwrap());
+
+        let mut packets = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            packets.push(p);
+        }
+        // playerWork.questScenario[0] = 0 journal wire-clear (pmeteor
+        // SendQuestClientUpdate) — the packet carries the target string
+        // and the murmur2 property id.
+        let scenario_id = common::utils::murmur_hash2("playerWork.questScenario[0]", 0);
+        assert!(
+            packets.iter().any(|p| {
+                p.windows(b"playerWork/journal".len())
+                    .any(|w| w == b"playerWork/journal")
+                    && p.windows(4).any(|w| w == scenario_id.to_le_bytes())
+            }),
+            "burst must carry the playerWork/journal questScenario[0] clear",
+        );
+        // 25086 toast rides a WorldMaster-sourced subpacket (header
+        // source_id at offset 4).
+        let wm = crate::packets::send::misc::WORLD_MASTER_ACTOR_ID.to_le_bytes();
+        assert!(
+            packets.iter().any(|p| p.len() >= 8 && p[4..8] == wm),
+            "burst must carry the WorldMaster 25086 toast",
+        );
+        // Quest-graphic clear is the only NPC-sourced subpacket here (the
+        // seeded NPC has no event conditions, so no SetEventStatus fan-out).
+        let npc_src = NPC_ACTOR_ID.to_le_bytes();
+        assert!(
+            packets.iter().any(|p| p.len() >= 12
+                && p[4..8] == npc_src
+                && p[8..12] == PLAYER_ID.to_le_bytes()),
+            "burst must carry the target-stamped quest-graphic clear for the ENPC",
+        );
+    }
+
+    /// The HasQuest guard (pmeteor Player.cs:1804): a second turn-in after
+    /// completion must not re-fire onFinish (no re-award) and must emit
+    /// nothing on the wire.
+    #[tokio::test]
+    async fn second_complete_quest_does_not_refire_onfinish_or_reaward() {
+        use crate::data::ClientHandle;
+        use common::db::ConnCallExt;
+
+        const PLAYER_ID: u32 = 62;
+        const SESSION_ID: u32 = 43;
+        const QUEST_ID: u32 = 110_002;
+
+        let root = tmpdir();
+        std::fs::write(
+            root.join("quests/man/man0l1.lua"),
+            r#"
+                function onFinish(player, quest, completed)
+                    player:AddGil(6000)
+                end
+            "#,
+        )
+        .unwrap();
+        let lua = Arc::new(LuaEngine::new(&root));
+        {
+            let mut quests = std::collections::HashMap::new();
+            quests.insert(
+                QUEST_ID,
+                crate::gamedata::QuestMeta {
+                    id: QUEST_ID,
+                    quest_name: "Treasures of the Main".to_string(),
+                    class_name: "Man0l1".to_string(),
+                    prerequisite: 0,
+                    min_level: 1,
+                },
+            );
+            lua.catalogs().install_quests(quests);
+        }
+
+        let db = crate::database::Database::open(tempdb()).await.unwrap();
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (62, 0, 0, 0, 'Guard')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let registry = ActorRegistry::new();
+        let mut character = Character::new(PLAYER_ID);
+        let mut quest = Quest::new(quest_actor_id(QUEST_ID), "Man0l1".to_string());
+        quest.clear_dirty();
+        character.quest_journal.add(quest);
+        let handle = ActorHandle::new(PLAYER_ID, ActorKindTag::Player, 100, SESSION_ID, character);
+        registry.insert(handle.clone()).await;
+
+        let world = WorldManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        world
+            .register_client(SESSION_ID, ClientHandle::new(SESSION_ID, tx))
+            .await;
+
+        // First turn-in: onFinish fires once and its AddGil drains.
+        apply_complete_quest(PLAYER_ID, QUEST_ID, &registry, &db, &world, Some(&lua)).await;
+        assert_eq!(
+            db.add_gil(PLAYER_ID, 0).await.unwrap(),
+            6000,
+            "first turn-in awards the onFinish gil exactly once",
+        );
+        assert!(db.is_quest_completed(PLAYER_ID, QUEST_ID).await.unwrap());
+        while rx.try_recv().is_ok() {} // drain the first burst
+
+        // Second turn-in: guard trips before onFinish — no re-award, no
+        // wire traffic, state unchanged.
+        apply_complete_quest(PLAYER_ID, QUEST_ID, &registry, &db, &world, Some(&lua)).await;
+        assert_eq!(
+            db.add_gil(PLAYER_ID, 0).await.unwrap(),
+            6000,
+            "second turn-in must not re-award",
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "second turn-in must emit no packets",
+        );
+        assert!(db.is_quest_completed(PLAYER_ID, QUEST_ID).await.unwrap());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

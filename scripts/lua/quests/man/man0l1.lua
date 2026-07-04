@@ -152,24 +152,35 @@ FLAG_ESCORT_HANDOFF		= 1;
 -- garlemald emits it Rust-side in apply_do_zone_change_content /
 -- the deferred private-area bundle — scripts never send it).
 --
--- The four ids below are UNVERIFIED CANDIDATES in the worldMaster
--- "instance" family around 34108, pending an in-client probe: if a
--- candidate renders wrong text, the user reports it and only the
--- number changes here. Retail line order at escort entry (OCR'd
--- playthroughs + Mirke transcripts): journal update → 34108 →
--- "Protect Sisipu from harm." → "You are now bound by duty." →
--- "There are 30 minutes remaining." (log + centre banner; the banner
--- half is pending the same id probe).
-TEXT_PROTECT_SISIPU		= 34109;	-- UNVERIFIED candidate: "Protect Sisipu from harm."
-TEXT_BOUND_BY_DUTY		= 34110;	-- UNVERIFIED candidate: "You are now bound by duty."
-TEXT_UNBOUND_FROM_DUTY	= 34111;	-- UNVERIFIED candidate: "You are no longer bound by duty."
-TEXT_TIME_REMAINING		= 34112;	-- UNVERIFIED candidate: "There are <param> minutes remaining."
+-- The ids below were decoded STRAIGHT FROM THE CLIENT'S TEXT SHEETS
+-- (worldMaster EN: data/03/A2/00/BC.DAT main block ids 21001-34324 +
+-- 03/A2/08/36.DAT duty block ids 49001-53041; rows are [u16 len][u8]
+-- [bytes XOR 0x73], ids from the sibling "enable" run files — the
+-- SeventhUmbral SheetData.cpp:ReadRow format). The old 34109-34112
+-- candidates were the instance-BOUNDARY family (34109 about-to-leave /
+-- 34110 left / 34111 not-attuned / 34112 "Enter this instance?") —
+-- wrong family entirely, live-proven wrong 20:50. Retail line order at
+-- escort entry (OCR'd playthroughs + Mirke transcripts): journal
+-- update → 34108 → "Protect Sisipu from harm." → "You are now bound by
+-- duty." → "There are 30 minutes remaining.".
+TEXT_PROTECT_SISIPU		= 51005;	-- "Protect ~<displayName>/<displayName>'s group~ from harm." (param: Sisipu's actor id)
+TEXT_BOUND_BY_DUTY		= 50011;	-- "You are now bound by duty."
+TEXT_UNBOUND_FROM_DUTY	= 50012;	-- "You are no longer bound by duty."
+TEXT_TIME_REMAINING		= 25018;	-- "There ~is/are~ <N> ~minute/minutes~ remaining." (param: minutes; 25019 = seconds variant)
+-- Duty battle announcements (worldMaster main block; param: the mob's
+-- actor id — the client renders "<displayName> is engaged/defeated.").
+-- 30122 (engaged) and 30123/30125 (defeated) are byte-identical
+-- duplicate rows — fall back to those if these two misrender.
+TEXT_MOB_ENGAGED		= 30120;	-- "<displayName> is engaged."
+TEXT_MOB_DEFEATED		= 30121;	-- "<displayName> is defeated."
 
 -- Sisipu's on-the-road guidance bark ("Oschon's Torch is due south...")
--- — man0l1 QUEST-sheet say id 337, CONFIRMED in the decoded client
--- processTtrBlkNml001. (Her SEQ_055 camp talk is say 119 — that one
--- belongs to the camp leg, not the escort.)
-SAY_ESCORT_GUIDANCE		= 337;
+-- — man0l1 QUEST-sheet row 283 (data/03/A2/04/4A.DAT EN + 4B enable).
+-- The earlier say-337 attribution was a decode conflation: sheet row
+-- 337 is "Forgive my boldness..." — the processEtc002 one-shot talk
+-- line, NOT the repeated bark. (Her SEQ_055 camp talk is say 119 —
+-- that one belongs to the camp leg, not the escort.)
+SAY_ESCORT_GUIDANCE		= 283;
 
 -- Msg packs for the Npc LS
 NPCLS_MSGS = {

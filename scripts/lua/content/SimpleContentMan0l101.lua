@@ -21,10 +21,12 @@ require ("quests/man/man0l1")
 -- geography — see seed/070; the zone-129 Skull Valley pin from seed/066
 -- is kept for rollback). Sisipu LEADS the walk due south from the gate
 -- to the lighthouse approach along the ROUTE waypoints, barking her
--- say-337 guidance every ~20 s; the eight seeded ankle biters
--- (chigoes) sit in three route clusters and pull as the party reaches
--- each segment. Arrival (both Sisipu and the player inside the final-
--- waypoint radius, road clear) fires sendSignal("escortComplete") → the
+-- say-283 guidance every ~20 s; the eight seeded ankle biters
+-- (chigoes) sit ONE PER AMBUSH POINT at even ninths of the recorded
+-- arc (screenshots show a single biter per location) and each pulls
+-- alone as the party reaches its stretch. Arrival (both Sisipu and
+-- the player inside the final-waypoint radius, road clear) fires
+-- sendSignal("escortComplete") → the
 -- director plays the processEvent605 arrival echo and warps to the
 -- lighthouse camp. Failure (Sisipu death OR the 30-minute limit) tears
 -- the content down, rolls the quest back to SEQ_048 (the ZEPHYR_TRIGGER
@@ -47,91 +49,139 @@ ARRIVAL_RADIUS = 20.0;       -- player inside this of the lighthouse goal → ar
 LEAD_DISTANCE = 5.0;         -- how far ahead of the player Sisipu paces while walking
 MOVE_EPSILON = 0.3;          -- player displacement/tick above this = "walking"
 TICKS_PER_SECOND = 2;
-ESCORT_LIMIT_TICKS = 30 * 60 * TICKS_PER_SECOND;    -- retail: "There are 30 minutes remaining."
+ESCORT_LIMIT_MINUTES = 30;   -- retail: "There are 30 minutes remaining."
+ESCORT_LIMIT_TICKS = ESCORT_LIMIT_MINUTES * 60 * TICKS_PER_SECOND;
+REMIND_20MIN_TICKS = 10 * 60 * TICKS_PER_SECOND;    -- 20 minutes remaining
 REMIND_10MIN_TICKS = 20 * 60 * TICKS_PER_SECOND;    -- 10 minutes remaining
 REMIND_5MIN_TICKS  = 25 * 60 * TICKS_PER_SECOND;    -- 5 minutes remaining
 BARK_INTERVAL_TICKS = 40;                           -- guidance bark every ~20 s
+ESCORT_DUTY_MUSIC = 37;      -- "Daring Dalliances" — 1.x quest-duty theme (wiki Music table id 37)
+-- Wave-outcome bark thresholds: Sisipu's HP fraction at wave clear
+-- picks the conditional variant (see the outcome beat in onUpdate).
+HURT_HP_RATIO = 0.5;         -- at/below → "Ow ow ow..." (took a beating)
+CLOSE_HP_RATIO = 0.85;       -- at/below → "Phew... much closer than I'd have liked"
+-- Minimap duty halo: an invisible ContentPrivateAreaRange object
+-- (seed/073 fills class 1290003's classPath + "exit"/"caution" push
+-- circles). The client's DepictionJudge attaches a native range map
+-- marker to any non-talkable actor whose class script defines
+-- getMapMarkerRange() (depictionjudge.lua:773-791), radii resolved
+-- from the wire-sent named push circles — so the halo rides this
+-- object, and MoveTo'ing it along with Sisipu moves the quest area
+-- ring on the minimap.
+ESCORT_RING_CLASS = 1290003;
+RING_MOVE_TICKS = 4;         -- re-home the halo every 2 s (one 0x00CF — plenty for a ~50-unit ring)
 
--- Sisipu's path: the PLAYER'S OWN recorded footsteps (round 7f). Decoded
--- from the 2026-07-03 21:38-21:47 escort run's inbound 0x00CA position
--- packets (offset verified against the warp anchor -63.25/33.16/164.51 and
--- a mid-run corridor sample) and downsampled to ~20-unit breadcrumbs: every
--- point is REAL walked ground with true terrain Y, so tracing them can never
--- leave walkable land or float (the navmesh is still a stub). The recording
--- reaches z~810 (~56% of the way); past the last breadcrumb Sisipu switches
--- to player-relative follow (round 7e logic) for the final stretch. Re-record
--- a fuller run to extend. ARRIVAL_GOAL is pmeteor's SEQ_055 camp point.
+-- Sisipu's path: the PLAYER'S OWN recorded footsteps (round 7f, extended
+-- to the lighthouse in round 8). Decoded from the player's full
+-- 2026-07-04 01:09-01:17 walk's inbound 0x00CA position packets (offset
+-- verified against the warp anchor -63.25/33.16/164.51) and downsampled
+-- to ~20-unit breadcrumbs: every point is REAL walked ground with true
+-- terrain Y, so tracing them can never leave walkable land or float (the
+-- navmesh is still a stub). The recording now reaches Oschon's Torch
+-- itself — a 1720-unit arc ending at the lighthouse camp approach
+-- (136.44, 60.70, 1324.01); one recorded backtrack step just before the
+-- arrival was pruned so the tail runs smoothly. The player-relative
+-- follow past the last breadcrumb is now only a safety fallback.
+-- ARRIVAL_GOAL is pmeteor's SEQ_055 camp point.
 TRAIL = {
 	{ x = -63.25, y = 33.16, z = 164.51 },
-	{ x = -43.93, y = 37.11, z = 156.42 },
-	{ x = -27.49, y = 41.10, z = 147.08 },
-	{ x = -10.56, y = 44.70, z = 141.54 },
-	{ x = 9.67, y = 45.20, z = 142.33 },
-	{ x = 29.18, y = 43.50, z = 138.89 },
-	{ x = 46.76, y = 45.79, z = 139.23 },
-	{ x = 62.63, y = 46.50, z = 131.88 },
-	{ x = 81.39, y = 45.86, z = 127.04 },
-	{ x = 100.35, y = 44.34, z = 129.65 },
-	{ x = 105.90, y = 47.10, z = 146.56 },
-	{ x = 122.67, y = 45.81, z = 153.04 },
-	{ x = 141.81, y = 46.77, z = 161.73 },
-	{ x = 157.87, y = 48.45, z = 170.87 },
-	{ x = 162.43, y = 50.15, z = 190.54 },
-	{ x = 161.41, y = 48.73, z = 209.05 },
-	{ x = 150.93, y = 46.43, z = 227.20 },
-	{ x = 141.69, y = 45.26, z = 246.37 },
-	{ x = 140.46, y = 45.34, z = 263.22 },
-	{ x = 135.40, y = 45.30, z = 282.75 },
-	{ x = 123.47, y = 45.33, z = 300.39 },
-	{ x = 111.30, y = 45.34, z = 315.91 },
-	{ x = 101.78, y = 43.77, z = 331.01 },
-	{ x = 90.06, y = 41.19, z = 346.85 },
-	{ x = 82.41, y = 42.37, z = 366.92 },
-	{ x = 74.50, y = 45.65, z = 382.13 },
-	{ x = 70.14, y = 44.87, z = 402.50 },
-	{ x = 69.93, y = 43.04, z = 422.19 },
-	{ x = 69.66, y = 41.34, z = 439.97 },
-	{ x = 69.33, y = 41.57, z = 461.57 },
-	{ x = 69.48, y = 43.69, z = 480.82 },
-	{ x = 86.94, y = 41.49, z = 490.07 },
-	{ x = 104.71, y = 41.87, z = 489.96 },
-	{ x = 122.22, y = 44.96, z = 501.00 },
-	{ x = 131.49, y = 45.89, z = 518.22 },
-	{ x = 136.96, y = 44.34, z = 535.47 },
-	{ x = 140.17, y = 49.92, z = 556.61 },
-	{ x = 138.78, y = 54.40, z = 574.13 },
-	{ x = 134.25, y = 52.75, z = 595.02 },
-	{ x = 134.05, y = 52.47, z = 612.74 },
-	{ x = 131.34, y = 54.53, z = 632.71 },
-	{ x = 127.51, y = 54.30, z = 653.87 },
-	{ x = 124.33, y = 52.29, z = 671.40 },
-	{ x = 120.48, y = 55.54, z = 692.71 },
-	{ x = 118.79, y = 56.85, z = 710.58 },
-	{ x = 111.83, y = 62.77, z = 727.47 },
-	{ x = 90.54, y = 64.47, z = 726.65 },
-	{ x = 77.07, y = 62.68, z = 736.72 },
-	{ x = 66.36, y = 57.28, z = 755.40 },
-	{ x = 52.76, y = 57.17, z = 764.91 },
-	{ x = 46.25, y = 59.88, z = 775.92 },
-	{ x = 53.72, y = 61.38, z = 793.35 },
-	{ x = 44.38, y = 63.70, z = 807.00 },
+	{ x = -45.02, y = 36.92, z = 155.90 },
+	{ x = -26.65, y = 41.26, z = 147.70 },
+	{ x = -6.55, y = 45.29, z = 140.92 },
+	{ x = 14.93, y = 44.31, z = 140.65 },
+	{ x = 36.27, y = 43.91, z = 139.11 },
+	{ x = 55.80, y = 46.38, z = 134.14 },
+	{ x = 76.48, y = 46.37, z = 129.19 },
+	{ x = 97.21, y = 44.13, z = 131.30 },
+	{ x = 110.60, y = 47.14, z = 147.63 },
+	{ x = 130.32, y = 46.20, z = 155.32 },
+	{ x = 149.47, y = 47.23, z = 164.72 },
+	{ x = 159.39, y = 49.46, z = 182.96 },
+	{ x = 161.77, y = 49.34, z = 203.54 },
+	{ x = 154.03, y = 47.11, z = 222.07 },
+	{ x = 145.69, y = 44.96, z = 241.43 },
+	{ x = 139.74, y = 45.40, z = 261.82 },
+	{ x = 133.33, y = 44.95, z = 281.98 },
+	{ x = 123.39, y = 45.42, z = 300.94 },
+	{ x = 110.17, y = 45.22, z = 317.74 },
+	{ x = 98.67, y = 42.78, z = 335.21 },
+	{ x = 87.31, y = 40.79, z = 353.31 },
+	{ x = 80.17, y = 44.02, z = 373.29 },
+	{ x = 73.08, y = 45.07, z = 393.45 },
+	{ x = 70.13, y = 43.66, z = 414.70 },
+	{ x = 70.11, y = 41.50, z = 435.66 },
+	{ x = 69.88, y = 41.37, z = 456.91 },
+	{ x = 70.77, y = 43.35, z = 477.76 },
+	{ x = 87.71, y = 41.27, z = 489.08 },
+	{ x = 108.77, y = 42.33, z = 492.30 },
+	{ x = 124.48, y = 46.35, z = 506.46 },
+	{ x = 131.73, y = 45.07, z = 526.60 },
+	{ x = 139.03, y = 47.06, z = 546.87 },
+	{ x = 139.60, y = 53.36, z = 567.82 },
+	{ x = 134.90, y = 53.17, z = 588.17 },
+	{ x = 134.03, y = 51.99, z = 608.77 },
+	{ x = 131.58, y = 54.46, z = 629.89 },
+	{ x = 127.75, y = 54.47, z = 650.68 },
+	{ x = 123.68, y = 52.42, z = 671.72 },
+	{ x = 121.86, y = 55.21, z = 692.62 },
+	{ x = 118.85, y = 57.59, z = 713.07 },
+	{ x = 106.80, y = 63.79, z = 729.79 },
+	{ x = 86.30, y = 64.42, z = 730.03 },
+	{ x = 72.22, y = 60.52, z = 745.81 },
+	{ x = 58.58, y = 56.03, z = 761.97 },
+	{ x = 53.61, y = 59.13, z = 782.49 },
+	{ x = 48.21, y = 63.05, z = 802.34 },
+	{ x = 27.39, y = 64.30, z = 805.55 },
+	{ x = 7.02, y = 59.63, z = 810.46 },
+	{ x = 2.98, y = 54.50, z = 831.35 },
+	{ x = 3.93, y = 53.68, z = 852.32 },
+	{ x = -1.11, y = 53.17, z = 873.06 },
+	{ x = -6.17, y = 54.44, z = 893.87 },
+	{ x = -14.89, y = 50.45, z = 912.89 },
+	{ x = -22.95, y = 47.63, z = 932.25 },
+	{ x = -18.26, y = 45.09, z = 951.77 },
+	{ x = -6.85, y = 45.96, z = 969.73 },
+	{ x = 6.68, y = 44.60, z = 985.20 },
+	{ x = 19.95, y = 45.07, z = 1002.12 },
+	{ x = 33.13, y = 44.08, z = 1018.93 },
+	{ x = 46.17, y = 43.14, z = 1035.55 },
+	{ x = 57.56, y = 44.11, z = 1053.79 },
+	{ x = 63.09, y = 46.25, z = 1073.98 },
+	{ x = 66.75, y = 46.46, z = 1095.15 },
+	{ x = 72.18, y = 44.73, z = 1116.02 },
+	{ x = 80.52, y = 44.54, z = 1135.35 },
+	{ x = 95.82, y = 44.01, z = 1150.23 },
+	{ x = 111.13, y = 44.66, z = 1165.12 },
+	{ x = 123.30, y = 44.07, z = 1181.26 },
+	{ x = 124.53, y = 46.16, z = 1202.12 },
+	{ x = 114.03, y = 46.12, z = 1220.71 },
+	{ x = 107.51, y = 50.24, z = 1241.09 },
+	{ x = 113.16, y = 57.56, z = 1261.33 },
+	{ x = 123.01, y = 62.47, z = 1278.80 },
+	{ x = 127.12, y = 61.61, z = 1298.65 },
+	{ x = 137.44, y = 60.33, z = 1322.00 },
+	{ x = 137.74, y = 60.41, z = 1323.04 },
+	{ x = 136.44, y = 60.70, z = 1324.01 },
 };
 ARRIVAL_GOAL = { x = 137.44, y = 60.33, z = 1322.0 };
 
--- Sisipu's bark slots. Only `guidance` has a wire-confirmed id
--- (man0l1 QUEST-sheet say 337, decoded client processTtrBlkNml001 —
--- "Oschon's Torch is due south..."). The conditional wave-outcome
--- variants are attested verbatim in the retail recordings but their
--- say ids are UNKNOWN — the nil slots are skipped by emitBark, so a
--- future id-probe just fills numbers in. (Say 119 is her SEQ_055 camp
--- talk and does NOT belong here.)
+-- Sisipu's bark slots — man0l1 QUEST-sheet rows decoded straight from
+-- the client's text sheets (data/03/A2/04/4A.DAT EN + 4B enable; rows
+-- [u16 len][u8][bytes XOR 0x73], ids from the enable run file — the
+-- SeventhUmbral SheetData.cpp:ReadRow format). Delivery = emitBark →
+-- owner:SendGameMessage(quest, sayId, 0x20) with the Man0l1 quest
+-- actor as text owner. (Say 119 is her SEQ_055 camp talk and does NOT
+-- belong here; row 284 — the "repellant draws beasts" ambush line —
+-- and the 291/292 arrival follow-ups are unwired spares.)
 BARKS = {
-	guidance   = SAY_ESCORT_GUIDANCE,   -- 337, confirmed
-	waveClean  = nil,   -- TODO id: "Good show! ..." (clean wave clear)
-	waveClose  = nil,   -- TODO id: "Phew... That was much closer..." (close call)
-	sisipuHurt = nil,   -- TODO id: "Ow ow ow..." (Sisipu took a beating)
-	dawdle     = nil,   -- TODO id: "Now put away your toys and come along, <Forename>..."
-	arrival    = nil,   -- TODO id: "We've finally arrived...and in one piece!"
+	dutyStart  = 105,   -- "Excited yet? I know I am. Now let us be off!..."
+	guidance   = SAY_ESCORT_GUIDANCE,   -- 283 "Oschon's Torch is due south..."
+	waveClean  = 286,   -- "Good show! Perhaps you are not as useless..."
+	waveClose  = 287,   -- "Phew... That was much closer than I'd have liked..."
+	waveThanks = 288,   -- "Thank the Navigator! Oh, and thank you, as well."
+	sisipuHurt = 289,   -- "Ow ow ow... That's going to leave a nasty bruise..."
+	dawdle     = 285,   -- "Now put away your toys and come along, <name>..."
+	arrival    = 290,   -- "We've finally arrived...and in one piece!"
 };
 
 -- Per-player escort state, keyed by actor id: the VM is process-cached
@@ -146,19 +196,38 @@ function onCreate(starterPlayer, contentArea, director)
 		startTick = nil,     -- latched on the first onUpdate tick (post-warp)
 		lastBarkTick = nil,
 		lastNear = 0,        -- live-mob count near the party last tick (wave-outcome beat)
+		reminded20 = false,
 		reminded10 = false,
 		reminded5 = false,
 		sawEscort = false,   -- Sisipu observed alive at least once (death detection)
+		waveEscortFought = false,   -- Sisipu engaged during the current wave (thank-you variant)
+		mobsLive = {},       -- actorId → true for position-synced live biters (defeat announcements)
+		mobsEngaged = {},    -- actorId → true once "<mob> is engaged." was announced
+		ringActorId = nil,   -- minimap-halo object id (re-acquired from the roster per tick)
 	};
 
-	-- Zone-128 route spawns (seed/070). Rows 16-24 are the superseded
-	-- zone-129 Skull Valley set, kept for rollback — flip these ids back
-	-- to 16..24 alongside man0l1.lua's zone pin to roll back.
+	-- Zone-128 route spawns (seed/070, re-homed one-per-ambush-point by
+	-- seed/072). Rows 16-24 are the superseded zone-129 Skull Valley set,
+	-- kept for rollback — flip these ids back to 16..24 alongside
+	-- man0l1.lua's zone pin to roll back.
 	sisipu = GetWorldManager().SpawnBattleNpcById(25, contentArea);
 	local mobs = {};
 	for bnpcId = 26, 33 do
 		table.insert(mobs, GetWorldManager().SpawnBattleNpcById(bnpcId, contentArea));
 	end
+
+	-- Minimap duty halo (see ESCORT_RING_CLASS): spawned at Sisipu's
+	-- seed position (seed/070 bnpc 25) and MoveTo'd alongside her every
+	-- couple of ticks in onUpdate. Cross-tick userdata handles are dead
+	-- (each tick drains a fresh command queue — lua/mod.rs
+	-- call_content_on_update), so only the ID is stored; director
+	-- membership puts the ring in the onUpdate monster roster (kind
+	-- Npc — ticker.rs build_content_rosters) where each tick re-acquires
+	-- a queue-bound handle. The combat loop skips it by this id.
+	-- Teardown despawn is automatic (spawned_actor_ids tracking in
+	-- apply_spawn_actor).
+	local ring = contentArea:SpawnActor(ESCORT_RING_CLASS, "escortAreaRange", -49.0, 36.43, 162.0, 0);
+	escortState[starterPlayer.actorId].ringActorId = ring.actorId;
 
 	-- Active MainState so Sisipu stands and the ankle biters render
 	-- hostile (tutorial-fight pattern).
@@ -185,19 +254,25 @@ function onCreate(starterPlayer, contentArea, director)
 	director:AddMember(starterPlayer);
 	director:AddMember(director);
 	director:AddMember(sisipu);
+	director:AddMember(ring);
 	for i = 1, #mobs do
 		director:AddMember(mobs[i]);
 	end
 end
 
--- Entry text moved to the DIRECTOR's post-warp chain (round 7): this
+-- Entry TEXT lives in onUpdate's first-sighting latch (round 9 — it
+-- needs Sisipu's actor id for the 51005 param and runs post-ack): this
 -- hook fires inside apply_do_zone_change_content immediately after the
 -- bundle flush — ~4s BEFORE the client's RX 0x0007 (wire-proven
--- 2026-07-03 14:24: the three lines + bark 337 + Sisipu's first walk
--- steps all shipped into the Now-Loading gap). The director emits them
--- after its fade-in delegate instead, and the go-latch below holds the
--- rest of the duty. (Garlemald-Server #46, round 7.)
+-- 2026-07-03 14:24: 0x0157 game messages shipped into the Now-Loading
+-- gap crash the client). SetMusic is load-gap-SAFE — the bundle's own
+-- zone-default SetMusic(60) ships in the same gap — and this 0x000C
+-- lands after it, so the duty override wins. Restore is automatic on
+-- every exit: the completion camp warp and the escortFail eject both
+-- re-send SetMusic from the destination's DB row via
+-- send_zone_in_bundle (design: scratchpad design_bgm). (#46, round 9.)
 function onZoneIn(player, contentArea, director)
+	player:ChangeMusic(ESCORT_DUTY_MUSIC);
 end
 
 function onDestroy()
@@ -278,22 +353,47 @@ function onUpdate(tick, area)
 
 	-- ---- Timer (retail: 30-minute limit) ----
 	-- `tick` is the ticker's monotonic 500 ms frame counter; latch the
-	-- first faded-in frame and measure elapsed from there. The 10/5-min
-	-- reminder LINES are omitted for now (round 7d): their text id was
-	-- the boundary-family 34112 "Enter this instance?" — wrong. The
-	-- expiry FAIL is real and kept; the reminder sends return once the
-	-- correct "There are N minutes remaining." id is probed.
+	-- first faded-in frame and measure elapsed from there. Reminder
+	-- lines reuse 25018 "There ~is/are~ <N> ~minute/minutes~
+	-- remaining." with the minutes as the message param (sheet-decoded;
+	-- the round-7d boundary-family candidate 34112 was wrong).
 	state.startTick = state.startTick or tick;
 	local elapsed = tick - state.startTick;
 	if elapsed >= ESCORT_LIMIT_TICKS then
 		escortFail(owner, area, state);
 		return;
 	end
+	if not state.reminded20 and elapsed >= REMIND_20MIN_TICKS then
+		state.reminded20 = true;
+		owner:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 20);
+	end
+	if not state.reminded10 and elapsed >= REMIND_10MIN_TICKS then
+		state.reminded10 = true;
+		owner:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 10);
+	end
+	if not state.reminded5 and elapsed >= REMIND_5MIN_TICKS then
+		state.reminded5 = true;
+		owner:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, 5);
+	end
 
 	-- ---- Sisipu death = fail (rosters are live-only, so a dead
 	-- escort simply vanishes from GetAllies) ----
 	local escort = allies[1]
 	if escort then
+		if not state.sawEscort then
+			-- First live sighting = the duty is underway (the ticker
+			-- only runs post-content_warp_acked, so the client has
+			-- loaded — 0x0157 is safe). Retail entry order: journal →
+			-- 34108 (Rust-side, rides the content-warp path) →
+			-- protect → bound → timer, then Sisipu's send-off. 51005
+			-- resolves "<displayName>" from the actor-id param — this
+			-- is why the banner set lives HERE and not in the
+			-- director, which has no handle on her.
+			owner:SendGameMessage(GetWorldMaster(), TEXT_PROTECT_SISIPU, 0x20, escort.actorId);
+			owner:SendGameMessage(GetWorldMaster(), TEXT_BOUND_BY_DUTY, 0x20);
+			owner:SendGameMessage(GetWorldMaster(), TEXT_TIME_REMAINING, 0x20, ESCORT_LIMIT_MINUTES);
+			emitBark(owner, BARKS.dutyStart);
+		end
 		state.sawEscort = true;
 	elseif state.sawEscort then
 		escortFail(owner, area, state);
@@ -303,18 +403,19 @@ function onUpdate(tick, area)
 		return;
 	end
 
-	-- ---- Ambush waves ----
-	-- The three seeded clusters are >100 units apart along the route, so
-	-- the engage radius activates exactly the wave whose segment the
-	-- party has reached: any live ankle biter inside ENGAGE_RADIUS of
-	-- the escort or the player joins the fight (2-3 at once — cluster
-	-- size); Sisipu fights back like the tutorial allies do.
+	-- ---- Ambush points ----
+	-- The eight seeded biters sit ONE PER AMBUSH POINT at even ninths of
+	-- the recorded arc (~130-160 units apart — seed/072; screenshots show
+	-- a single biter per location), so the engage radius activates exactly
+	-- the point whose stretch the party has reached: the live ankle biter
+	-- inside ENGAGE_RADIUS of the escort or the player pulls alone;
+	-- Sisipu fights back like the tutorial allies do.
 	-- Round 7h: skip actors whose roster position is still unsynced
-	-- (0,0,0) — on the spawn tick every distance reads ~0, so the whole
-	-- wave-1 cluster engaged the player AND Sisipu instantly from ~225
-	-- units away (log 23:05:49: ActorEngage rows at content-spawn time =
-	-- the "invisible enemies" report). A real position never sits exactly
-	-- at origin in zone 128.
+	-- (0,0,0) — on the spawn tick every distance reads ~0, so the wave-1
+	-- mobs (then a 3-mob cluster) engaged the player AND Sisipu instantly
+	-- from ~225 units away (log 23:05:49: ActorEngage rows at
+	-- content-spawn time = the "invisible enemies" report). A real
+	-- position never sits exactly at origin in zone 128.
 	local function positionLive(a)
 		return a and not (a.positionX == 0 and a.positionY == 0 and a.positionZ == 0);
 	end
@@ -325,9 +426,17 @@ function onUpdate(tick, area)
 	local nearLive = 0
 	local anyEngaged = false
 	local nearestMob, nearestD = nil, math.huge
+	-- The minimap-halo ring object rides the same director roster
+	-- (kind Npc → monsters — ticker.rs build_content_rosters); pick its
+	-- fresh queue-bound handle out and keep it clear of combat logic.
+	local ring = nil
+	local liveIds = {}
 	for i = 1, #mobs do
 		local mob = mobs[i]
-		if mob and positionLive(mob) then
+		if mob and state.ringActorId ~= nil and mob.actorId == state.ringActorId then
+			ring = mob;
+		elseif mob and positionLive(mob) then
+			liveIds[mob.actorId] = true;
 			local dMob = math.min(
 				dist2d(mob.positionX, mob.positionZ, escort.positionX, escort.positionZ),
 				dist2d(mob.positionX, mob.positionZ, owner.positionX, owner.positionZ))
@@ -336,6 +445,13 @@ function onUpdate(tick, area)
 			end
 			if mob:IsEngaged() then
 				anyEngaged = true
+				-- "The ankle biter is engaged." — announced once per
+				-- mob on its first engaged tick; the actor-id param
+				-- resolves <displayName> client-side.
+				if not state.mobsEngaged[mob.actorId] then
+					state.mobsEngaged[mob.actorId] = true;
+					owner:SendGameMessage(GetWorldMaster(), TEXT_MOB_ENGAGED, 0x20, mob.actorId);
+				end
 			end
 			if dMob < nearestD then
 				nearestMob, nearestD = mob, dMob
@@ -345,6 +461,14 @@ function onUpdate(tick, area)
 			end
 		end
 	end
+	-- "The ankle biter is defeated." — the roster is live-only, so a
+	-- previously-seen biter vanishing from it died this tick.
+	for id in pairs(state.mobsLive) do
+		if not liveIds[id] then
+			owner:SendGameMessage(GetWorldMaster(), TEXT_MOB_DEFEATED, 0x20, id);
+		end
+	end
+	state.mobsLive = liveIds;
 	-- Sisipu joins the fight against the NEAREST in-range mob only.
 	-- (Round 7g: this used to target mobs[1] — the first ROSTER entry,
 	-- which could be a far unstreamed cluster hundreds of units away →
@@ -353,12 +477,28 @@ function onUpdate(tick, area)
 		allyGlobal.EngageTarget(escort, nearestMob)
 	end
 
-	-- Wave-outcome beat: the contested count dropping back to zero =
-	-- the wave was cleared this tick. The conditional variants (clean /
-	-- close-call / Sisipu-hurt) need her HP, which the roster userdata
-	-- doesn't expose yet — emit the (unprobed) clean slot only.
+	-- Ambush-outcome beat: the contested count dropping back to zero =
+	-- this ambush point was cleared this tick. Variant by how the
+	-- fight went for Sisipu (HP snapshot refreshed per tick —
+	-- build_content_rosters, #46 escort R4a): badly hurt → "Ow ow
+	-- ow..."; scraped → "Phew..."; she had to fight herself → "Thank
+	-- the Navigator!"; untouched → "Good show!".
+	if escort:IsEngaged() then
+		state.waveEscortFought = true;
+	end
 	if nearLive == 0 and state.lastNear > 0 then
-		emitBark(owner, BARKS.waveClean);
+		local hp, maxHp = escort:GetHP(), escort:GetMaxHP();
+		local ratio = (maxHp > 0) and (hp / maxHp) or 1.0;
+		if ratio <= HURT_HP_RATIO then
+			emitBark(owner, BARKS.sisipuHurt);
+		elseif ratio <= CLOSE_HP_RATIO then
+			emitBark(owner, BARKS.waveClose);
+		elseif state.waveEscortFought then
+			emitBark(owner, BARKS.waveThanks);
+		else
+			emitBark(owner, BARKS.waveClean);
+		end
+		state.waveEscortFought = false;
 	end
 	state.lastNear = nearLive;
 
@@ -387,10 +527,10 @@ function onUpdate(tick, area)
 	-- ground the player actually walked (real terrain Y), so she cannot
 	-- straight-line into the ocean or float (the 7e player-relative
 	-- follow cut corners off walkable land). She waits when the player
-	-- falls behind the leash, and once the recorded trail is exhausted
-	-- (the recording stops at z~810) she transitions to the 7e
-	-- player-relative follow for the final unrecorded stretch, as
-	-- specified. (Garlemald-Server #46, round 7f.)
+	-- falls behind the leash. The recording now reaches the lighthouse
+	-- itself (round 8), so the 7e player-relative follow past the last
+	-- breadcrumb is only a safety fallback (arrival normally fires
+	-- first). (Garlemald-Server #46, rounds 7f/8.)
 	local dPlayer = dist2d(escort.positionX, escort.positionZ, owner.positionX, owner.positionZ);
 
 	-- One-time: start from the trail point nearest her spawn (the first
@@ -440,8 +580,10 @@ function onUpdate(tick, area)
 				math.atan(dx, dz), 2);
 		end
 	else
-		-- TRAIL EXHAUSTED: player-relative follow (7e) for the last
-		-- stretch — her Y comes from the player's real ground height.
+		-- TRAIL EXHAUSTED: player-relative follow (7e) as a safety
+		-- fallback only — the trail now ends at the lighthouse, inside
+		-- the arrival radius, so this branch is normally unreachable.
+		-- Her Y comes from the player's real ground height.
 		local py = owner.positionY;
 		local last = state.lastOwnerX and { x = state.lastOwnerX, z = state.lastOwnerZ } or nil;
 		local moved = last and dist2d(owner.positionX, owner.positionZ, last.x, last.z) or 0;
@@ -457,8 +599,17 @@ function onUpdate(tick, area)
 	state.lastOwnerX = owner.positionX;
 	state.lastOwnerZ = owner.positionZ;
 
+	-- Minimap halo follows Sisipu: re-home the ring object onto her
+	-- current position every RING_MOVE_TICKS while she walks (the
+	-- native range marker is actor-attached, so 0x00CF moves the ring
+	-- on the client's minimap).
+	if ring ~= nil and (state.lastRingTick == nil or tick - state.lastRingTick >= RING_MOVE_TICKS) then
+		state.lastRingTick = tick;
+		ring:MoveTo(escort.positionX, escort.positionY, escort.positionZ, 0.0, 0);
+	end
+
 	-- Guidance bark ("Oschon's Torch is due south...") every ~20 s while
-	-- escorting — say 337, wire-confirmed.
+	-- escorting — man0l1 sheet row 283.
 	if state.lastBarkTick == nil or tick - state.lastBarkTick >= BARK_INTERVAL_TICKS then
 		state.lastBarkTick = tick;
 		emitBark(owner, BARKS.guidance);

@@ -2647,13 +2647,18 @@ mod tests {
     /// Garlemald-Server #46 — drive the REAL
     /// `SimpleContentMan0l101.lua` escort through its lifecycle:
     /// onCreate spawns Sisipu (bnpc 25) + the 8 ankle biters (26-33,
-    /// the zone-128 route rows from seed/070), then onUpdate (1) has
-    /// Sisipu LEAD toward the first ROUTE waypoint while the player is
-    /// close and the road is clear, (2) holds the walk + pulls mobs
-    /// when an ankle biter is close, and (3) fires
-    /// `sendSignal("escortComplete")` once BOTH Sisipu and the player
-    /// are inside the lighthouse-approach arrival radius. Also
-    /// syntax-checks the script.
+    /// one per on-trail ambush point — seed/072) + the minimap
+    /// duty-halo ring object (class 1290003 — seed/073), then onUpdate
+    /// (1) emits the sheet-decoded duty-entry banner set (51005
+    /// protect + 50011 bound + 25018 timer, worldMaster-owned) and
+    /// Sisipu's send-off bark on her first live sighting, has her LEAD
+    /// toward the first ROUTE waypoint while the player is close and
+    /// the road is clear, and re-homes the halo ring onto her, (2)
+    /// holds the walk + pulls mobs when an ankle biter is close, and
+    /// (3) fires `sendSignal("escortComplete")` + the arrival bark
+    /// once BOTH Sisipu and the player are inside the
+    /// lighthouse-approach arrival radius. Also syntax-checks the
+    /// script.
     #[test]
     fn real_man0l1_escort_content_walks_holds_and_signals() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
@@ -2688,8 +2693,25 @@ mod tests {
         assert_eq!(
             spawn_ids,
             (25..=33).collect::<Vec<u32>>(),
-            "onCreate must spawn Sisipu (25) + 8 ankle biters (26-33, seed/070 zone-128 route)",
+            "onCreate must spawn Sisipu (25) + 8 ankle biters (26-33, one per ambush point — seed/072)",
         );
+        // The minimap duty-halo ring object (invisible
+        // ContentPrivateAreaRange — seed/073) spawns at Sisipu's seed
+        // position; its deterministic id is what onUpdate re-acquires
+        // from the roster to MoveTo it alongside her.
+        let ring_id = result
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                LuaCommand::SpawnActor {
+                    actor_class_id: 1_290_003,
+                    unique_id,
+                    expected_actor_id,
+                    ..
+                } if unique_id == "escortAreaRange" => Some(*expected_actor_id),
+                _ => None,
+            })
+            .expect("onCreate must spawn the minimap duty-halo ring (class 1290003 — seed/073)");
 
         let escort_actor =
             |pos: (f32, f32, f32), queue: Arc<Mutex<CommandQueue>>| userdata::LuaActor {
@@ -2740,17 +2762,23 @@ mod tests {
 
         // Round 7f — Sisipu TRACES the player's recorded footsteps. From
         // her seed spawn (-49, 36.43, 162) the nearest TRAIL breadcrumb
-        // is (-43.93, 37.11, 156.42) (the second recorded sample), so
-        // with the player in leash range and the road clear she must
-        // step toward it — x increasing above -49 — at the BREADCRUMB'S
-        // recorded ground Y (37.11), never an interpolated one.
+        // is (-45.02, 36.92, 155.90) (the second recorded sample of the
+        // full-walk trail), so with the player in leash range and the
+        // road clear she must step toward it — x increasing above -49 —
+        // at the BREADCRUMB'S recorded ground Y (36.92), never an
+        // interpolated one.
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
         area.players.push(near_player((-52.0, 36.0, 158.0)));
         area.allies
             .push(escort_actor((-49.0, 36.43, 162.0), q.clone()));
         area.monsters
-            .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
+            .push(mob_actor((124.43, 46.40, 1205.66), q.clone()));
+        // The halo ring rides the same roster (director member of kind
+        // Npc → monsters — ticker.rs build_content_rosters).
+        let mut ring_actor = mob_actor((-49.0, 36.43, 162.0), q.clone());
+        ring_actor.actor_id = ring_id;
+        area.monsters.push(ring_actor);
         let result = engine.call_content_on_update(&script_path, 1, area);
         assert!(result.error.is_none(), "tick1: {:?}", result.error);
         let step = result.commands.iter().find_map(|c| match c {
@@ -2763,20 +2791,89 @@ mod tests {
             _ => None,
         });
         assert!(
-            step.is_some_and(|(x, y)| x > -49.0 && (y - 37.11).abs() < 0.01),
+            step.is_some_and(|(x, y)| x > -49.0 && (y - 36.92).abs() < 0.01),
             "clear road + close player must step Sisipu toward the nearest trail breadcrumb at its recorded Y; got {:?}",
             result.commands,
         );
+        // First live sighting of Sisipu → the duty-entry banner set
+        // (sheet-decoded worldMaster ids — man0l1.lua TEXT_*): 51005
+        // "Protect <displayName> from harm." carries her actor id as
+        // the param, 50011 "You are now bound by duty.", 25018 "There
+        // are <N> minutes remaining." carries the 30-minute limit.
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessage {
+                    text_owner_id: 0x5FF8_0001,
+                    text_id: 51005,
+                    params,
+                    ..
+                } if params.as_slice() == [0x4008_0001_i64]
+            )),
+            "duty start must announce 51005 Protect <Sisipu> with her actor id as param; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessage {
+                    text_owner_id: 0x5FF8_0001,
+                    text_id: 50011,
+                    ..
+                }
+            )),
+            "duty start must announce 50011 'You are now bound by duty.'; got {:?}",
+            result.commands,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessage {
+                    text_owner_id: 0x5FF8_0001,
+                    text_id: 25018,
+                    params,
+                    ..
+                } if params.as_slice() == [30_i64]
+            )),
+            "duty start must announce 25018 with the 30-minute param; got {:?}",
+            result.commands,
+        );
+        // ...followed by Sisipu's send-off bark (man0l1 QUEST-sheet
+        // row 105, quest actor 0xA0F1ADB2 as text owner).
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessage {
+                    text_owner_id: 0xA0F1_ADB2,
+                    text_id: 105,
+                    ..
+                }
+            )),
+            "duty start must emit the say-105 send-off bark; got {:?}",
+            result.commands,
+        );
+        // The halo ring is re-homed onto Sisipu's position this tick
+        // (walking + throttle window open).
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::MoveActorToPosition { actor_id, .. } if *actor_id == ring_id
+            )),
+            "the minimap halo ring must follow Sisipu; got {:?}",
+            result.commands,
+        );
 
-        // Tick 2 — ambush at the wave-1 cluster: a live ankle biter
-        // inside the engage radius freezes the walk and pulls the mob
-        // onto the escort party.
+        // Tick 2 — ambush at the third single ambush point (bnpc 28,
+        // seed/072: 69.96, 41.22, 449.76): the lone live ankle biter
+        // inside the engage radius freezes the walk and pulls onto the
+        // escort party by itself.
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
-        area.players.push(near_player((-6.0, 42.0, 446.0)));
+        area.players.push(near_player((66.0, 41.0, 446.0)));
         area.allies
-            .push(escort_actor((-2.7, 42.4, 450.0), q.clone()));
-        area.monsters.push(mob_actor((0.0, 42.4, 455.0), q.clone()));
+            .push(escort_actor((68.0, 41.2, 448.0), q.clone()));
+        area.monsters
+            .push(mob_actor((69.96, 41.22, 449.76), q.clone()));
         let result = engine.call_content_on_update(&script_path, 2, area);
         assert!(result.error.is_none(), "tick2: {:?}", result.error);
         assert!(
@@ -2798,15 +2895,16 @@ mod tests {
 
         // Tick 3 — ARRIVAL: the PLAYER inside the lighthouse-approach
         // radius of ARRIVAL_GOAL (137.44, 60.33, 1322), Sisipu at their
-        // side, the last cluster far behind: escortComplete must fire
-        // (goal arrival, NOT kill count — the far mob is still alive).
+        // side, the last ambush point (bnpc 33) far behind:
+        // escortComplete must fire (goal arrival, NOT kill count — the
+        // far mob is still alive).
         let q = CommandQueue::new();
         let mut area = sample_content_area(q.clone());
         area.players.push(near_player((135.0, 60.0, 1318.0)));
         area.allies
             .push(escort_actor((133.0, 60.2, 1320.0), q.clone()));
         area.monsters
-            .push(mob_actor((106.0, 55.8, 1104.0), q.clone()));
+            .push(mob_actor((124.43, 46.40, 1205.66), q.clone()));
         let result = engine.call_content_on_update(&script_path, 3, area);
         assert!(result.error.is_none(), "arrival tick: {:?}", result.error);
         assert!(
@@ -2815,6 +2913,20 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, LuaCommand::SendSignal { name } if name == "escortComplete")),
             "party inside the arrival radius must fire escortComplete; got {:?}",
+            result.commands,
+        );
+        // Arrival bark: "We've finally arrived...and in one piece!"
+        // (man0l1 QUEST-sheet row 290) rides the same drain.
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SendGameMessage {
+                    text_owner_id: 0xA0F1_ADB2,
+                    text_id: 290,
+                    ..
+                }
+            )),
+            "arrival must emit the say-290 bark; got {:?}",
             result.commands,
         );
     }
