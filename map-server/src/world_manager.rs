@@ -745,12 +745,28 @@ pub(crate) fn push_npc_spawn(
         ];
         match lua.and_then(|l| l.call_npc_init(&class_path_lower)) {
             Some(tail) if !tail.is_empty() => p.extend(tail),
-            _ => p.extend([
-                common::luaparam::LuaParam::False,
-                common::luaparam::LuaParam::False,
-                common::luaparam::LuaParam::Int32(0),
-                common::luaparam::LuaParam::Int32(0),
-            ]),
+            _ => {
+                // A monster class falling back to the populace tail is
+                // the exact precondition of the client's fatal
+                // DepictionJudge nil-`parameterTemp` crash (bit-2
+                // nameplate actors; live-proven 2026-07-04 Ubuntu
+                // opening-quest kick, where the miss was a
+                // case-sensitivity resolve failure). Ship the fallback
+                // loudly, never silently.
+                if class_path_lower.contains("/monster/") {
+                    tracing::warn!(
+                        class_path = %class_path_lower,
+                        actor = format!("0x{actor_id:08X}"),
+                        "monster base-class init missing/failed — shipping populace fallback tail",
+                    );
+                }
+                p.extend([
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::False,
+                    common::luaparam::LuaParam::Int32(0),
+                    common::luaparam::LuaParam::Int32(0),
+                ]);
+            }
         }
         p
     };
