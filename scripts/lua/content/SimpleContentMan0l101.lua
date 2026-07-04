@@ -35,6 +35,11 @@ require ("quests/man/man0l1")
 WALK_STEP = 1.6;             -- units per 500 ms tick (escort walking pace)
 RUN_STEP = 3.4;              -- units per 500 ms tick (run pace — 7e walk was too slow)
 HOLD_RADIUS = 28.0;          -- live mob within this of Sisipu/player → hold the walk
+-- Render-before-fight invariant: ENGAGE_RADIUS (18) + PLAYER_LEASH (15)
+-- stays below the server's INSTANCE_STREAM_RADIUS (50, world_manager.rs)
+-- — as does the controller's MAX_DETECT_DISTANCE (20) — so every mob is
+-- AddActor'd to the client before it can possibly pull or reach the
+-- party. Widen these past 50 and mobs fight invisibly again (#46).
 ENGAGE_RADIUS = 18.0;        -- mob pulls onto the escort party inside this
 PLAYER_LEASH = 15.0;         -- Sisipu > this from the player → close the gap directly
 WAYPOINT_RADIUS = 4.0;       -- close enough to the lead point → stop stepping
