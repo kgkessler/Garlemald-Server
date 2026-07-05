@@ -420,19 +420,29 @@ pub struct EventStartPacket {
     pub event_name: String,
     pub lua_params: Vec<LuaParam>,
     /// When the client catches a Lua runtime error it re-purposes
-    /// `EventStartPacket` as an error tunnel. `serverCodes == 0x3980_0010`
-    /// (the `unknown` field per Meteor's parser) signals that the body
-    /// carries an 0x80-byte ASCII error message instead of an event
-    /// payload. Parsed opportunistically so the server can log the real
-    /// Lua trace rather than just `owner actor missing owner=3`.
+    /// `EventStartPacket` as an error tunnel. Meteor's (commented-out)
+    /// parser keyed on `serverCodes == 0x3980_0010` in the `unknown`
+    /// field, but live 2026-07-04 captures show the retail client
+    /// actually sends `event_type == 127` with `server_codes ==
+    /// 0x30400000` and `unknown == 0` — so detection keys on the event
+    /// type (the marker branch is kept for Meteor parity). The report
+    /// arrives as `owner_actor_id` chunks (`trigger_actor_id` = chunk
+    /// index — pseudo-ids, not actors) of 0x80 ASCII bytes each at the
+    /// LuaParam position, 0xFF-padded. Parsed so the server can log the
+    /// real Lua trace rather than just `owner actor missing owner=4`.
     /// See Meteor `Map Server/Packets/Receive/Events/EventStartPacket.cs`
-    /// for the original (commented-out) branch.
+    /// for the original branch.
     pub client_script_error: Option<String>,
 }
 
 /// Marker that distinguishes a real EventStart from the client's Lua
 /// error tunnel. Lives in the `unknown` u32 slot (offset 0x0C).
 const CLIENT_SCRIPT_ERROR_MARKER: u32 = 0x3980_0010;
+
+/// The `event_type` the live retail client stamps on Lua-error tunnel
+/// chunks (wire-proven: the Ubuntu opening-quest kick shipped
+/// `parameterTemp is nil` traces this way, 8/8 sessions).
+const CLIENT_SCRIPT_ERROR_EVENT_TYPE: u8 = 127;
 
 impl EventStartPacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
@@ -480,6 +490,36 @@ impl EventStartPacket {
         // (Garlemald-Server #46.)
         let event_name = read_fixed_field_ascii(&mut c, 0x20);
         let pos = c.position() as usize;
+
+        // Client Lua-ERROR tunnel, the shape the live client really sends
+        // (see `client_script_error` doc): one 0x80-byte ASCII chunk at
+        // the LuaParam position. Cut the chunk at the first NUL / 0xFF
+        // padding / non-text control byte — the tail past the text is
+        // client-stack garbage.
+        if event_type == CLIENT_SCRIPT_ERROR_EVENT_TYPE {
+            let raw = if pos < data.len() {
+                &data[pos..(pos + 0x80).min(data.len())]
+            } else {
+                &[][..]
+            };
+            let cut = raw
+                .iter()
+                .position(|&b| {
+                    b == 0 || b >= 0x80 || (b < 0x20 && !matches!(b, b'\n' | b'\r' | b'\t'))
+                })
+                .unwrap_or(raw.len());
+            return Ok(Self {
+                trigger_actor_id,
+                owner_actor_id,
+                server_codes,
+                unknown,
+                event_type,
+                event_name,
+                lua_params: Vec::new(),
+                client_script_error: Some(String::from_utf8_lossy(&raw[..cut]).into_owned()),
+            });
+        }
+
         // No params if the fixed name field ran to (or past) the end of the
         // body, or if the next byte is the 0x01 "no params" marker (pmeteor's
         // `PeekChar() == 0x1`). The `pos >= data.len()` arm also keeps a
@@ -855,6 +895,48 @@ mod event_start_tests {
             matches!(pkt.lua_params[0], LuaParam::Int32(119)),
             "emoteId must parse as 119 (Kneel) from past the fixed name field; got {:?}",
             pkt.lua_params
+        );
+    }
+
+    /// Live 2026-07-04 capture shape (map-packets.log, the Ubuntu
+    /// opening-quest kick): the client ships fatal Lua errors as
+    /// EventStart chunks with event_type=127, server_codes=0x30400000,
+    /// unknown=0 — NOT the 0x3980_0010 `unknown` marker Meteor's
+    /// commented-out parser expected, which is why these crashes were
+    /// invisible in map-server.log (`event_name=""` + "owner actor
+    /// missing owner=4"). The ASCII chunk sits at the LuaParam position
+    /// and is 0xFF-padded.
+    #[test]
+    fn event_start_type_127_parses_as_client_script_error_chunk() {
+        let text = b"#1 ***** Client Script ERROR ***** lpb version: 50463\n\
+                     ?:0: attempt to index field 'parameterTemp' (a nil value)\n";
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes()); // trigger = chunk index (pseudo-id)
+        data.extend_from_slice(&4u32.to_le_bytes()); // owner = chunk count (pseudo-id)
+        data.extend_from_slice(&0x3040_0000u32.to_le_bytes()); // server_codes as observed
+        data.extend_from_slice(&0u32.to_le_bytes()); // unknown as observed (marker absent)
+        data.push(0x7f); // event_type 127 — the real discriminator
+        data.extend_from_slice(&[0u8; 0x20]); // empty fixed name field
+        data.extend_from_slice(text);
+        data.resize(0x31 + 0x80, 0xFF); // 0xFF padding to the 0x80-byte chunk
+        data.extend_from_slice(&[0x1d, 0x8d, 0x77, 0x00]); // trailing client-stack junk
+
+        let pkt = EventStartPacket::parse(&data).expect("parse");
+        assert_eq!(pkt.event_type, 127);
+        assert_eq!(pkt.owner_actor_id, 4);
+        assert!(pkt.lua_params.is_empty());
+        let err = pkt
+            .client_script_error
+            .as_deref()
+            .expect("error text captured");
+        assert!(
+            err.contains("Client Script ERROR")
+                && err.contains("attempt to index field 'parameterTemp'"),
+            "chunk text not extracted: {err:?}"
+        );
+        assert!(
+            !err.contains('\u{FFFD}'),
+            "0xFF padding must be trimmed, not lossy-decoded: {err:?}"
         );
     }
 }
