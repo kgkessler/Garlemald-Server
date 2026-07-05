@@ -205,6 +205,13 @@ under which this project is distributed.
 
 ## Sister projects
 
+- **[meteor-decomp](https://github.com/swstegall/meteor-decomp)** —
+  clean-room decompilation of the FFXIV 1.23b Windows client binaries,
+  producing byte-identical recompiles and validated wire-protocol
+  ground truth.
+- **[decomp-agents](https://github.com/swstegall/decomp-agents)** —
+  parallel autonomous Claude agents that grind through meteor-decomp's
+  per-function matching workflow via a shared claim queue.
 - **[Garlemald Client](https://github.com/swstegall/Garlemald-Client)** —
   cross-platform Rust launcher that speaks this server's lobby / patch
   handshake and manages its own Wine runtime on macOS and Linux.
@@ -212,6 +219,10 @@ under which this project is distributed.
   bash installer that stands up a working 1.23b client on Apple
   Silicon Macs, which the client above can then drive against this
   server.
+- **[XIV 1.0 Linux Installer](https://github.com/swstegall/XIV-1.0-Linux-Installer)** —
+  one-command installer that stands up a working 1.23b client on x86_64
+  Linux across distributions — the counterpart to the Apple Silicon
+  installer above.
 
 ## Community
 
