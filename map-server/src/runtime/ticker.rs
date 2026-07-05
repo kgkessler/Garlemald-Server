@@ -966,7 +966,18 @@ fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
 ///   * MP has NO natural out-of-combat regen in 1.x — anima is the only
 ///     documented passive regen in 1.0; MP came from aetherytes,
 ///     abilities, and Refresh effects.
-///   * TP decays toward 0 out of combat (pmeteor Modifier.cs:178).
+///   * TP decays toward 0 only while SHEATHED (`MAIN_STATE_PASSIVE`).
+///     pmeteor's "should be -90 out of combat" (Modifier.cs:178) maps to
+///     passive stance — "combat mode" in 1.x parlance IS the drawn-weapon
+///     active stance (the client's own gate reads "That command can only
+///     be performed in active mode"). Draining whenever merely
+///     disengaged emptied the pool between escort ambush waves even
+///     though the player never sheathed (live 2026-07-05: one
+///     main_state=2 flip for the whole leg, TP 489→0 across a 44 s wave
+///     gap), so the 1000-TP Fast Blade never lit while the 250-TP
+///     Phalanx did. The retail escort recording shows weaponskill
+///     openers on waves ~45 s apart — TP banks across waves while the
+///     weapon stays drawn. (Garlemald-Server #199, round 2.)
 ///
 /// Corpses and engaged actors get nothing here — their pools move only
 /// through the status-effect modifiers `regen_tick` reads separately.
@@ -988,7 +999,11 @@ fn compute_passive_regen(chara: &Character) -> crate::status::PassiveRegen {
     } else {
         0
     };
-    let tp = -OUT_OF_COMBAT_TP_DECAY_PER_TICK.min(chara.chara.tp as i32);
+    let tp = if chara.base.current_main_state == crate::actor::MAIN_STATE_PASSIVE {
+        -OUT_OF_COMBAT_TP_DECAY_PER_TICK.min(chara.chara.tp as i32)
+    } else {
+        0
+    };
     crate::status::PassiveRegen { hp, mp: 0, tp }
 }
 
@@ -1238,6 +1253,44 @@ mod tests {
         // …and an empty pool stays put.
         ticker.tick_once(12_000).await;
         assert_eq!(handle.character.read().await.chara.tp, 0);
+    }
+
+    /// TP banks while the weapon stays drawn: a disengaged actor in
+    /// ACTIVE stance keeps its full pool across regen ticks — decay only
+    /// applies to `MAIN_STATE_PASSIVE` (sheathed). This is what lets an
+    /// escort player carry TP across the ~45 s ambush-wave gaps and
+    /// eventually fire the 1000-TP Fast Blade. (#199 round 2.)
+    #[tokio::test]
+    async fn tp_persists_between_fights_while_active_stance() {
+        let ticker = setup_one_zone_plain_actor(1000, 1000, 500).await;
+        let handle = ticker.registry.get(1).await.unwrap();
+        {
+            let mut c = handle.character.write().await;
+            c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+        }
+
+        // Several 3 s regen cadences — enough that the old
+        // always-decay behavior would have drained all 500 TP.
+        for t in [3_000, 6_000, 9_000, 12_000, 15_000, 18_000] {
+            ticker.tick_once(t).await;
+        }
+        assert_eq!(
+            handle.character.read().await.chara.tp,
+            500,
+            "active-stance TP must not decay between fights",
+        );
+
+        // Sheathing flips decay back on.
+        {
+            let mut c = handle.character.write().await;
+            c.base.current_main_state = crate::actor::MAIN_STATE_PASSIVE;
+        }
+        ticker.tick_once(21_000).await;
+        assert_eq!(
+            handle.character.read().await.chara.tp,
+            410,
+            "passive-stance TP must resume the -90/3 s decay",
+        );
     }
 
     /// The SEQ_005 tutorial's `MinimumTpLock` floor holds under the

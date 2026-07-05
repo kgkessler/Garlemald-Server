@@ -69,6 +69,17 @@ pub enum BattleEvent {
         attacker_actor_id: u32,
         defender_actor_id: u32,
     },
+    /// A ready auto-attack swing was dropped because the target sits
+    /// outside `attack_range` (target resolved in the arena, auto-attack
+    /// enabled). pmeteor answers this with worldMaster text 32537 "The
+    /// target is too far away." (AttackState.cs:222-229, player only);
+    /// without it the player gets ZERO feedback while their swings
+    /// silently skip (the #199 escort "combat doesn't work on some
+    /// biters" report was exactly this). Fires at most once per
+    /// swing-delay window — same cadence as pmeteor's TryAttack.
+    AutoAttackOutOfRange {
+        owner_actor_id: u32,
+    },
     /// Emitted by `AIContainer::update` when a Magic/Ability/WeaponSkill
     /// state returns `Complete` — i.e. the cast timer elapsed. Carries the
     /// full skill so the dispatcher can route to

@@ -442,6 +442,19 @@ impl AIContainer {
                                 attack_range,
                                 "battle: swing ready but skipped",
                             );
+                            // Out-of-range specifically (target resolved,
+                            // auto-attack on, just too far): surface
+                            // pmeteor's "The target is too far away."
+                            // feedback so the player knows to close the
+                            // gap instead of watching nothing happen
+                            // (AttackState.cs:222-229; dispatcher drops it
+                            // for non-players). (#199 round 2.)
+                            if target_actor_id != 0 && auto_attack_enabled && target_view.is_some()
+                            {
+                                outbox.push(BattleEvent::AutoAttackOutOfRange {
+                                    owner_actor_id: owner_id,
+                                });
+                            }
                         }
                     }
                     break;

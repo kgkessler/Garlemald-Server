@@ -497,6 +497,22 @@ pub async fn dispatch_battle_event(
             )
             .await;
         }
+        BattleEvent::AutoAttackOutOfRange { owner_actor_id } => {
+            // pmeteor AttackState.cs:222-229: a range-blocked player
+            // auto-attack answers with worldMaster text 32537 "The
+            // target is too far away." — player-only (the C# gates on
+            // `owner is Player`; `send_to_self_if_player` is our
+            // equivalent), once per swing-delay window (the AIContainer
+            // re-arms before emitting). (#199 round 2.)
+            let sub = tx::build_game_message_actor1(
+                tx::WORLD_MASTER_ACTOR_ID,
+                *owner_actor_id,
+                tx::WORLD_MASTER_ACTOR_ID,
+                32537,
+                tx::MESSAGE_TYPE_SYSTEM,
+            );
+            send_to_self_if_player(registry, world, *owner_actor_id, sub.to_bytes()).await;
+        }
         BattleEvent::ResolveAction {
             attacker_actor_id,
             defender_actor_id,
