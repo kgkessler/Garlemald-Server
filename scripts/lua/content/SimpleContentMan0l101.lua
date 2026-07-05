@@ -69,7 +69,7 @@ CLOSE_HP_RATIO = 0.85;       -- at/below → "Phew... much closer than I'd have 
 -- object, and MoveTo'ing it along with Sisipu moves the quest area
 -- ring on the minimap.
 ESCORT_RING_CLASS = 1290003;
-RING_MOVE_TICKS = 4;         -- re-home the halo every 2 s (one 0x00CF — plenty for a ~50-unit ring)
+RING_MOVE_TICKS = 1;         -- re-home the halo EVERY 500 ms frame (one 0x00CF on one invisible marker — cheap; 4 lagged ~13.6u at run pace). #199
 
 -- Sisipu's path: the PLAYER'S OWN recorded footsteps (round 7f, extended
 -- to the lighthouse in round 8). Decoded from the player's full
@@ -469,6 +469,24 @@ function onUpdate(tick, area)
 		end
 	end
 	state.mobsLive = liveIds;
+
+	-- Minimap halo follows Sisipu EVERY tick. Re-home the invisible
+	-- range-marker ring onto her current position HERE — before all of
+	-- the movement early-returns below (hold-while-contested, arrival,
+	-- player-leash) — so the halo tracks her while she walks AND while she
+	-- is pinned fighting an ambush wave. (The re-home used to sit AFTER
+	-- those returns, so the instant the player fell >PLAYER_LEASH behind
+	-- to fight, onUpdate returned early and the halo froze off-center for
+	-- the whole fight.) The native range marker is actor-attached, so one
+	-- 0x00CF (MoveTo) drags the halo on the client's minimap;
+	-- RING_MOVE_TICKS=1 re-homes per frame, so it also snaps onto her on
+	-- the first position-synced tick instead of lagging ~6 s from spawn.
+	-- (Garlemald-Server #199.)
+	if ring ~= nil and (state.lastRingTick == nil or tick - state.lastRingTick >= RING_MOVE_TICKS) then
+		state.lastRingTick = tick;
+		ring:MoveTo(escort.positionX, escort.positionY, escort.positionZ, 0.0, 0);
+	end
+
 	-- Sisipu joins the fight against the NEAREST in-range mob only.
 	-- (Round 7g: this used to target mobs[1] — the first ROSTER entry,
 	-- which could be a far unstreamed cluster hundreds of units away →
@@ -599,14 +617,8 @@ function onUpdate(tick, area)
 	state.lastOwnerX = owner.positionX;
 	state.lastOwnerZ = owner.positionZ;
 
-	-- Minimap halo follows Sisipu: re-home the ring object onto her
-	-- current position every RING_MOVE_TICKS while she walks (the
-	-- native range marker is actor-attached, so 0x00CF moves the ring
-	-- on the client's minimap).
-	if ring ~= nil and (state.lastRingTick == nil or tick - state.lastRingTick >= RING_MOVE_TICKS) then
-		state.lastRingTick = tick;
-		ring:MoveTo(escort.positionX, escort.positionY, escort.positionZ, 0.0, 0);
-	end
+	-- (Minimap-halo re-home hoisted above the movement early-returns —
+	-- see the block after the mob loop. #199.)
 
 	-- Guidance bark ("Oschon's Torch is due south...") every ~20 s while
 	-- escorting — man0l1 sheet row 283.

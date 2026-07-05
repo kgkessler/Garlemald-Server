@@ -3200,6 +3200,23 @@ impl PacketProcessor {
             zw.core.update_actor_position(actor_id, spawn, &mut ob);
         }
 
+        // Rebind the player's REGISTRY handle zone to the content zone.
+        // The per-frame combat ticker filters actors by the frozen
+        // `ActorHandle.zone_id` (`actor_registry::actors_in_zone`, driven
+        // by `ticker::tick_zone`) and hands `ai_container::update` only
+        // THAT zone as its `ActorArena`. We already wrote
+        // `Character.base.zone_id = parent_zone_id` and migrated the
+        // spatial grid above, but the registry handle is still pinned to
+        // wherever the player last crossed a seamless boundary. Without
+        // this rebind the player is ticked in the wrong zone's arena, so
+        // `arena.get(<content mob>)` returns `None`, `in_range` is false,
+        // and every auto-attack swing is dropped (`ai_container.rs`
+        // "swing ready but skipped … target_in_arena=false") → no TP →
+        // "active mode" errors → the killing blow is never credited to the
+        // player → no EXP. Mirrors the seamless path's `reassign_zone`
+        // call on `SeamlessResult::ZoneChanged`. (Garlemald-Server #199.)
+        self.registry.reassign_zone(actor_id, parent_zone_id).await;
+
         // 3. Update the session's spawn_type / destination fields. The
         //    helper above set zone + xyz/rot but not the spawn_type
         //    arg the bundle uses. Also latch `reload_in_flight` — the

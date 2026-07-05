@@ -17163,6 +17163,33 @@ async fn reload_latch_holds_stale_position_updates_until_zone_in_ack() {
         world.session(PLAYER_ID).await.unwrap().reload_in_flight,
         "wipe+0x10 warp must latch reload_in_flight",
     );
+    // #199 regression: the scripted warp must rebind the player's REGISTRY
+    // handle to the destination zone. The combat ticker keys the per-frame
+    // arena off `ActorHandle.zone_id` (`actors_in_zone` → `tick_zone`), so
+    // if the handle stays frozen at OLD_ZONE the player is ticked in the
+    // wrong zone's arena and any mob spawned into NEW_ZONE is invisible to
+    // the player's auto-attack (the Sisipu-escort no-TP/no-EXP bug).
+    assert_eq!(
+        registry.get(PLAYER_ID).await.unwrap().zone_id,
+        NEW_ZONE,
+        "apply_do_zone_change must reassign the player's registry-zone to the destination (#199)",
+    );
+    assert!(
+        registry
+            .actors_in_zone(NEW_ZONE)
+            .await
+            .iter()
+            .any(|h| h.actor_id == PLAYER_ID),
+        "player must appear in actors_in_zone(destination) after warp (#199)",
+    );
+    assert!(
+        !registry
+            .actors_in_zone(OLD_ZONE)
+            .await
+            .iter()
+            .any(|h| h.actor_id == PLAYER_ID),
+        "player must NOT still be ticked in the origin zone after warp (#199)",
+    );
     // Drain the warp bundle.
     while rx.try_recv().is_ok() {}
 
