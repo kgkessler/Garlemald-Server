@@ -69,7 +69,16 @@ CLOSE_HP_RATIO = 0.85;       -- at/below → "Phew... much closer than I'd have 
 -- object, and MoveTo'ing it along with Sisipu moves the quest area
 -- ring on the minimap.
 ESCORT_RING_CLASS = 1290003;
-RING_MOVE_TICKS = 4;         -- re-home the halo every 2 s (one 0x00CF — plenty for a ~50-unit ring)
+RING_MOVE_TICKS = 1;         -- re-home the halo EVERY 500 ms frame (one 0x00CF on one invisible marker — cheap; 4 lagged ~13.6u at run pace). #199
+
+-- Every escort ambusher is the same chigoe class 2205603, whose
+-- gamedata_actor_class displayNameId is 3205603 ("ankle biter"). The
+-- engaged/defeated rows 30120/30121 take their subject from the
+-- DispId-sender wire family (0x0161-0x0165 — pmeteor
+-- Player.SendGameMessageDisplayIDSender), i.e. a STATIC name-sheet id in
+-- the packet header; a runtime mob actor id in the LuaParam slot leaves
+-- the name BLANK (" is engaged." — live 2026-07-05). (#199 round 2.)
+ANKLE_BITER_DISPLAY_ID = 3205603;
 
 -- Sisipu's path: the PLAYER'S OWN recorded footsteps (round 7f, extended
 -- to the lighthouse in round 8). Decoded from the player's full
@@ -445,12 +454,13 @@ function onUpdate(tick, area)
 			end
 			if mob:IsEngaged() then
 				anyEngaged = true
-				-- "The ankle biter is engaged." — announced once per
-				-- mob on its first engaged tick; the actor-id param
-				-- resolves <displayName> client-side.
+				-- "Ankle biter is engaged." — announced once per mob on
+				-- its first engaged tick. Subject rides the DispId-sender
+				-- family (see ANKLE_BITER_DISPLAY_ID) — an actor-id
+				-- LuaParam rendered a blank subject.
 				if not state.mobsEngaged[mob.actorId] then
 					state.mobsEngaged[mob.actorId] = true;
-					owner:SendGameMessage(GetWorldMaster(), TEXT_MOB_ENGAGED, 0x20, mob.actorId);
+					owner:SendGameMessageLocalizedDisplayName(GetWorldMaster(), TEXT_MOB_ENGAGED, 0x20, ANKLE_BITER_DISPLAY_ID);
 				end
 			end
 			if dMob < nearestD then
@@ -461,14 +471,42 @@ function onUpdate(tick, area)
 			end
 		end
 	end
-	-- "The ankle biter is defeated." — the roster is live-only, so a
-	-- previously-seen biter vanishing from it died this tick.
+	-- "Ankle biter is defeated." — the roster is live-only, so a
+	-- previously-seen biter vanishing from it died this tick. Subject
+	-- rides the DispId-sender family (see ANKLE_BITER_DISPLAY_ID); this
+	-- also sidesteps the dead mob no longer being client-resolvable.
 	for id in pairs(state.mobsLive) do
 		if not liveIds[id] then
-			owner:SendGameMessage(GetWorldMaster(), TEXT_MOB_DEFEATED, 0x20, id);
+			owner:SendGameMessageLocalizedDisplayName(GetWorldMaster(), TEXT_MOB_DEFEATED, 0x20, ANKLE_BITER_DISPLAY_ID);
 		end
 	end
 	state.mobsLive = liveIds;
+
+	-- Minimap halo follows Sisipu EVERY tick. Re-home the invisible
+	-- range-marker ring onto her current position HERE — before all of
+	-- the movement early-returns below (hold-while-contested, arrival,
+	-- player-leash) — so the halo tracks her while she walks AND while she
+	-- is pinned fighting an ambush wave. (The re-home used to sit AFTER
+	-- those returns, so the instant the player fell >PLAYER_LEASH behind
+	-- to fight, onUpdate returned early and the halo froze off-center for
+	-- the whole fight.) The native range marker is actor-attached, so one
+	-- 0x00CF (MoveTo) drags the halo on the client's minimap;
+	-- RING_MOVE_TICKS=1 re-homes per frame, so it also snaps onto her on
+	-- the first position-synced tick instead of lagging ~6 s from spawn.
+	-- (Garlemald-Server #199.)
+	-- moveState 2 (running), NOT 0: the wire enum is 0=standing /
+	-- 1=walking / 2=running (UpdatePlayerPositionPacket.cs:33), and the
+	-- client GLIDES a state-0 0x00CF instead of snapping — re-targeted
+	-- every 500 ms at glide pace the halo fell ever further behind a
+	-- running Sisipu until it left the minimap entirely (live
+	-- 2026-07-05: server re-homes glued to her coords, client marker
+	-- lagged then vanished). State 2 is the exact pipeline Sisipu's own
+	-- every-tick MoveTo renders perfectly with. (#199 round 2.)
+	if ring ~= nil and (state.lastRingTick == nil or tick - state.lastRingTick >= RING_MOVE_TICKS) then
+		state.lastRingTick = tick;
+		ring:MoveTo(escort.positionX, escort.positionY, escort.positionZ, 0.0, 2);
+	end
+
 	-- Sisipu joins the fight against the NEAREST in-range mob only.
 	-- (Round 7g: this used to target mobs[1] — the first ROSTER entry,
 	-- which could be a far unstreamed cluster hundreds of units away →
@@ -599,14 +637,8 @@ function onUpdate(tick, area)
 	state.lastOwnerX = owner.positionX;
 	state.lastOwnerZ = owner.positionZ;
 
-	-- Minimap halo follows Sisipu: re-home the ring object onto her
-	-- current position every RING_MOVE_TICKS while she walks (the
-	-- native range marker is actor-attached, so 0x00CF moves the ring
-	-- on the client's minimap).
-	if ring ~= nil and (state.lastRingTick == nil or tick - state.lastRingTick >= RING_MOVE_TICKS) then
-		state.lastRingTick = tick;
-		ring:MoveTo(escort.positionX, escort.positionY, escort.positionZ, 0.0, 0);
-	end
+	-- (Minimap-halo re-home hoisted above the movement early-returns —
+	-- see the block after the mob loop. #199.)
 
 	-- Guidance bark ("Oschon's Torch is due south...") every ~20 s while
 	-- escorting — man0l1 sheet row 283.

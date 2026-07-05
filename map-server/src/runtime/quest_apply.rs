@@ -2261,6 +2261,22 @@ pub(crate) async fn apply_do_zone_change(
             &mut status_outbox,
         );
     }
+    // Rebind the REGISTRY handle's zone to the destination too. The
+    // combat ticker (`ticker::tick_zone` → `actor_registry::actors_in_zone`)
+    // and the broadcast fan-out both filter on `ActorHandle.zone_id`,
+    // which is otherwise frozen at registration (the class of bug the
+    // "frozen at registration" notes below already work around by reading
+    // `session.current_zone_id`). Without this, a player warped into a new
+    // zone is still ticked in the OLD zone's arena, so any actor spawned
+    // into the destination (content mobs, quest ENPCs) never resolves for
+    // the player's combat/interaction path — the tutorial (`man0l0`
+    // SEQ_005) only works today because its login zone happens to equal
+    // the mob zone. Private-area routing still keys on the PARENT zone id:
+    // `tick_zone(zone_id)` builds its arena from the whole `Zone` (core +
+    // every private area), so the parent id is the correct registry key.
+    // Same-zone / public⇄private flips are a no-op (dest == current).
+    // Mirrors the seamless path and the content-warp path. (Garlemald-Server #199.)
+    registry.reassign_zone(actor_id, zone_id).await;
     // Persist the new zone + private area + coords to the characters
     // row IMMEDIATELY (pmeteor `Player.CleanupAndSave` semantics). The
     // DB writer existed but had zero callers, so currentZoneId only
